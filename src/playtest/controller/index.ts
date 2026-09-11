@@ -11,6 +11,9 @@ export const PLAYER_SPRINT_MULTIPLIER = 2
 export const PLAYER_JUMP_VELOCITY = 6
 export const PLAYER_GRAVITY = 20
 export const MOUSE_SENSITIVITY = 0.0022
+// Maximum step-up height: lets the playtester climb stair treads and door
+// thresholds instead of treating every 18cm riser as a wall.
+export const PLAYER_STEP_UP = 0.35
 
 // Eye position for spawning in a room: floor-slab top + full body height.
 // `position.y` is the camera (eye) location, matching the collision model

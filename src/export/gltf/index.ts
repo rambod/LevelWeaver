@@ -87,6 +87,10 @@ export async function exportGLB(level: GeneratedLevel): Promise<Blob> {
     stairGeo.risers.forEach((riser, i) => addGeometryToGroup(stairGroup, riser, `Riser_${i}`, 0, materialFor))
     stairGeo.stringers.forEach((stringer, i) => addGeometryToGroup(stairGroup, stringer, `Stringer_${i}`, 0, materialFor))
     stairGeo.landing.forEach((landing, i) => addGeometryToGroup(stairGroup, landing, `Landing_${i}`, 1, materialFor))
+    if (stairGeo.tower) {
+      addGeometryToGroup(stairGroup, stairGeo.tower.floor, 'TowerFloor', 1, materialFor)
+      stairGeo.tower.walls.forEach((wall, i) => addGeometryToGroup(stairGroup, wall, `TowerWall_${i}`, 0, materialFor))
+    }
 
     stairGroup.position.y = stairGeo.startFloor * FLOOR_HEIGHT
     floorGroup.add(stairGroup)

@@ -124,18 +124,35 @@ export interface CorridorGeometry {
   ceiling: MeshData
 }
 
+export interface StairTowerGeometry {
+  /** World-space outer footprint (local Y). */
+  rect: Rect2D
+  /** Host-wall door center (world) cut for the shaft mouth. */
+  door: Vec3
+  floor: MeshData
+  walls: MeshData[]
+}
+
 export interface StairsGeometry {
   id: string
   startFloor: number
   endFloor: number
-  /** Host room containing the stairs (stairs always live inside a room). */
+  /** Host room the stair serves (tower attached to it, or containing it). */
   hostRoomId: string
+  upperRoomId: string
+  /** 'tower' = attached outdoor shaft; 'inroom' = flight inside host. */
+  kind: 'tower' | 'inroom'
+  /** Attached outdoor shaft (null for in-room stairs). */
+  tower: StairTowerGeometry | null
   /** Stair run axis in room space. */
   axis: 'x' | 'z'
   /** World-space footprint center at the host floor base. */
   position: Vec3
   width: number
   depth: number
+  stepCount: number
+  stepHeight: number
+  stepDepth: number
   steps: MeshData[]
   risers: MeshData[]
   stringers: MeshData[]

@@ -7,6 +7,7 @@ import {
   PLAYER_SPRINT_MULTIPLIER,
   PLAYER_JUMP_VELOCITY,
   PLAYER_GRAVITY,
+  PLAYER_STEP_UP,
   MOUSE_SENSITIVITY,
 } from '@/playtest/controller'
 
@@ -314,6 +315,21 @@ export class CameraController {
       zPos.z = newPosition.z
       if (!this.checkCollision(zPos, collisionBoxes)) {
         this.camera.position.z = newPosition.z
+      }
+
+      // Step-up: rise up to PLAYER_STEP_UP and retry the horizontal move.
+      // This is what makes stair treads and door thresholds walkable
+      // instead of invisible walls.
+      const stepped = this.camera.position.clone()
+      stepped.y += PLAYER_STEP_UP
+      if (!this.checkCollision(stepped, collisionBoxes)) {
+        const steppedTarget = stepped.clone()
+        steppedTarget.x = newPosition.x
+        steppedTarget.z = newPosition.z
+        if (!this.checkCollision(steppedTarget, collisionBoxes)) {
+          this.camera.position.copy(steppedTarget)
+          this.canJump = true
+        }
       }
 
       // Try Y only

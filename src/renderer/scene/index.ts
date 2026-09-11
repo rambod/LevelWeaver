@@ -229,6 +229,25 @@ export class LevelScene {
           })
         }
 
+        // Attached shaft (tower stairs): floor + walls.
+        if (stairGeo.tower) {
+          if (stairGeo.tower.floor.vertices.length > 0) {
+            const mesh = this.createMesh(stairGeo.tower.floor, 1)
+            mesh.name = 'floor'
+            mesh.receiveShadow = true
+            stairGroup.add(mesh)
+          }
+          stairGeo.tower.walls.forEach((wallGeo, i) => {
+            if (wallGeo.vertices.length > 0) {
+              const mesh = this.createMesh(wallGeo, 0)
+              mesh.name = `wall_tower_${i}`
+              mesh.castShadow = true
+              mesh.receiveShadow = true
+              stairGroup.add(mesh)
+            }
+          })
+        }
+
         stairGroup.position.y = stairGeo.startFloor * FLOOR_HEIGHT
         this.levelGroup.add(stairGroup)
       }

@@ -45,9 +45,17 @@ export function generateLevel(config: LevelConfig): GeneratedLevel {
   // Stage 7: Compute door openings from corridor connections
   const doorOpenings = computeDoorOpenings(rooms, corridors)
 
-  // Stage 7b: Plan stairs inside rooms (needs doors for placement) and
-  // reserve matching floor/ceiling holes for the stairwells.
-  const stairPlans = planStairs(rooms, doorOpenings)
+  // Stage 7b: Plan stairs (tower shafts first, in-room fallback) using
+  // doors + corridor slabs for placement rules, and reserve matching
+  // floor/ceiling holes for the stairwells.
+  const corridorSlabs = collectCorridorSlabs(corridors)
+  const corridorDegree = new Map<string, number>()
+  for (const corridor of corridors) {
+    corridorDegree.set(corridor.startRoomId, (corridorDegree.get(corridor.startRoomId) ?? 0) + 1)
+    corridorDegree.set(corridor.endRoomId, (corridorDegree.get(corridor.endRoomId) ?? 0) + 1)
+  }
+  const stairPlans = planStairs(rooms, doorOpenings, { corridorSlabsByFloor: corridorSlabs, boundary, corridorDegree })
+  mergeTowerDoors(rooms, doorOpenings, stairPlans)
   const slabHoles = computeSlabHoles(rooms, stairPlans)
 
   // Stage 8: Generate geometry
@@ -78,9 +86,58 @@ export function generateLevel(config: LevelConfig): GeneratedLevel {
   }
 }
 
-// Stairwell holes: the host (lower) room always gets a ceiling hole above
-// its stairs; the upper room gets a floor hole where the stair footprint
-// overlaps it, so the landing genuinely arrives upstairs.
+// Corridor slab footprints per floor (world XZ): stair arrivals must not
+// land under a corridor slab crossing overhead.
+function collectCorridorSlabs(corridors: Corridor[]): Map<number, { minX: number; maxX: number; minZ: number; maxZ: number }[]> {
+  const slabs = new Map<number, { minX: number; maxX: number; minZ: number; maxZ: number }[]>()
+  for (const corridor of corridors) {
+    const pts = corridor.pathPoints && corridor.pathPoints.length > 0
+      ? corridor.pathPoints
+      : [corridor.startPos, corridor.endPos]
+    let list = slabs.get(corridor.floorIndex)
+    if (!list) {
+      list = []
+      slabs.set(corridor.floorIndex, list)
+    }
+    for (let i = 0; i < pts.length - 1; i++) {
+      list.push({
+        minX: Math.min(pts[i].x, pts[i + 1].x) - corridor.width / 2,
+        maxX: Math.max(pts[i].x, pts[i + 1].x) + corridor.width / 2,
+        minZ: Math.min(pts[i].z, pts[i + 1].z) - corridor.width / 2,
+        maxZ: Math.max(pts[i].z, pts[i + 1].z) + corridor.width / 2,
+      })
+    }
+  }
+  return slabs
+}
+
+// Tower shaft mouths: door openings cut in the host wall where the shaft
+// attaches (mouth matches the shaft, like corridor mouths match corridors).
+function mergeTowerDoors(
+  rooms: Room[],
+  doorOpenings: Map<string, DoorOpening[]>,
+  stairPlans: ReturnType<typeof planStairs>
+): void {
+  const roomMap = new Map(rooms.map(r => [r.id, r]))
+  for (const plan of stairPlans) {
+    if (plan.kind !== 'tower' || !plan.towerDoor) continue
+    const host = roomMap.get(plan.hostRoomId)
+    const list = doorOpenings.get(plan.hostRoomId) ?? []
+    list.push({
+      roomId: plan.hostRoomId,
+      wallIndex: plan.towerDoor.wallIndex,
+      position: { x: plan.towerDoor.x, y: (host?.position.y ?? 0) + 0.1, z: plan.towerDoor.z },
+      width: 1.8,
+      height: 2.4,
+    })
+    doorOpenings.set(plan.hostRoomId, list)
+  }
+}
+
+// Stairwell holes: in-room stairs pierce the host ceiling above the flight;
+// tower stairs stand outside (host ceiling stays intact). The upper room
+// gets a floor hole where the flight overlaps it, so the landing genuinely
+// arrives upstairs.
 function computeSlabHoles(
   rooms: Room[],
   stairPlans: ReturnType<typeof planStairs>
@@ -114,15 +171,18 @@ function computeSlabHoles(
       minZ: plan.z - halfD,
       maxZ: plan.z + halfD,
     }
-    // Room-local hole for the host.
-    put(plan.hostRoomId, {
-      ceiling: {
-        minX: world.minX - lower.position.x,
-        maxX: world.maxX - lower.position.x,
-        minZ: world.minZ - lower.position.z,
-        maxZ: world.maxZ - lower.position.z,
-      },
-    })
+    // Room-local ceiling hole for in-room hosts (tower stairs stand
+    // outside: the host ceiling stays intact).
+    if (plan.kind === 'inroom') {
+      put(plan.hostRoomId, {
+        ceiling: {
+          minX: world.minX - lower.position.x,
+          maxX: world.maxX - lower.position.x,
+          minZ: world.minZ - lower.position.z,
+          maxZ: world.maxZ - lower.position.z,
+        },
+      })
+    }
     // Matching floor hole upstairs where the footprints overlap.
     if (overlaps(world, roomRect(upper))) {
       put(upper.id, {

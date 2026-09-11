@@ -186,11 +186,13 @@ function createThickWallWithDoors(
     }
   }).filter(s => s.end > s.start).sort((a, b) => a.start - b.start)
 
-  // Merge overlapping spans so adjacent doors share one opening.
+  // Merge overlapping spans so adjacent doors share one opening (merged
+  // within 0.4m: paper-thin wall slivers between close doors would look
+  // broken and collide badly).
   const merged: typeof spans = []
   for (const span of spans) {
     const last = merged[merged.length - 1]
-    if (last && span.start <= last.end + 0.05) {
+    if (last && span.start <= last.end + 0.4) {
       last.end = Math.max(last.end, span.end)
       last.top = Math.max(last.top, span.top)
     } else {
@@ -533,7 +535,5 @@ function buildCorridorGeometry(corridor: Corridor, points: Vec3[]): CorridorGeom
   }
 }
 
-// Vertical circulation lives in `@/generator/vertical`; re-exported here
-// so existing importers keep working.
-export { generateStairsGeometry } from '@/generator/vertical'
+// Vertical circulation lives in `@/generator/vertical`.
 

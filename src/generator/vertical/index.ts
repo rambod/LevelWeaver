@@ -1,125 +1,686 @@
-import type { Room, MeshData, StairsGeometry, VerticalLink, DoorOpening } from '@/core/types'
+import type { Room, MeshData, StairsGeometry, VerticalLink, DoorOpening, Rect2D, Boundary } from '@/core/types'
+import { FLOOR_HEIGHT } from '@/core/types'
 import { createBoxMesh, createOrientedBox } from '@/core/meshdata'
+import { isPointInBoundary } from '@/generator/boundary'
 
 // Vertical circulation (pipeline stage: "Add stairs or vertical connectors").
 //
-// Stairs always live INSIDE the larger of the two linked rooms (never
-// floating at midpoints in empty space): StairPlan fixes the footprint,
-// planStairs() also reserves matching floor/ceiling holes, and the builders
-// below emit LOCAL geometry (base at y=0); the renderer/exporter offsets
-// each group by floor level.
+// Stairs always live INSIDE the lower linked room (never floating at
+// midpoints): StairPlan fixes a rule-checked footprint (clear of doors,
+// other stairs, shafts, and upper corridors), planStairs() also reserves
+// matching floor/ceiling holes, and the builders emit LOCAL geometry
+// (base at y=0); the renderer/exporter offsets each group by floor level.
 
-const FLOOR_THICKNESS = 0.2
-const STAIR_WIDTH = 2.5
-const STAIR_DEPTH = 5.0
+// Walkable stair code (meters): a comfortable riser/tread pair for the
+// 1.8m playtester. The old fixed 8-16 steps made 25cm ladder risers with
+// 8cm treads in small rooms.
+const STAIR_RISER = 0.18
+const STAIR_TREAD = 0.28
+const STAIR_WIDTH = 2.4
 const LANDING_DEPTH = 1.2
+const FLOOR_THICKNESS = 0.2
+
+// Habitability clearances (meters).
+const STAIR_STAIR_GAP = 1.2
+const STAIR_WALL_INSET = 0.35
+
+// Attached stair tower (outdoor shaft) dimensions.
+const TOWER_WIDTH = 3.0
+const TOWER_PARAPET = 1.1
+
+// Max stair shafts per room: more is over-linking no room can host cleanly.
+const MAX_VERTICAL_PER_ROOM = 3
 
 export interface StairPlan {
   link: VerticalLink
-  /** Room containing the stairs (the larger of the two). */
+  /** Room containing the stairs (always the lower room). */
   hostRoomId: string
   /** True when the host is the lower room (stairs ascend from it). */
   ascending: boolean
   /** Run axis in room space. */
   axis: 'x' | 'z'
+  /** Ascent direction along axis (+1 toward +axis, -1 toward -axis). */
+  dir: 1 | -1
   /** World-space footprint center. */
   x: number
   z: number
   width: number
   depth: number
+  /** True for folded switchback flights (compact footprint, same slope). */
+  switchback: boolean
+  /** 'tower' = attached outdoor shaft; 'inroom' = flight inside host. */
+  kind: 'tower' | 'inroom'
+  stepCount: number
+  stepHeight: number
+  stepDepth: number
+  /** Tower outer footprint + host-wall door (tower plans only). */
+  towerRect: Rect2D | null
+  towerDoor: { wallIndex: number; x: number; z: number } | null
 }
 
-// Wall index per facing side (matches core/generation door walls).
-function sideToWallIndex(side: 'px' | 'nx' | 'pz' | 'nz'): number {
-  switch (side) {
-    case 'px': return 1
-    case 'nx': return 3
-    case 'pz': return 2
-    case 'nz': return 0
+export interface StairPlanContext {
+  /** Upper-floor corridor slab footprints the arrival hole must avoid. */
+  corridorSlabsByFloor: Map<number, Rect2D[]>
+  /** Map boundary for tower placement. */
+  boundary: Boundary
+  /** Corridor links per room (for critical-first ordering). */
+  corridorDegree: Map<string, number>
+}
+
+function rectsOverlap(a: Rect2D, b: Rect2D, pad = 0): boolean {
+  return a.minX < b.maxX + pad && a.maxX > b.minX - pad && a.minZ < b.maxZ + pad && a.maxZ > b.minZ - pad
+}
+
+function pointRectDist(px: number, pz: number, r: Rect2D): number {
+  const dx = Math.max(r.minX - px, 0, px - r.maxX)
+  const dz = Math.max(r.minZ - pz, 0, pz - r.maxZ)
+  return Math.sqrt(dx * dx + dz * dz)
+}
+
+// Walk-through zone in front of a doorway (inside the room): the opening
+// span plus swing space. Stairs may stand BESIDE a door, never in its zone.
+export function doorWalkZone(door: DoorOpening): Rect2D {
+  const inward = door.wallIndex === 0 ? { x: 0, z: 1 }
+    : door.wallIndex === 1 ? { x: -1, z: 0 }
+    : door.wallIndex === 2 ? { x: 0, z: -1 }
+    : { x: 1, z: 0 }
+  const lateral = door.wallIndex % 2 === 0 ? 'x' : 'z'
+  const halfSpan = door.width / 2 + 0.3
+  const front = 1.2
+  if (lateral === 'x') {
+    return {
+      minX: door.position.x - halfSpan,
+      maxX: door.position.x + halfSpan,
+      minZ: Math.min(door.position.z, door.position.z + inward.z * front),
+      maxZ: Math.max(door.position.z, door.position.z + inward.z * front),
+    }
+  }
+  return {
+    minX: Math.min(door.position.x, door.position.x + inward.x * front),
+    maxX: Math.max(door.position.x, door.position.x + inward.x * front),
+    minZ: door.position.z - halfSpan,
+    maxZ: door.position.z + halfSpan,
+  }
+}
+
+export function stairBlocksDoor(stair: Rect2D, door: DoorOpening): boolean {
+  return rectsOverlap(stair, doorWalkZone(door), 0)
+}
+
+// Minimum edge-to-edge gap (negative when overlapping).
+function rectGap(a: Rect2D, b: Rect2D): number {
+  const dx = Math.max(b.minX - a.maxX, a.minX - b.maxX)
+  const dz = Math.max(b.minZ - a.maxZ, a.minZ - b.maxZ)
+  if (dx <= 0 && dz <= 0) return -Math.min(-dx, -dz)
+  return Math.sqrt(Math.max(dx, 0) ** 2 + Math.max(dz, 0) ** 2)
+}
+
+function rectIntersection(a: Rect2D, b: Rect2D): Rect2D | null {
+  const minX = Math.max(a.minX, b.minX)
+  const maxX = Math.min(a.maxX, b.maxX)
+  const minZ = Math.max(a.minZ, b.minZ)
+  const maxZ = Math.min(a.maxZ, b.maxZ)
+  if (maxX <= minX || maxZ <= minZ) return null
+  return { minX, maxX, minZ, maxZ }
+}
+
+function roomRect(r: Room): Rect2D {
+  return {
+    minX: r.position.x - r.width / 2,
+    maxX: r.position.x + r.width / 2,
+    minZ: r.position.z - r.depth / 2,
+    maxZ: r.position.z + r.depth / 2,
   }
 }
 
 export function planStairs(
   rooms: Room[],
-  doorsByRoom: Map<string, DoorOpening[]>
+  doorsByRoom: Map<string, DoorOpening[]>,
+  context?: StairPlanContext
 ): StairPlan[] {
   const roomMap = new Map(rooms.map(r => [r.id, r]))
   const plans: StairPlan[] = []
+  // Standing-floor stair footprints + open shaft holes (both forbid new
+  // footprints: stairs must not nest into each other or float over shafts).
+  const footprints = new Map<number, Rect2D[]>()
+  const floorHoles = new Map<number, Rect2D[]>()
+  const slabsByFloor = context?.corridorSlabsByFloor ?? new Map<number, Rect2D[]>()
 
-  for (const link of findVerticalLinks(rooms)) {
+  const atFloor = (map: Map<number, Rect2D[]>, floor: number): Rect2D[] => {
+    let list = map.get(floor)
+    if (!list) {
+      list = []
+      map.set(floor, list)
+    }
+    return list
+  }
+
+  // Walkable step math from the floor height (not from room size: a short
+  // run never justifies ladder steps — oversized stairs simply don't fit
+  // and the link is reported instead of built broken).
+  const stepCount = Math.max(10, Math.min(26, Math.round(FLOOR_HEIGHT / STAIR_RISER)))
+  const stepHeight = FLOOR_HEIGHT / stepCount
+  const stepDepth = STAIR_TREAD
+  const run = (stepCount - 1) * stepDepth
+  const depth = run + LANDING_DEPTH
+  const width = STAIR_WIDTH
+
+  const st: StairPlanner = {
+    rooms,
+    roomMap,
+    doorsByRoom,
+    slabsByFloor,
+    boundary: context?.boundary,
+    footprints,
+    floorHoles,
+    towers: [],
+    stepCount,
+    stepHeight,
+    stepDepth,
+    run,
+    depth,
+    width,
+    atFloor,
+  }
+
+  // Vertical-link cap per room: a room with four shafts is over-linked
+  // (no room has four clean shaft sites). Trimming redundant links never
+  // isolates (rooms keep their first links), but unbounded links exhaust
+  // small rooms and strand their last shaft.
+  const keptCount = new Map<string, number>()
+
+  // Critical-first order: links whose endpoints have the fewest corridor
+  // alternatives get first pick of shaft sites, so scarce space never
+  // strands a room's only vertical connection.
+  const corridorDegree = context?.corridorDegree ?? new Map<string, number>()
+  const links = findVerticalLinks(rooms).sort((p, q) => {
+    const pc = Math.min(corridorDegree.get(p.lowerRoomId) ?? 0, corridorDegree.get(p.upperRoomId) ?? 0)
+    const qc = Math.min(corridorDegree.get(q.lowerRoomId) ?? 0, corridorDegree.get(q.upperRoomId) ?? 0)
+    if (pc !== qc) return pc - qc
+    const pk = p.lowerRoomId < p.upperRoomId ? p.lowerRoomId + '|' + p.upperRoomId : p.upperRoomId + '|' + p.lowerRoomId
+    const qk = q.lowerRoomId < q.upperRoomId ? q.lowerRoomId + '|' + q.upperRoomId : q.upperRoomId + '|' + q.lowerRoomId
+    return pk < qk ? -1 : pk > qk ? 1 : 0
+  })
+
+  for (const link of links) {
     const lower = roomMap.get(link.lowerRoomId)!
     const upper = roomMap.get(link.upperRoomId)!
     if (!lower || !upper) continue
 
-    // Host = the lower room, always: stairs ascend from its floor to the
-    // next floor level, so the top landing always meets the upper level
-    // exactly (upper floor top == landing top).
-    const host = lower
-    const other = upper
-    const ascending = true
-
-    // Face the other room: run the stairs toward that wall.
-    const dx = other.position.x - host.position.x
-    const dz = other.position.z - host.position.z
-    const side: 'px' | 'nx' | 'pz' | 'nz' =
-      Math.abs(dx) > Math.abs(dz) ? (dx > 0 ? 'px' : 'nx') : (dz > 0 ? 'pz' : 'nz')
-    const axis: 'x' | 'z' = side === 'px' || side === 'nx' ? 'x' : 'z'
-
-    // Clamp the footprint to the host room.
-    const hostAlong = axis === 'z' ? host.depth : host.width
-    const hostAcross = axis === 'z' ? host.width : host.depth
-    const width = Math.min(STAIR_WIDTH, Math.max(1.4, hostAcross - 1.2))
-    const depth = Math.min(STAIR_DEPTH, Math.max(2.4, hostAlong - 1.2))
-
-    // Push the footprint against the facing wall.
-    const alongSign = side === 'px' || side === 'pz' ? 1 : -1
-    const hostHalfAlong = hostAlong / 2
-    const alongCenter = alongSign * (hostHalfAlong - depth / 2 - 0.35)
-
-    // Lateral placement: bias toward the other room, then shift away from
-    // doors on the facing wall so stairs never block a doorway.
-    const otherLat = axis === 'z' ? other.position.z - host.position.z : other.position.x - host.position.x
-    const maxLat = Math.max(0, hostAcross / 2 - width / 2 - 0.35)
-    const clampLat = (v: number) => Math.max(-maxLat, Math.min(maxLat, v))
-    const wallIndex = sideToWallIndex(side)
-    const doorLats = (doorsByRoom.get(host.id) ?? [])
-      .filter(d => d.wallIndex === wallIndex)
-      .map(d => (axis === 'z' ? d.position.z - host.position.z : d.position.x - host.position.x))
-
-    let lateral = clampLat(otherLat)
-    if (doorLats.length > 0) {
-      let best = lateral
-      let bestScore = -Infinity
-      for (let c = -maxLat; c <= maxLat + 1e-6; c += 0.5) {
-        const score = Math.min(...doorLats.map(d => Math.abs(c - d)))
-        const tiebreak = -Math.abs(c - clampLat(otherLat)) * 0.01
-        if (score + tiebreak > bestScore) {
-          bestScore = score + tiebreak
-          best = c
-        }
-      }
-      lateral = best
+    // A link is critical while an endpoint has no other connection yet
+    // (no corridors and no kept stairs): capping it could isolate a room,
+    // so critical links bypass the cap.
+    const lowerCritical = (corridorDegree.get(lower.id) ?? 0) === 0 && (keptCount.get(lower.id) ?? 0) === 0
+    const upperCritical = (corridorDegree.get(upper.id) ?? 0) === 0 && (keptCount.get(upper.id) ?? 0) === 0
+    if (!lowerCritical && !upperCritical &&
+        ((keptCount.get(lower.id) ?? 0) >= MAX_VERTICAL_PER_ROOM ||
+         (keptCount.get(upper.id) ?? 0) >= MAX_VERTICAL_PER_ROOM)) {
+      console.warn(
+        `[LevelWeaver] stair ${link.lowerRoomId}->${link.upperRoomId} omitted: ` +
+        `room vertical-link cap (${MAX_VERTICAL_PER_ROOM}) reached.`
+      )
+      continue
     }
 
-    const hx = host.position.x
-    const hz = host.position.z
-    plans.push({
-      link,
-      hostRoomId: host.id,
-      ascending,
-      axis,
-      x: axis === 'z' ? hx + lateral : hx + alongCenter,
-      z: axis === 'z' ? hz + alongCenter : hz + lateral,
-      width,
-      depth,
-    })
+    // Tower shaft first (compact folded flight: uniform look, walkable
+    // slope, small shaft), then in-room straight flight (big rooms), then
+    // in-room switchback (compact rooms), else report the link.
+    // Switchback footprint: two half-runs side by side + turn landing.
+    const nASw = Math.ceil(st.stepCount / 2)
+    const switchDepth = (nASw - 1) * st.stepDepth + st.stepDepth * 1.15 / 2 + LANDING_DEPTH
+    const switchWidth = st.width
+    const switchDims = { width: switchWidth, depth: switchDepth }
+    const plan =
+      tryTowerPlan(link, st, switchDims) ??
+      tryInRoomPlan(link, st, { width: st.width, depth: st.depth }, false) ??
+      tryInRoomPlan(link, st, switchDims, true)
+    if (!plan) {
+      console.warn(
+        `[LevelWeaver] stair ${link.lowerRoomId}->${link.upperRoomId} omitted: no rule-clean placement ` +
+        `(tower blocked and room too small, doors/stairs in the way, or arrival blocked).`
+      )
+      continue
+    }
+
+    // Reserve footprint + arrival shaft so later stairs avoid them.
+    recordPlan(st, plan)
+    keptCount.set(lower.id, (keptCount.get(lower.id) ?? 0) + 1)
+    keptCount.set(upper.id, (keptCount.get(upper.id) ?? 0) + 1)
+    plans.push(plan)
   }
 
   return plans
 }
 
-export function generateStairsGeometry(rooms: Room[], config: { floorHeight: number }): StairsGeometry[] {
-  return buildStairsGeometry(planStairs(rooms, new Map()), rooms, config.floorHeight)
+interface StairPlanner {
+  rooms: Room[]
+  roomMap: Map<string, Room>
+  doorsByRoom: Map<string, DoorOpening[]>
+  slabsByFloor: Map<number, Rect2D[]>
+  boundary: Boundary | undefined
+  footprints: Map<number, Rect2D[]>
+  floorHoles: Map<number, Rect2D[]>
+  /** All tower outer rects (full-height shafts: any floor conflicts). */
+  towers: Rect2D[]
+  stepCount: number
+  stepHeight: number
+  stepDepth: number
+  run: number
+  depth: number
+  width: number
+  atFloor: (map: Map<number, Rect2D[]>, floor: number) => Rect2D[]
+}
+
+function flightRectOf(x: number, z: number, width: number, depth: number, axis: 'x' | 'z'): Rect2D {
+  const halfAlong = depth / 2
+  const halfAcross = width / 2
+  return axis === 'z'
+    ? { minX: x - halfAcross, maxX: x + halfAcross, minZ: z - halfAlong, maxZ: z + halfAlong }
+    : { minX: x - halfAlong, maxX: x + halfAlong, minZ: z - halfAcross, maxZ: z + halfAcross }
+}
+
+// Top-landing rect (world) for arrival checks: straight flights land at
+// the +dir end, switchbacks fold back and land near the -dir end on the
+// return flight (computed from the step math, not guessed).
+export function landingRectOf(plan: Pick<StairPlan, 'x' | 'z' | 'width' | 'depth' | 'axis' | 'dir' | 'switchback' | 'stepCount' | 'stepDepth'>): Rect2D {
+  if (!plan.switchback) {
+    const topSign = plan.dir > 0 ? 1 : -1
+    const landLen = LANDING_DEPTH
+    if (plan.axis === 'z') {
+      const end = plan.z + topSign * (plan.depth / 2)
+      const lo = Math.min(end, end - topSign * landLen)
+      return { minX: plan.x - plan.width / 2, maxX: plan.x + plan.width / 2, minZ: lo, maxZ: lo + landLen }
+    }
+    const end = plan.x + topSign * (plan.depth / 2)
+    const lo = Math.min(end, end - topSign * landLen)
+    return { minX: lo, maxX: lo + landLen, minZ: plan.z - plan.width / 2, maxZ: plan.z + plan.width / 2 }
+  }
+  const nA = Math.ceil(plan.stepCount / 2)
+  const nB = plan.stepCount - nA
+  // Canonical top-tread center (matches createSwitchbackStairsMesh: A
+  // treads, turn landing, then B treads back), mirrored by dir below.
+  const topCanon = -plan.depth / 2 + (nA - 1) * plan.stepDepth + plan.stepDepth * 1.15 / 2 + LANDING_DEPTH - (nB - 1) * plan.stepDepth
+  const half = LANDING_DEPTH / 2
+  if (plan.axis === 'z') {
+    const cz = plan.z + plan.dir * topCanon
+    return { minX: plan.x - plan.width / 2, maxX: plan.x + plan.width / 2, minZ: cz - half, maxZ: cz + half }
+  }
+  const cx = plan.x + plan.dir * topCanon
+  return { minX: cx - half, maxX: cx + half, minZ: plan.z - plan.width / 2, maxZ: plan.z + plan.width / 2 }
+}
+
+function recordPlan(st: StairPlanner, plan: StairPlan): void {
+  const host = st.roomMap.get(plan.hostRoomId)!
+  const upper = st.roomMap.get(plan.link.upperRoomId)!
+  const placed = flightRectOf(plan.x, plan.z, plan.width, plan.depth, plan.axis)
+  st.atFloor(st.footprints, host.floorIndex).push(placed)
+  if (plan.towerRect) st.towers.push(plan.towerRect)
+  if (upper) {
+    const arrival = rectIntersection(placed, roomRect(upper))
+    if (arrival) st.atFloor(st.floorHoles, upper.floorIndex).push(arrival)
+  }
+}
+
+// In-room flight: straight (big rooms) or switchback (compact rooms).
+// Same rule set as towers, applied inside the host room.
+function tryInRoomPlan(
+  link: VerticalLink,
+  st: StairPlanner,
+  dims: { width: number; depth: number },
+  switchback: boolean
+): StairPlan | null {
+  const lower = st.roomMap.get(link.lowerRoomId)!
+  const upper = st.roomMap.get(link.upperRoomId)!
+  if (!lower || !upper) return null
+  const host = lower
+  const other = upper
+  const hostRect = roomRect(host)
+  const upperRect = roomRect(upper)
+  const hostFloor = host.floorIndex
+  const upperFloor = upper.floorIndex
+  const { width, depth } = dims
+
+  const dx = other.position.x - host.position.x
+  const dz = other.position.z - host.position.z
+  const facingAxis: 'x' | 'z' = Math.abs(dx) > Math.abs(dz) ? 'x' : 'z'
+  const facingSign: 1 | -1 = (facingAxis === 'x' ? dx : dz) > 0 ? 1 : -1
+
+  const orientations: { axis: 'x' | 'z'; dir: 1 | -1 }[] = [
+    { axis: 'x', dir: 1 },
+    { axis: 'x', dir: -1 },
+    { axis: 'z', dir: 1 },
+    { axis: 'z', dir: -1 },
+  ]
+
+  const doors = st.doorsByRoom.get(host.id) ?? []
+  const upperSlabs = st.slabsByFloor.get(upperFloor) ?? []
+  const sameFloorPrints = st.atFloor(st.footprints, hostFloor)
+  const standingHoles = st.atFloor(st.floorHoles, hostFloor)
+
+  let best: StairPlan | null = null
+  let bestScore = -Infinity
+
+  for (const { axis, dir } of orientations) {
+    const alongRoom = axis === 'z' ? host.depth : host.width
+    const acrossRoom = axis === 'z' ? host.width : host.depth
+    if (depth + 0.7 > alongRoom || width + 0.7 > acrossRoom) continue
+    const aRange = alongRoom / 2 - depth / 2 - STAIR_WALL_INSET
+    const cRange = acrossRoom / 2 - width / 2 - STAIR_WALL_INSET
+
+    for (let a = -aRange; a <= aRange + 1e-6; a += 0.5) {
+      for (let c = -cRange; c <= cRange + 1e-6; c += 0.5) {
+        const cx = axis === 'z' ? host.position.x + c : host.position.x + a
+        const cz = axis === 'z' ? host.position.z + a : host.position.z + c
+        const rect = flightRectOf(cx, cz, width, depth, axis)
+
+        // 1. Footprint (+stringer margin) stays inside the host room.
+        if (
+          rect.minX - STAIR_WALL_INSET < hostRect.minX ||
+          rect.maxX + STAIR_WALL_INSET > hostRect.maxX ||
+          rect.minZ - STAIR_WALL_INSET < hostRect.minZ ||
+          rect.maxZ + STAIR_WALL_INSET > hostRect.maxZ
+        ) continue
+
+        // 2. Never block a doorway: stairs may stand beside a gate,
+        // never in its walk-through zone (shared rule with towers).
+        let doorClear = Infinity
+        let doorBlocked = false
+        for (const d of doors) {
+          doorClear = Math.min(doorClear, pointRectDist(d.position.x, d.position.z, rect))
+          if (stairBlocksDoor(rect, d)) doorBlocked = true
+        }
+        if (doorBlocked) continue
+
+        // 3. Clear of other stairwells on this floor + open shafts below.
+        let stairClear = Infinity
+        let blocked = false
+        for (const f of sameFloorPrints) {
+          const gap = rectGap(rect, f)
+          stairClear = Math.min(stairClear, gap)
+          if (gap < STAIR_STAIR_GAP) {
+            blocked = true
+            break
+          }
+        }
+        if (blocked) continue
+        for (const h of standingHoles) {
+          if (rectsOverlap(rect, h, 0.2)) {
+            blocked = true
+            break
+          }
+        }
+        if (blocked) continue
+
+        // 4b. Never pierce a non-target upper room's floor.
+        for (const r of st.rooms) {
+          if (r.floorIndex !== upperFloor || r.id === upper.id) continue
+          if (rectsOverlap(rect, roomRect(r), 0.2)) {
+            blocked = true
+            break
+          }
+        }
+        if (blocked) continue
+
+        // 4. Upper arrival through the link's upper room (shared rule:
+        // landing inside the overlap, shaft clear of slabs/stairs/holes).
+        const overlap = rectIntersection(rect, upperRect)
+        if (overlap) {
+          const landing = landingRectOf({ x: cx, z: cz, width, depth, axis, dir, switchback, stepCount: st.stepCount, stepDepth: st.stepDepth })
+          if (!checkUpperArrival(rect, landing, upper, upperSlabs, st)) continue
+        }
+
+        const facing = axis === facingAxis && dir === facingSign ? 3 : 0
+        const wallDist = Math.min(
+          rect.minX - hostRect.minX, hostRect.maxX - rect.maxX,
+          rect.minZ - hostRect.minZ, hostRect.maxZ - rect.maxZ
+        )
+        const score = facing + Math.min(doorClear, 3) + Math.min(stairClear, 4) + (wallDist < 1.0 ? 2 : 0)
+        if (score > bestScore) {
+          bestScore = score
+          best = {
+            link,
+            hostRoomId: host.id,
+            ascending: true,
+            axis,
+            dir,
+            x: cx,
+            z: cz,
+            width,
+            depth,
+            stepCount: st.stepCount,
+            stepHeight: st.stepHeight,
+            stepDepth: st.stepDepth,
+            kind: 'inroom',
+            switchback,
+            towerRect: null,
+            towerDoor: null,
+          }
+        }
+      }
+    }
+  }
+
+  return best
+}
+
+// Attached outdoor stair tower: flush against one host wall, full-height
+// shaft to the ground, open top with parapet. Fits regardless of room
+// size, so walkable slope never depends on room dimensions.
+function tryTowerPlan(
+  link: VerticalLink,
+  st: StairPlanner,
+  dims: { width: number; depth: number }
+): StairPlan | null {
+  if (!st.boundary) return null
+  const lower = st.roomMap.get(link.lowerRoomId)!
+  const upper = st.roomMap.get(link.upperRoomId)!
+  if (!lower || !upper) return null
+  const host = lower
+  const hostFloor = host.floorIndex
+  const upperFloor = upper.floorIndex
+  const { width, depth } = dims
+  const towerLen = depth + 0.6
+  const halfT = TOWER_WIDTH / 2
+
+  const dx = upper.position.x - host.position.x
+  const dz = upper.position.z - host.position.z
+  const facingAxis: 'x' | 'z' = Math.abs(dx) > Math.abs(dz) ? 'x' : 'z'
+  const facingSign: 1 | -1 = (facingAxis === 'x' ? dx : dz) > 0 ? 1 : -1
+  const sides: { axis: 'x' | 'z'; sign: 1 | -1; wallIndex: number }[] = [
+    { axis: 'x', sign: 1, wallIndex: 1 },
+    { axis: 'x', sign: -1, wallIndex: 3 },
+    { axis: 'z', sign: 1, wallIndex: 2 },
+    { axis: 'z', sign: -1, wallIndex: 0 },
+  ]
+  // Facing wall first (deterministic): arrival lands toward the partner.
+  sides.sort((p, q) => {
+    const pf = p.axis === facingAxis && p.sign === facingSign ? 0 : 1
+    const qf = q.axis === facingAxis && q.sign === facingSign ? 0 : 1
+    return pf - qf
+  })
+
+  const doors = st.doorsByRoom.get(host.id) ?? []
+  const hostSlabs = st.slabsByFloor.get(hostFloor) ?? []
+  const upperSlabs = st.slabsByFloor.get(upperFloor) ?? []
+
+  let best: StairPlan | null = null
+  let bestScore = -Infinity
+
+  for (const side of sides) {
+    const alongWall = side.axis === 'x' ? host.depth : host.width
+    const wallC = side.axis === 'x' ? host.position.z : host.position.x
+    const wallPlane = side.axis === 'x'
+      ? host.position.x + side.sign * (host.width / 2)
+      : host.position.z + side.sign * (host.depth / 2)
+    const maxLat = alongWall / 2 - halfT - 0.3
+    if (maxLat < 0) continue
+
+    for (let c = -maxLat; c <= maxLat + 1e-6; c += 0.5) {
+      // Tower outer rect: near edge flush with the host wall plane.
+      const near = wallPlane
+      const far = wallPlane + side.sign * towerLen
+      const t0 = wallC + c
+      const rect: Rect2D = side.axis === 'x'
+        ? { minX: Math.min(near, far), maxX: Math.max(near, far), minZ: t0 - halfT, maxZ: t0 + halfT }
+        : { minX: t0 - halfT, maxX: t0 + halfT, minZ: Math.min(near, far), maxZ: Math.max(near, far) }
+
+      // a. Inside the map (rect in outer bounds, center in shape).
+      const cx = (rect.minX + rect.maxX) / 2
+      const cz = (rect.minZ + rect.maxZ) / 2
+      if (
+        rect.minX < -st.boundary.width / 2 + 0.5 || rect.maxX > st.boundary.width / 2 - 0.5 ||
+        rect.minZ < -st.boundary.depth / 2 + 0.5 || rect.maxZ > st.boundary.depth / 2 - 0.5 ||
+        !isPointInBoundary({ x: cx, z: cz }, st.boundary, 1)
+      ) continue
+
+      // b. Clear of rooms on the host floor (except the host: abutting).
+      let blocked = false
+      for (const r of st.rooms) {
+        if (r.floorIndex !== hostFloor || r.id === host.id) continue
+        if (rectsOverlap(rect, roomRect(r), 1.0)) {
+          blocked = true
+          break
+        }
+      }
+      if (blocked) continue
+
+      // c. Clear of host-floor corridor slabs.
+      for (const s of hostSlabs) {
+        if (rectsOverlap(rect, s, 0.3)) {
+          blocked = true
+          break
+        }
+      }
+      if (blocked) continue
+
+      // d. Clear of other tower shafts (full height: any floor conflicts).
+      for (const t of st.towers) {
+        if (rectsOverlap(rect, t, 0.8)) {
+          blocked = true
+          break
+        }
+      }
+      if (blocked) continue
+
+      // e. Ground column: clear of rooms on lower floors.
+      for (const r of st.rooms) {
+        if (r.floorIndex >= hostFloor) continue
+        if (rectsOverlap(rect, roomRect(r), 0.5)) {
+          blocked = true
+          break
+        }
+      }
+      if (blocked) continue
+
+      // f. Top: may overlap the arrival room (shaft curb), nothing else up there.
+      for (const r of st.rooms) {
+        if (r.floorIndex !== upperFloor || r.id === upper.id) continue
+        if (rectsOverlap(rect, roomRect(r), 0.3)) {
+          blocked = true
+          break
+        }
+      }
+      if (blocked) continue
+      for (const s of upperSlabs) {
+        if (rectsOverlap(rect, s, 0.2)) {
+          blocked = true
+          break
+        }
+      }
+      if (blocked) continue
+
+      // g. No host doorway in the tower's way (shared walk-zone rule).
+      for (const d of doors) {
+        if (stairBlocksDoor(rect, d)) {
+          blocked = true
+          break
+        }
+      }
+      if (blocked) continue
+
+      // h. Folded flight inside the tower + upper arrival rules.
+      const flightX = side.axis === 'x' ? wallPlane + side.sign * (0.3 + depth / 2) : wallC + c
+      const flightZ = side.axis === 'x' ? wallC + c : wallPlane + side.sign * (0.3 + depth / 2)
+      const flight: Rect2D = flightRectOf(flightX, flightZ, width, depth, side.axis)
+      if (!flightInsideTower(flight, rect)) continue
+      const landing = landingRectOf({ x: flightX, z: flightZ, width, depth, axis: side.axis, dir: side.sign, switchback: true, stepCount: st.stepCount, stepDepth: st.stepDepth })
+      if (!checkUpperArrival(flight, landing, upper, upperSlabs, st)) continue
+
+      // Score: facing partner, clearance to towers/doors.
+      let towerClear = Infinity
+      for (const t of st.towers) towerClear = Math.min(towerClear, rectGap(rect, t))
+      let hostDoorClear = Infinity
+      for (const d of doors) {
+        if (d.wallIndex !== side.wallIndex) continue
+        const lat = side.axis === 'x' ? d.position.z : d.position.x
+        hostDoorClear = Math.min(hostDoorClear, Math.abs(lat - (wallC + c)))
+      }
+      const facing = side.axis === facingAxis && side.sign === facingSign ? 3 : 0
+      const score = facing + Math.min(towerClear, 4) + Math.min(hostDoorClear, 3)
+      if (score > bestScore) {
+        bestScore = score
+        // Door center on the shared wall (mouth matches the shaft).
+        const doorPos = side.axis === 'x'
+          ? { x: wallPlane, z: wallC + c }
+          : { x: wallC + c, z: wallPlane }
+        best = {
+          link,
+          hostRoomId: host.id,
+          ascending: true,
+          axis: side.axis,
+          dir: side.sign,
+          x: flightX,
+          z: flightZ,
+          width,
+          depth,
+          stepCount: st.stepCount,
+          stepHeight: st.stepHeight,
+          stepDepth: st.stepDepth,
+          kind: 'tower',
+          switchback: true,
+          towerRect: rect,
+          towerDoor: { wallIndex: side.wallIndex, x: doorPos.x, z: doorPos.z },
+        }
+      }
+    }
+  }
+
+  return best
+}
+
+// Flight must sit inside its tower shaft.
+function flightInsideTower(flight: Rect2D, tower: Rect2D): boolean {
+  return (
+    flight.minX >= tower.minX - 1e-6 && flight.maxX <= tower.maxX + 1e-6 &&
+    flight.minZ >= tower.minZ - 1e-6 && flight.maxZ <= tower.maxZ + 1e-6
+  )
+}
+
+// Shared upper-arrival rule: overlapping flights need the landing inside
+// the overlap and the shaft clear of slabs, stairs, and other shafts.
+function checkUpperArrival(
+  flight: Rect2D,
+  landing: Rect2D,
+  upper: Room,
+  upperSlabs: Rect2D[],
+  st: StairPlanner
+): boolean {
+  const overlap = rectIntersection(flight, roomRect(upper))
+  if (!overlap) return true // roof arrival: no hole needed
+  if (
+    landing.minX < overlap.minX - 1e-6 || landing.maxX > overlap.maxX + 1e-6 ||
+    landing.minZ < overlap.minZ - 1e-6 || landing.maxZ > overlap.maxZ + 1e-6
+  ) return false
+  for (const s of upperSlabs) {
+    if (rectsOverlap(overlap, s, 0.4)) return false
+  }
+  for (const f of st.atFloor(st.footprints, upper.floorIndex)) {
+    if (rectsOverlap(overlap, f, 0.1)) return false
+  }
+  for (const h of st.atFloor(st.floorHoles, upper.floorIndex)) {
+    if (rectsOverlap(overlap, h, 0)) return false
+  }
+  return true
 }
 
 export function buildStairsGeometry(plans: StairPlan[], rooms: Room[], floorHeight: number): StairsGeometry[] {
@@ -131,32 +692,57 @@ export function buildStairsGeometry(plans: StairPlan[], rooms: Room[], floorHeig
     const upper = roomMap.get(plan.link.upperRoomId)!
     if (!lower || !upper) continue
 
-    const stepCount = Math.max(8, Math.min(16, Math.floor(floorHeight / 0.18)))
-    const stepHeight = floorHeight / stepCount
-    const stepDepth = (plan.depth - LANDING_DEPTH) / (stepCount - 1)
+    const built = plan.switchback
+      ? createSwitchbackStairsMesh(
+        plan.x,
+        plan.z,
+        plan.width,
+        plan.depth,
+        plan.axis,
+        plan.dir,
+        0,
+        plan.stepCount,
+        plan.stepHeight,
+        plan.stepDepth
+      )
+      : createStairsMesh(
+        plan.x,
+        plan.z,
+        plan.width,
+        plan.depth,
+        floorHeight,
+        plan.axis,
+        plan.dir,
+        0,
+        plan.stepCount,
+        plan.stepHeight,
+        plan.stepDepth
+      )
 
-    const built = createStairsMesh(
-      plan.x,
-      plan.z,
-      plan.width,
-      plan.depth,
-      floorHeight,
-      plan.axis,
-      0,
-      stepCount,
-      stepHeight,
-      stepDepth
-    )
+    // Attached shaft geometry (tower plans only).
+    const tower = plan.towerRect && plan.towerDoor
+      ? {
+          ...createStairTower(plan.towerRect, plan.axis, plan.dir, lower.floorIndex, floorHeight),
+          rect: plan.towerRect,
+          door: { x: plan.towerDoor.x, y: lower.floorIndex * floorHeight, z: plan.towerDoor.z },
+        }
+      : null
 
     stairs.push({
       id: `stairs_${plan.link.lowerRoomId}_${plan.link.upperRoomId}`,
       startFloor: lower.floorIndex,
       endFloor: upper.floorIndex,
       hostRoomId: plan.hostRoomId,
+      upperRoomId: plan.link.upperRoomId,
+      kind: plan.kind,
       axis: plan.axis,
       position: { x: plan.x, y: lower.floorIndex * floorHeight, z: plan.z },
       width: plan.width,
       depth: plan.depth,
+      stepCount: plan.stepCount,
+      stepHeight: plan.stepHeight,
+      stepDepth: plan.stepDepth,
+      tower,
       steps: built.steps,
       risers: built.risers,
       stringers: built.stringers,
@@ -167,11 +753,58 @@ export function buildStairsGeometry(plans: StairPlan[], rooms: Room[], floorHeig
   return stairs
 }
 
+// Attached shaft: floor slab, two side walls + far end wall from the
+// ground up to a parapet above the arrival level, open on the host side
+// (the host wall + door close it) and open on top (arrival platform).
+function createStairTower(
+  rect: Rect2D,
+  axis: 'x' | 'z',
+  dir: 1 | -1,
+  hostFloor: number,
+  floorHeight: number
+): { floor: MeshData; walls: MeshData[] } {
+  const cx = (rect.minX + rect.maxX) / 2
+  const cz = (rect.minZ + rect.maxZ) / 2
+  const wX = rect.maxX - rect.minX
+  const wZ = rect.maxZ - rect.minZ
+  const t = 0.3
+  // Local Y: group sits at the host floor base; walls run from the ground
+  // (world y=0) to a parapet above the arrival level.
+  const yDown = -hostFloor * floorHeight
+  const yTop = floorHeight + TOWER_PARAPET
+  const yMid = (yDown + yTop) / 2
+  const yH = yTop - yDown
+
+  const floor = createBoxMesh(cx, FLOOR_THICKNESS / 2, cz, wX, FLOOR_THICKNESS, wZ, 1)
+  const walls: MeshData[] = []
+
+  // Outward unit (host -> far end) in world XZ.
+  const ox = axis === 'x' ? dir : 0
+  const oz = axis === 'z' ? dir : 0
+
+  if (axis === 'x') {
+    // Side walls along X at both Z edges (inset inward).
+    for (const s of [-1, 1]) {
+      walls.push(createBoxMesh(cx, yMid, cz + s * (wZ / 2 - t / 2), wX, yH, t, 0))
+    }
+    // Far end wall (near end stays open toward the host door).
+    walls.push(createBoxMesh(cx + ox * (wX / 2 - t / 2), yMid, cz, t, yH, wZ - 2 * t, 0))
+  } else {
+    for (const s of [-1, 1]) {
+      walls.push(createBoxMesh(cx + s * (wX / 2 - t / 2), yMid, cz, t, yH, wZ, 0))
+    }
+    walls.push(createBoxMesh(cx, yMid, cz + oz * (wZ / 2 - t / 2), wX - 2 * t, yH, t, 0))
+  }
+
+  return { floor, walls }
+}
+
 function createStairsMesh(
   centerX: number, centerZ: number,
   width: number, depth: number,
   totalHeight: number,
   axis: 'x' | 'z',
+  dir: 1 | -1,
   baseY: number,
   stepCount: number,
   stepHeight: number,
@@ -182,7 +815,7 @@ function createStairsMesh(
   const stringers: MeshData[] = []
   const landing: MeshData[] = []
 
-  // Stairs ascend toward +axis (toward the facing wall). Map run/across
+  // Stairs ascend toward dir*axis. Map run/across
   // coordinates to world XZ.
   const toWorld = (along: number, y: number, across: number): { x: number; y: number; z: number } =>
     axis === 'z'
@@ -199,9 +832,9 @@ function createStairsMesh(
       : createBoxMesh(c.x, c.y, c.z, alongLen, h, acrossLen, materialIndex)
   }
 
-  // Landing platform at the top (+along end).
+  // Landing platform at the top (+along end, mirrored by dir).
   const landingY = baseY + totalHeight
-  const landingCenter = depth / 2 - LANDING_DEPTH / 2
+  const landingCenter = dir * (depth / 2 - LANDING_DEPTH / 2)
   landing.push(putBox(landingCenter, landingY + FLOOR_THICKNESS / 2, 0, LANDING_DEPTH, FLOOR_THICKNESS, width, 1))
 
   // Stringers: sloped side beams. Slope basis: u along the slope,
@@ -216,17 +849,17 @@ function createStairsMesh(
   for (const s of [-1, 1]) {
     const across = s * (halfW + stringerDepth / 2)
     // Beam center: halfway up the slope, starting at the low end.
-    const lowAlong = -depth / 2 + LANDING_DEPTH
-    const midAlong = lowAlong + (run / stringerLength) * (stringerLength / 2)
+    const lowAlong = dir * (-depth / 2 + LANDING_DEPTH)
+    const midAlong = lowAlong + dir * (run / 2)
     const midY = baseY + totalHeight / 2
     const c = toWorld(midAlong, midY, across)
-    // Slope direction in world space (ascending toward +along).
+    // Slope direction in world space (ascending toward dir*along).
     const slope = axis === 'z'
-      ? { x: 0, y: sinA, z: cosA }
-      : { x: cosA, y: sinA, z: 0 }
+      ? { x: 0, y: sinA, z: dir * cosA }
+      : { x: dir * cosA, y: sinA, z: 0 }
     const normal = axis === 'z'
-      ? { x: 0, y: cosA, z: -sinA }
-      : { x: -sinA, y: cosA, z: 0 }
+      ? { x: 0, y: cosA, z: -dir * sinA }
+      : { x: -dir * sinA, y: cosA, z: 0 }
     const acrossAxis = axis === 'z'
       ? { x: 1, y: 0, z: 0 }
       : { x: 0, y: 0, z: 1 }
@@ -242,16 +875,131 @@ function createStairsMesh(
 
   for (let i = 0; i < stepCount; i++) {
     const y = baseY + i * stepHeight
-    const along = -depth / 2 + LANDING_DEPTH + i * stepDepth
+    const along = dir * (-depth / 2 + LANDING_DEPTH + i * stepDepth)
 
     // Step tread (slight overlap avoids hairline gaps).
     steps.push(putBox(along, y + stepHeight / 2, 0, stepDepth * 1.15, stepHeight, width, 1))
 
     // Riser (vertical face toward the ascending side).
     if (i < stepCount - 1) {
-      risers.push(putBox(along + stepDepth / 2, y + stepHeight, 0, 0.15, stepHeight, width, 0))
+      risers.push(putBox(along + dir * stepDepth / 2, y + stepHeight, 0, 0.15, stepHeight, width, 0))
     }
   }
+
+  return { steps, risers, stringers, landing }
+}
+
+// Folded switchback flight: two half-runs side by side sharing one turn
+// landing. Same riser/tread code as a straight flight in roughly half the
+// footprint depth, so compact rooms can still host walkable stairs.
+function createSwitchbackStairsMesh(
+  centerX: number, centerZ: number,
+  width: number, depth: number,
+  axis: 'x' | 'z',
+  dir: 1 | -1,
+  baseY: number,
+  stepCount: number,
+  stepHeight: number,
+  stepDepth: number
+): { steps: MeshData[]; risers: MeshData[]; stringers: MeshData[]; landing: MeshData[] } {
+  const steps: MeshData[] = []
+  const risers: MeshData[] = []
+  const stringers: MeshData[] = []
+  const landing: MeshData[] = []
+  const flightW = width / 2
+
+  const toWorld = (along: number, y: number, across: number): { x: number; y: number; z: number } =>
+    axis === 'z'
+      ? { x: centerX + across, y, z: centerZ + along }
+      : { x: centerX + along, y, z: centerZ + across }
+  const putBox = (
+    along: number, y: number, across: number,
+    alongLen: number, h: number, acrossLen: number,
+    materialIndex: number
+  ): MeshData => {
+    const c = toWorld(along, y, across)
+    return axis === 'z'
+      ? createBoxMesh(c.x, c.y, c.z, acrossLen, h, alongLen, materialIndex)
+      : createBoxMesh(c.x, c.y, c.z, alongLen, h, acrossLen, materialIndex)
+  }
+  // Slope beam between two run/across points (world-space via toWorld).
+  const putBeam = (
+    a0: number, y0: number, c0: number,
+    a1: number, y1: number, c1: number,
+    beamH: number, beamW: number
+  ): void => {
+    const p0 = toWorld(a0, y0, c0)
+    const p1 = toWorld(a1, y1, c1)
+    const dx = p1.x - p0.x
+    const dy = p1.y - p0.y
+    const dz = p1.z - p0.z
+    const len = Math.sqrt(dx * dx + dy * dy + dz * dz)
+    if (len < 0.01) return
+    const ux = dx / len
+    const uy = dy / len
+    const uz = dz / len
+    const acrossAxis = axis === 'z'
+      ? { x: 1, y: 0, z: 0 }
+      : { x: 0, y: 0, z: 1 }
+    // Beam normal = slope x across axis, flipped to face up.
+    let nx = uy * acrossAxis.z
+    let ny = uz * acrossAxis.x - ux * acrossAxis.z
+    let nz = -uy * acrossAxis.x
+    if (ny < 0) {
+      nx = -nx
+      ny = -ny
+      nz = -nz
+    }
+    stringers.push(createOrientedBox(
+      { x: (p0.x + p1.x) / 2, y: (p0.y + p1.y) / 2, z: (p0.z + p1.z) / 2 },
+      { u: { x: ux, y: uy, z: uz }, v: { x: nx, y: ny, z: nz }, w: acrossAxis },
+      len,
+      beamH,
+      beamW,
+      0
+    ))
+  }
+
+  const nA = Math.ceil(stepCount / 2)
+  const e0 = -depth / 2 // entry end (canonical frame; mirrored by dir below)
+  const runA = nA * stepDepth
+  const M = (alongCanon: number) => dir * alongCanon
+
+  // Flight A (low): entry end ascending toward +canonical-along.
+  for (let i = 0; i < nA; i++) {
+    const y = baseY + i * stepHeight
+    const along = M(e0 + i * stepDepth)
+    steps.push(putBox(along, y + stepHeight / 2, -flightW / 2, stepDepth * 1.15, stepHeight, flightW, 1))
+    // No riser on the top tread: the turn landing's box face covers it.
+    if (i < nA - 1) {
+      risers.push(putBox(along + dir * stepDepth / 2, y + stepHeight, -flightW / 2, 0.15, stepHeight, flightW, 0))
+    }
+  }
+
+  // Turn landing (full width) at A's top, flush with its top tread.
+  const landY = baseY + nA * stepHeight
+  const landC = M(e0 + runA + LANDING_DEPTH / 2)
+  landing.push(putBox(landC, landY - FLOOR_THICKNESS / 2, 0, LANDING_DEPTH, FLOOR_THICKNESS, width, 1))
+
+  // Flight B: back along -canonical-along from the landing to full height.
+  // No riser on its top tread (0.2m lip to the upper floor, step-up-able).
+  const nB = stepCount - nA
+  for (let j = 0; j < nB; j++) {
+    const y = landY + j * stepHeight
+    const along = M(e0 + runA + LANDING_DEPTH - j * stepDepth)
+    steps.push(putBox(along, y + stepHeight / 2, flightW / 2, stepDepth * 1.15, stepHeight, flightW, 1))
+    if (j < nB - 1) {
+      risers.push(putBox(along - dir * stepDepth / 2, y + stepHeight, flightW / 2, 0.15, stepHeight, flightW, 0))
+    }
+  }
+
+  // Outer stringers following each flight.
+  const beamW = 0.3
+  const beamH = 0.3
+  putBeam(M(e0), baseY, -flightW - beamW / 2, M(e0 + runA), landY, -flightW - beamW / 2, beamH, beamW)
+  putBeam(M(e0), baseY, beamW / 2, M(e0 + runA), landY, beamW / 2, beamH, beamW)
+  putBeam(M(e0 + runA + LANDING_DEPTH), landY, -beamW / 2, M(e0), landY + nB * stepHeight, -beamW / 2, beamH, beamW)
+  putBeam(M(e0 + runA + LANDING_DEPTH), landY, flightW + beamW / 2, M(e0), landY + nB * stepHeight, flightW + beamW / 2, beamH, beamW)
 
   return { steps, risers, stringers, landing }
 }

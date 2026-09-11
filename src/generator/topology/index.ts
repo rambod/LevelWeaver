@@ -178,6 +178,21 @@ function getRoomWeight(type: RoomType): number {
   }
 }
 
+// Stair-host preference for vertical links: a walkable 4m rise needs ~7m
+// of run, which only large lower rooms fit. Bonus steers links there.
+function lowerRoomBonus(type: RoomType): number {
+  switch (type) {
+    case 'hub':
+    case 'arena': return 9
+    case 'hall':
+    case 'objective': return 4
+    case 'storage':
+    case 'spawn':
+    case 'exit': return 1
+    default: return 0.5
+  }
+}
+
 function buildConnections(
   nodes: Map<string, TopologyNode>,
   config: LevelConfig,
@@ -248,6 +263,12 @@ function buildConnections(
   // placed far away). Falls back to adjacent floors only for single-room
   // floors. Deterministic: nearest distance, lowest id breaks ties.
   ensureConnected(nodes)
+
+  // Same-floor guarantee: every room on a multi-room floor needs at least
+  // one same-floor link. Stairs can be dropped by placement rules, but
+  // corridors never drop — so a room whose links are all vertical can be
+  // stranded by dropped shafts. Single-room floors keep cross-floor links.
+  ensureSameFloorLink(nodes)
 }
 
 function addConnection(nodes: Map<string, TopologyNode>, aId: string, bId: string): void {
@@ -285,16 +306,18 @@ function handleVerticalConnections(
     if (lowerRooms.length === 0 || upperRooms.length === 0) continue
 
     // Score every cross-floor pair by XZ distance (plus a little seeded
-    // jitter for variety). Stairs are built at/near the linked rooms, so
-    // close pairs keep vertical circulation reachable instead of floating
-    // at the midpoint of two distant rooms.
+    // jitter for variety), preferring LARGE lower rooms as stair hosts: a
+    // walkable 4m rise needs ~7m of run, which only big rooms fit. Stairs
+    // are built at/near the linked rooms, so close pairs also keep
+    // vertical circulation reachable instead of floating at the midpoint
+    // of two distant rooms.
     const pairs = []
     for (const lower of lowerRooms) {
       for (const upper of upperRooms) {
         pairs.push({
           lower,
           upper,
-          score: distance(lower.position, upper.position) - random.nextFloat(0, 10),
+          score: distance(lower.position, upper.position) - lowerRoomBonus(lower.type) - random.nextFloat(0, 10),
         })
       }
     }
@@ -378,4 +401,21 @@ function nearestOnFloors(
     }
   }
   return best
+}
+
+function ensureSameFloorLink(nodes: Map<string, TopologyNode>): void {
+  const floorCounts = new Map<number, number>()
+  for (const node of nodes.values()) {
+    floorCounts.set(node.floorIndex, (floorCounts.get(node.floorIndex) ?? 0) + 1)
+  }
+  for (const node of nodes.values()) {
+    if ((floorCounts.get(node.floorIndex) ?? 0) < 2) continue
+    const hasSameFloor = [...node.connections].some(id => {
+      const other = nodes.get(id)
+      return other !== undefined && other.floorIndex === node.floorIndex
+    })
+    if (hasSameFloor) continue
+    const best = nearestOnFloors(nodes, node, [node.floorIndex])
+    if (best) addConnection(nodes, node.id, best.id)
+  }
 }
