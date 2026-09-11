@@ -128,6 +128,14 @@ export interface StairsGeometry {
   id: string
   startFloor: number
   endFloor: number
+  /** Host room containing the stairs (stairs always live inside a room). */
+  hostRoomId: string
+  /** Stair run axis in room space. */
+  axis: 'x' | 'z'
+  /** World-space footprint center at the host floor base. */
+  position: Vec3
+  width: number
+  depth: number
   steps: MeshData[]
   risers: MeshData[]
   stringers: MeshData[]
@@ -164,6 +172,14 @@ export interface MaterialParams {
   color: number
   roughness: number
   metalness: number
+}
+
+// Axis-aligned rectangle in XZ (room-local or world depending on context).
+export interface Rect2D {
+  minX: number
+  maxX: number
+  minZ: number
+  maxZ: number
 }
 
 // Vertical distance between consecutive floor base levels (meters).

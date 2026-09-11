@@ -197,7 +197,12 @@ function buildConnections(
     return distA - distB
   })
 
-  // Connect each node to previous nodes (tree-like base)
+  // Connect each node to previous nodes (tree-like base). Partners are
+  // chosen NEAR-first (seeded): uniform random picks produced far-flung
+  // links that became 60m+ corridors dominating the map. Links beyond
+  // TREE_LINK_MAX are only used when nothing nearer exists (connectivity
+  // beats looks; ensureConnected is the final backstop).
+  const TREE_LINK_MAX = 45
   for (let i = 1; i < nodeArray.length; i++) {
     const node = nodeArray[i]
     const candidates = nodeArray.slice(0, i).filter(n =>
@@ -205,22 +210,30 @@ function buildConnections(
     )
 
     if (candidates.length > 0) {
-      const target = random.pick(candidates)
+      const near = candidates.filter(n => distance(node.position, n.position) <= TREE_LINK_MAX)
+      const target = pickNear(node, near.length > 0 ? near : candidates, random)
       addConnection(nodes, node.id, target.id)
     }
   }
 
-  // Add extra connections for loops/alternate paths
+  // Add extra connections for loops/alternate paths (near-biased too, and
+  // capped: long alternates are allowed only when short ones run out).
+  const EXTRA_LINK_MAX = 40
   const extraConnections = Math.round(targetConnections * connectivity)
   for (let i = 0; i < extraConnections; i++) {
     const a = random.pick(nodeArray)
-    const b = random.pick(nodeArray)
-
-    if (a.id !== b.id &&
-        !a.connections.has(b.id) &&
-        (a.floorIndex === b.floorIndex || Math.abs(a.floorIndex - b.floorIndex) === 1)) {
-      addConnection(nodes, a.id, b.id)
-    }
+    const inRange = (n: TopologyNode) =>
+      n.id !== a.id &&
+      !a.connections.has(n.id) &&
+      (n.floorIndex === a.floorIndex || Math.abs(n.floorIndex - a.floorIndex) === 1)
+    const candidates = nodeArray.filter(inRange)
+    if (candidates.length === 0) continue
+    const near = candidates.filter(n => distance(a.position, n.position) <= EXTRA_LINK_MAX)
+    const pool = near.length > 0 ? near : candidates
+    // Mostly near, occasionally far (keeps long alternate routes possible
+    // without letting them dominate).
+    const b = random.nextBool(0.85) ? pickNear(a, pool, random) : random.pick(pool)
+    addConnection(nodes, a.id, b.id)
   }
 
   // Handle vertical connectors
@@ -230,9 +243,10 @@ function buildConnections(
   applyDeadEnds(nodes, config, random)
 
   // Final guarantee: attach any still-orphaned room to its nearest
-  // same-or-adjacent-floor neighbor. (The tree pass can leave orphans when
-  // no earlier room shares an adjacent floor, and corridor generation may
-  // skip links.) Deterministic: nearest distance, lowest id breaks ties.
+  // SAME-floor neighbor (a same-floor link always yields a walkable
+  // corridor; a cross-floor link would strand the room behind stairs
+  // placed far away). Falls back to adjacent floors only for single-room
+  // floors. Deterministic: nearest distance, lowest id breaks ties.
   ensureConnected(nodes)
 }
 
@@ -243,6 +257,16 @@ function addConnection(nodes: Map<string, TopologyNode>, aId: string, bId: strin
     a.connections.add(bId)
     b.connections.add(aId)
   }
+}
+
+// Seeded near-first pick: sort candidates by distance with a small random
+// jitter for variety, then take one of the closest few.
+function pickNear(from: TopologyNode, candidates: TopologyNode[], random: SeededRandom): TopologyNode {
+  const ranked = candidates
+    .map(c => ({ c, score: distance(from.position, c.position) - random.nextFloat(0, 8) }))
+    .sort((p, q) => p.score - q.score)
+  const shortlist = ranked.slice(0, Math.min(3, ranked.length))
+  return random.pick(shortlist).c
 }
 
 function handleVerticalConnections(
@@ -329,17 +353,29 @@ function distance(a: { x: number; z: number }, b: { x: number; z: number }): num
 function ensureConnected(nodes: Map<string, TopologyNode>): void {
   for (const node of nodes.values()) {
     if (node.connections.size > 0) continue
-    let best: TopologyNode | null = null
-    let bestDist = Infinity
-    for (const other of nodes.values()) {
-      if (other.id === node.id) continue
-      if (Math.abs(other.floorIndex - node.floorIndex) > 1) continue
-      const d = distance(node.position, other.position)
-      if (d < bestDist || (d === bestDist && best !== null && other.id < best.id)) {
-        best = other
-        bestDist = d
-      }
-    }
+    // Prefer same floor; adjacent floors only as a last resort.
+    const best =
+      nearestOnFloors(nodes, node, [node.floorIndex]) ??
+      nearestOnFloors(nodes, node, [node.floorIndex - 1, node.floorIndex + 1])
     if (best) addConnection(nodes, node.id, best.id)
   }
+}
+
+function nearestOnFloors(
+  nodes: Map<string, TopologyNode>,
+  node: TopologyNode,
+  floors: number[]
+): TopologyNode | null {
+  let best: TopologyNode | null = null
+  let bestDist = Infinity
+  for (const other of nodes.values()) {
+    if (other.id === node.id) continue
+    if (!floors.includes(other.floorIndex)) continue
+    const d = distance(node.position, other.position)
+    if (d < bestDist || (d === bestDist && best !== null && other.id < best.id)) {
+      best = other
+      bestDist = d
+    }
+  }
+  return best
 }

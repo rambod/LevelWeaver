@@ -1,4 +1,4 @@
-import type { Room, Corridor, RoomGeometry, CorridorGeometry, MeshData, DoorOpening, Vec3 } from '@/core/types'
+import type { Room, Corridor, RoomGeometry, CorridorGeometry, MeshData, DoorOpening, Vec3, Rect2D } from '@/core/types'
 import { DOOR_WIDTH, DOOR_HEIGHT } from '@/core/types'
 import { createBoxMesh, createOrientedBox, combineMeshes, createEmptyMesh } from '@/core/meshdata'
 
@@ -11,12 +11,20 @@ const FLOOR_THICKNESS = 0.2
 const CEILING_THICKNESS = 0.2
 
 
-export function generateRoomGeometry(rooms: Room[], doorOpenings: Map<string, DoorOpening[]>): RoomGeometry[] {
-  return rooms.map(room => generateSingleRoomGeometry(room, doorOpenings.get(room.id) || []))
+export interface RoomSlabHoles {
+  floor?: Rect2D | null
+  ceiling?: Rect2D | null
 }
 
+export function generateRoomGeometry(
+  rooms: Room[],
+  doorOpenings: Map<string, DoorOpening[]>,
+  slabHoles?: Map<string, RoomSlabHoles>
+): RoomGeometry[] {
+  return rooms.map(room => generateSingleRoomGeometry(room, doorOpenings.get(room.id) || [], slabHoles?.get(room.id)))
+}
 
-function generateSingleRoomGeometry(room: Room, doors: DoorOpening[]): RoomGeometry {
+function generateSingleRoomGeometry(room: Room, doors: DoorOpening[], holes?: RoomSlabHoles): RoomGeometry {
   const { width, depth, height } = room
   const halfW = width / 2
   const halfD = depth / 2
@@ -40,23 +48,44 @@ function generateSingleRoomGeometry(room: Room, doors: DoorOpening[]): RoomGeome
     id: room.id,
     type: room.type,
     floorIndex: room.floorIndex,
-    floor: createFloorMesh(halfW, halfD, y, FLOOR_THICKNESS),
+    floor: createSlabWithHole(width, depth, y + FLOOR_THICKNESS, FLOOR_THICKNESS, holes?.floor ?? null, 1),
     walls: createWallMeshes(halfW, halfD, height, y, WALL_THICKNESS, localDoors),
-    ceiling: createCeilingMesh(halfW, halfD, y + height, CEILING_THICKNESS),
+    ceiling: createSlabWithHole(width, depth, y + height, CEILING_THICKNESS, holes?.ceiling ?? null, 2),
     doorOpenings: doors,
   }
 }
 
-
-function createFloorMesh(halfW: number, halfD: number, y: number, thickness: number): MeshData {
-  // Solid slab: top surface at y + thickness.
-  return createBoxMesh(0, y + thickness / 2, 0, halfW * 2, thickness, halfD * 2, 1)
-}
-
-
-function createCeilingMesh(halfW: number, halfD: number, y: number, thickness: number): MeshData {
-  // Solid slab: top surface at y (bottom face at y - thickness).
-  return createBoxMesh(0, y - thickness / 2, 0, halfW * 2, thickness, halfD * 2, 2)
+// Solid slab with an optional axis-aligned rectangular hole (stairwells).
+// The hole is in room-local coordinates (room centered at origin).
+function createSlabWithHole(
+  width: number,
+  depth: number,
+  yTop: number,
+  thickness: number,
+  hole: Rect2D | null,
+  materialIndex: number
+): MeshData {
+  const yCenter = yTop - thickness / 2
+  if (!hole) {
+    return createBoxMesh(0, yCenter, 0, width, thickness, depth, materialIndex)
+  }
+  const hx0 = Math.max(-width / 2, hole.minX)
+  const hx1 = Math.min(width / 2, hole.maxX)
+  const hz0 = Math.max(-depth / 2, hole.minZ)
+  const hz1 = Math.min(depth / 2, hole.maxZ)
+  const parts: MeshData[] = []
+  const push = (cx: number, cz: number, w: number, d: number) => {
+    if (w > 0.05 && d > 0.05) {
+      parts.push(createBoxMesh(cx, yCenter, cz, w, thickness, d, materialIndex))
+    }
+  }
+  // Left / right of the hole (full depth).
+  push((-width / 2 + hx0) / 2, 0, hx0 + width / 2, depth)
+  push((hx1 + width / 2) / 2, 0, width / 2 - hx1, depth)
+  // Front / back of the hole (between its X edges).
+  push((hx0 + hx1) / 2, (-depth / 2 + hz0) / 2, hx1 - hx0, hz0 + depth / 2)
+  push((hx0 + hx1) / 2, (hz1 + depth / 2) / 2, hx1 - hx0, depth / 2 - hz1)
+  return combineMeshes(parts, materialIndex)
 }
 
 
@@ -239,133 +268,269 @@ export function generateCorridorGeometry(corridors: Corridor[]): CorridorGeometr
 }
 
 
+// ---------------------------------------------------------------------------
+// Corridor ribbons.
+//
+// A corridor is a swept path: floor/ceiling slabs and side walls share one
+// vertex loop per joint, so segments can never overlap, z-fight, or leave
+// wedge gaps (the old per-segment boxes did all three at every joint).
+// ---------------------------------------------------------------------------
+
+interface FlatPoint {
+  x: number
+  z: number
+}
+
+interface RibbonVertex {
+  x: number
+  y: number
+  z: number
+  u: number
+  v: number
+}
+
+interface Miter {
+  /** Scaled offset (unit normal * miter scale) for exact joint placement. */
+  mx: number
+  mz: number
+  /** Unit normal for lighting. */
+  ux: number
+  uz: number
+}
+
+function newRibbonBuilder() {
+  const positions: number[] = []
+  const normals: number[] = []
+  const uvs: number[] = []
+  const indices: number[] = []
+
+  function vert(v: RibbonVertex, n: { x: number; y: number; z: number }): number {
+    positions.push(v.x, v.y, v.z)
+    normals.push(n.x, n.y, n.z)
+    uvs.push(v.u, v.v)
+    return positions.length / 3 - 1
+  }
+
+  // Quad strip between two vertex rows (same length, uniform normal).
+  function strip(rowA: RibbonVertex[], rowB: RibbonVertex[], n: { x: number; y: number; z: number }): void {
+    for (let i = 0; i < rowA.length - 1; i++) {
+      const a0 = vert(rowA[i], n)
+      const b0 = vert(rowB[i], n)
+      const b1 = vert(rowB[i + 1], n)
+      const a1 = vert(rowA[i + 1], n)
+      indices.push(a0, b0, b1, a0, b1, a1)
+    }
+  }
+
+  // Single quad with one normal (skirts, caps, wall faces).
+  function quad(a: RibbonVertex, b: RibbonVertex, c: RibbonVertex, d: RibbonVertex, n: { x: number; y: number; z: number }): void {
+    const a0 = vert(a, n)
+    const b0 = vert(b, n)
+    const c0 = vert(c, n)
+    const d0 = vert(d, n)
+    indices.push(a0, b0, c0, a0, c0, d0)
+  }
+
+  function build(materialIndex: number): MeshData {
+    return {
+      vertices: new Float32Array(positions),
+      indices: new Uint32Array(indices),
+      normals: new Float32Array(normals),
+      uvs: new Float32Array(uvs),
+      materialIndex,
+    }
+  }
+
+  return { strip, quad, build }
+}
+
+// Miter offset per path point: averaged segment normals, scaled so the
+// offset edge stays exactly `offset` away from the centerline.
+function computeMiters(pts: FlatPoint[]): Miter[] {
+  const n = pts.length
+  const segN: { x: number; z: number }[] = []
+  for (let i = 0; i < n - 1; i++) {
+    const dx = pts[i + 1].x - pts[i].x
+    const dz = pts[i + 1].z - pts[i].z
+    const len = Math.sqrt(dx * dx + dz * dz) || 1
+    segN.push({ x: -dz / len, z: dx / len })
+  }
+  const miters: Miter[] = []
+  for (let i = 0; i < n; i++) {
+    let nx: number
+    let nz: number
+    if (i === 0) {
+      nx = segN[0].x
+      nz = segN[0].z
+    } else if (i === n - 1) {
+      nx = segN[n - 2].x
+      nz = segN[n - 2].z
+    } else {
+      const ax = segN[i - 1].x + segN[i].x
+      const az = segN[i - 1].z + segN[i].z
+      const al = Math.sqrt(ax * ax + az * az)
+      if (al < 1e-6) {
+        // U-turn: fall back to the incoming normal.
+        nx = segN[i - 1].x
+        nz = segN[i - 1].z
+      } else {
+        const cosHalf = (ax * segN[i].x + az * segN[i].z) / al
+        const scale = Math.min(2.5, 1 / Math.max(0.45, cosHalf))
+        nx = (ax / al) * scale
+        nz = (az / al) * scale
+      }
+    }
+    const ul = Math.sqrt(nx * nx + nz * nz) || 1
+    miters.push({ mx: nx, mz: nz, ux: nx / ul, uz: nz / ul })
+  }
+  return miters
+}
+
+function arclengths(pts: FlatPoint[]): number[] {
+  const out = [0]
+  for (let i = 1; i < pts.length; i++) {
+    out.push(out[i - 1] + Math.sqrt((pts[i].x - pts[i - 1].x) ** 2 + (pts[i].z - pts[i - 1].z) ** 2))
+  }
+  return out
+}
+
+function segmentDir(pts: FlatPoint[], i: number): { x: number; z: number } {
+  const dx = pts[i + 1].x - pts[i].x
+  const dz = pts[i + 1].z - pts[i].z
+  const len = Math.sqrt(dx * dx + dz * dz) || 1
+  return { x: dx / len, z: dz / len }
+}
+
+// Horizontal slab (floor or ceiling). yTop is the TOP surface; the slab is
+// a hair wider than the walls' outer faces so no faces are coplanar.
+function buildSlabRibbon(
+  pts: FlatPoint[],
+  miters: Miter[],
+  arc: number[],
+  half: number,
+  yTop: number,
+  thickness: number,
+  materialIndex: number
+): MeshData {
+  const b = newRibbonBuilder()
+  const yBot = yTop - thickness
+  const topL: RibbonVertex[] = []
+  const topR: RibbonVertex[] = []
+  const botL: RibbonVertex[] = []
+  const botR: RibbonVertex[] = []
+  for (let i = 0; i < pts.length; i++) {
+    const u = arc[i] / 3
+    topL.push({ x: pts[i].x + miters[i].mx * half, y: yTop, z: pts[i].z + miters[i].mz * half, u, v: 0 })
+    topR.push({ x: pts[i].x - miters[i].mx * half, y: yTop, z: pts[i].z - miters[i].mz * half, u, v: 1 })
+    botL.push({ x: pts[i].x + miters[i].mx * half, y: yBot, z: pts[i].z + miters[i].mz * half, u, v: 0 })
+    botR.push({ x: pts[i].x - miters[i].mx * half, y: yBot, z: pts[i].z - miters[i].mz * half, u, v: 1 })
+  }
+  b.strip(topL, topR, { x: 0, y: 1, z: 0 })
+  b.strip(botL, botR, { x: 0, y: -1, z: 0 })
+
+  for (let i = 0; i < pts.length - 1; i++) {
+    const d = segmentDir(pts, i)
+    const n = { x: -d.z, y: 0, z: d.x }
+    // Left skirt (outward +normal).
+    b.quad(topL[i], topL[i + 1], botL[i + 1], botL[i], n)
+    // Right skirt (outward -normal).
+    b.quad(topR[i + 1], topR[i], botR[i], botR[i + 1], { x: -n.x, y: 0, z: -n.z })
+  }
+
+  // End caps read as thresholds where the corridor meets the doorway.
+  const d0 = segmentDir(pts, 0)
+  b.quad(topL[0], topR[0], botR[0], botL[0], { x: -d0.x, y: 0, z: -d0.z })
+  const d1 = segmentDir(pts, pts.length - 2)
+  const l = pts.length - 1
+  b.quad(topR[l], topL[l], botL[l], botR[l], { x: d1.x, y: 0, z: d1.z })
+
+  return b.build(materialIndex)
+}
+
+// Vertical side wall ribbon: inner face, outer face, top cap. No end caps:
+// both path ends are open doorways into rooms.
+function buildWallRibbon(
+  pts: FlatPoint[],
+  miters: Miter[],
+  arc: number[],
+  side: 1 | -1,
+  innerOffset: number,
+  thickness: number,
+  yBase: number,
+  height: number,
+  materialIndex: number
+): MeshData {
+  const b = newRibbonBuilder()
+  const yTop = yBase + height
+  const inBot: RibbonVertex[] = []
+  const inTop: RibbonVertex[] = []
+  const outBot: RibbonVertex[] = []
+  const outTop: RibbonVertex[] = []
+  for (let i = 0; i < pts.length; i++) {
+    const u = arc[i] / 3
+    const ix = pts[i].x + miters[i].mx * side * innerOffset
+    const iz = pts[i].z + miters[i].mz * side * innerOffset
+    const ox = pts[i].x + miters[i].mx * side * (innerOffset + thickness)
+    const oz = pts[i].z + miters[i].mz * side * (innerOffset + thickness)
+    inBot.push({ x: ix, y: yBase, z: iz, u, v: 0 })
+    inTop.push({ x: ix, y: yTop, z: iz, u, v: 1 })
+    outBot.push({ x: ox, y: yBase, z: oz, u, v: 0 })
+    outTop.push({ x: ox, y: yTop, z: oz, u, v: 1 })
+  }
+  // Top cap is one continuous strip (uniform normal).
+  b.strip(inTop, outTop, { x: 0, y: 1, z: 0 })
+  // Faces get per-segment normals for crisp corners.
+  for (let i = 0; i < pts.length - 1; i++) {
+    const d = segmentDir(pts, i)
+    const inward = { x: -d.z * side, y: 0, z: d.x * side }
+    // Inner face (toward the corridor).
+    b.quad(inBot[i], inBot[i + 1], inTop[i + 1], inTop[i], { x: -inward.x, y: 0, z: -inward.z })
+    // Outer face.
+    b.quad(outBot[i + 1], outBot[i], outTop[i], outTop[i + 1], inward)
+  }
+  return b.build(materialIndex)
+}
+
 function buildCorridorGeometry(corridor: Corridor, points: Vec3[]): CorridorGeometry {
   const width = corridor.width
   // Local coordinates: the corridor group is positioned at the floor level
   // by the renderer/exporter, so build around y=0 here (see room geometry).
   const floorY = 0
-  
-  // Build combined floor, walls, ceiling from path segments
-  const floorMeshes: MeshData[] = []
-  const wallMeshes: MeshData[] = []
-  const ceilingMeshes: MeshData[] = []
+  const wallH = 3
 
-  for (let i = 0; i < points.length - 1; i++) {
-    const start = points[i]
-    const end = points[i + 1]
-    
-    floorMeshes.push(createCorridorSegmentFloor(start.x, start.z, end.x, end.z, width, floorY, FLOOR_THICKNESS))
-    wallMeshes.push(...createCorridorSegmentWalls(start.x, start.z, end.x, end.z, width, floorY, 3, WALL_THICKNESS))
-    ceilingMeshes.push(createCorridorSegmentCeiling(start.x, start.z, end.x, end.z, width, floorY + 3, CEILING_THICKNESS))
+  // Drop degenerate consecutive points (zero-length segments).
+  const clean: Vec3[] = []
+  for (const p of points) {
+    const prev = clean[clean.length - 1]
+    if (!prev || Math.sqrt((p.x - prev.x) ** 2 + (p.z - prev.z) ** 2) > 1e-4) {
+      clean.push(p)
+    }
+  }
+  if (clean.length < 2) {
+    return {
+      id: corridor.id,
+      floorIndex: corridor.floorIndex,
+      floor: createEmptyMesh(),
+      walls: [],
+      ceiling: createEmptyMesh(),
+    }
   }
 
-  const combinedFloor = combineMeshes(floorMeshes, 1)
-  const combinedCeiling = combineMeshes(ceilingMeshes, 2)
+  const flat: FlatPoint[] = clean.map(p => ({ x: p.x, z: p.z }))
+  const miters = computeMiters(flat)
+  const arc = arclengths(flat)
+  const halfSlab = width / 2 + WALL_THICKNESS + 0.02
 
   return {
     id: corridor.id,
     floorIndex: corridor.floorIndex,
-    floor: combinedFloor,
-    walls: wallMeshes,
-    ceiling: combinedCeiling,
+    floor: buildSlabRibbon(flat, miters, arc, halfSlab, floorY + FLOOR_THICKNESS, FLOOR_THICKNESS, 1),
+    walls: [
+      buildWallRibbon(flat, miters, arc, 1, width / 2, WALL_THICKNESS, floorY, wallH, 0),
+      buildWallRibbon(flat, miters, arc, -1, width / 2, WALL_THICKNESS, floorY, wallH, 0),
+    ],
+    ceiling: buildSlabRibbon(flat, miters, arc, halfSlab, floorY + wallH, CEILING_THICKNESS, 2),
   }
-}
-
-
-function createCorridorSegmentFloor(
-  x1: number, z1: number, x2: number, z2: number, width: number, y: number, thickness: number
-): MeshData {
-  const dx = x2 - x1
-  const dz = z2 - z1
-  const len = Math.sqrt(dx * dx + dz * dz)
-  if (len < 0.01) return createEmptyMesh()
-
-  const ux = dx / len
-  const uz = dz / len
-  // Extend past joints so angled segments don't leave wedge gaps.
-  const extLen = len + width
-
-  return createOrientedBox(
-    { x: (x1 + x2) / 2, y: y + thickness / 2, z: (z1 + z2) / 2 },
-    {
-      u: { x: ux, y: 0, z: uz },
-      v: { x: 0, y: 1, z: 0 },
-      w: { x: -uz, y: 0, z: ux },
-    },
-    extLen,
-    thickness,
-    width,
-    1
-  )
-}
-
-
-function createCorridorSegmentWalls(
-  x1: number, z1: number, x2: number, z2: number, width: number, y: number, height: number, thickness: number
-): MeshData[] {
-  const dx = x2 - x1
-  const dz = z2 - z1
-  const len = Math.sqrt(dx * dx + dz * dz)
-  if (len < 0.01) return []
-
-  const nx = -dz / len
-  const nz = dx / len
-  const hw = width / 2
-
-  // Extend past joints so angled wall segments overlap instead of gapping.
-  const ext = width * 0.5
-  const ux = dx / len
-  const uz = dz / len
-  const sx = x1 - ux * ext
-  const sz = z1 - uz * ext
-  const ex = x2 + ux * ext
-  const ez = z2 + uz * ext
-
-  // Left wall (relative to corridor direction)
-  const leftWall = createThickWall(
-    { x: sx - nx * hw, z: sz - nz * hw },
-    { x: ex - nx * hw, z: ez - nz * hw },
-    y, y + height, thickness,
-    { x: nx, y: 0, z: nz } // outward normal points away from corridor center
-  )
-
-  // Right wall
-  const rightWall = createThickWall(
-    { x: ex + nx * hw, z: ez + nz * hw },
-    { x: sx + nx * hw, z: sz + nz * hw },
-    y, y + height, thickness,
-    { x: -nx, y: 0, z: -nz }
-  )
-
-  return [leftWall, rightWall]
-}
-
-
-function createCorridorSegmentCeiling(
-  x1: number, z1: number, x2: number, z2: number, width: number, y: number, thickness: number
-): MeshData {
-  const dx = x2 - x1
-  const dz = z2 - z1
-  const len = Math.sqrt(dx * dx + dz * dz)
-  if (len < 0.01) return createEmptyMesh()
-
-  const ux = dx / len
-  const uz = dz / len
-  // Extend past joints like the floor slab. y is the TOP of the slab.
-  const extLen = len + width
-
-  return createOrientedBox(
-    { x: (x1 + x2) / 2, y: y - thickness / 2, z: (z1 + z2) / 2 },
-    {
-      u: { x: ux, y: 0, z: uz },
-      v: { x: 0, y: 1, z: 0 },
-      w: { x: -uz, y: 0, z: ux },
-    },
-    extLen,
-    thickness,
-    width,
-    2
-  )
 }
 
 // Vertical circulation lives in `@/generator/vertical`; re-exported here
