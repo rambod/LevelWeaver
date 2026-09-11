@@ -1,4 +1,5 @@
 import type { Room, Corridor, LevelConfig, Vec3 } from '@/core/types'
+import { gateWidthFor, SPATIAL_DEFAULTS } from '@/core/rules'
 
 interface Obstacle {
   minX: number
@@ -261,9 +262,9 @@ function createCorridor(
 ): Corridor | null {
   // Door points on the room walls facing each other. The clamp matches
   // core/generation's door computation exactly so the corridor mouth and
-  // the wall opening land on the same center.
-  const startDoor = findDoorPosition(roomA, roomB.position, config.corridorWidth)
-  const endDoor = findDoorPosition(roomB, roomA.position, config.corridorWidth)
+  // the wall opening land on the same center with the same width.
+  const startDoor = findDoorPosition(roomA, roomB.position, config.corridorWidth, config)
+  const endDoor = findDoorPosition(roomB, roomA.position, config.corridorWidth, config)
 
   if (!startDoor || !endDoor) return null
 
@@ -343,7 +344,7 @@ export interface DoorSpot {
   nz: number
 }
 
-function findDoorPosition(room: Room, targetPos: { x: number; z: number }, corridorWidth: number): DoorSpot | null {
+function findDoorPosition(room: Room, targetPos: { x: number; z: number }, corridorWidth: number, config?: LevelConfig): DoorSpot | null {
   const halfW = room.width / 2
   const halfD = room.depth / 2
   const relX = targetPos.x - room.position.x
@@ -351,11 +352,17 @@ function findDoorPosition(room: Room, targetPos: { x: number; z: number }, corri
   const absX = Math.abs(relX)
   const absZ = Math.abs(relZ)
 
-  // Opening matches the corridor mouth; shrink to fit narrow walls.
+  // Opening matches the gate the wall cutter will produce (lawbook §28:
+  // corridor mouth and door hole must share one center AND one width).
+  // Falls back to the legacy corridor-width rule when no config is given.
   const wallLength = absX > absZ ? room.depth : room.width
-  const opening = Math.max(1.0, Math.min(corridorWidth, wallLength - 0.6))
+  const opening = config
+    ? gateWidthFor(config, wallLength, corridorWidth)
+    : Math.max(1.0, Math.min(corridorWidth, wallLength - 0.6))
+  if (opening <= 0.05) return null // wall far too short: no fake mouth
+  const margin = SPATIAL_DEFAULTS.doorCornerMargin
   const clampRel = (v: number, half: number) =>
-    Math.max(-half + opening / 2 + 0.3, Math.min(half - opening / 2 - 0.3, v))
+    Math.max(-half + opening / 2 + margin, Math.min(half - opening / 2 - margin, v))
 
   // Determine which wall face the target is closest to
   let doorX = room.position.x

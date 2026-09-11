@@ -1,0 +1,199 @@
+import type { LevelConfig } from '@/core/types'
+
+// Centralized dimensional rules (LAWBOOK §7, §106).
+//
+// FORBIDDEN: hard-coding 1.0 / 2.4 / 0.3 etc. in scattered generator
+// functions. Every minimum/default below is the single source of truth;
+// generator stages derive their geometry from here, never from literals.
+
+export const EPSILON = 0.0001
+
+export const AGENT_DEFAULTS = {
+  height: 1.8,
+  radius: 0.3,
+  shoulderClearance: 0.1,
+  headClearance: 0.2,
+  maxStepHeight: 0.2,
+  maxWalkSlopeDeg: 45,
+} as const
+
+/** Lawbook §5.1: minimumClearWidth = 2*radius + 2*shoulder. */
+export const MIN_CLEAR_WIDTH =
+  2 * AGENT_DEFAULTS.radius + 2 * AGENT_DEFAULTS.shoulderClearance // 0.80 m
+
+/** Lawbook §5.1: minimumClearHeight = height + headClearance. */
+export const MIN_CLEAR_HEIGHT =
+  AGENT_DEFAULTS.height + AGENT_DEFAULTS.headClearance // 2.00 m
+
+export const SPATIAL_DEFAULTS = {
+  epsilon: EPSILON,
+  wallThickness: 0.2,
+  floorThickness: 0.2,
+  ceilingThickness: 0.2,
+
+  minRoomWidth: 2.4,
+  minRoomDepth: 2.4,
+  minRoomArea: 6.0,
+  minRoomAspectRatio: 0.5,
+  maxRoomAspectRatio: 2.0,
+  roomBuffer: 0.25,
+
+  // Lawbook §106 strict V0.1 defaults.
+  doorClearWidth: 1.0,
+  doorClearHeight: 2.1,
+  doorCornerMargin: 0.25,
+  doorSeparation: 0.25,
+
+  corridorWidth: 1.2,
+  corridorClearHeight: 2.4,
+  minCorridorSegment: 0.5,
+
+  floorToFloorHeight: 3.2,
+  clearCeilingHeight: 2.7,
+
+  stair: {
+    clearWidth: 1.2,
+    minRiser: 0.1,
+    maxRiser: 0.178,
+    targetRiser: 0.17,
+    minTread: 0.28,
+    preferredTread: 0.3,
+    minHeadroom: 2.05,
+    landingDepth: 1.2,
+  },
+} as const
+
+export interface StairMath {
+  stepCount: number
+  stepHeight: number
+  stepDepth: number
+  run: number
+}
+
+/**
+ * Lawbook §41-43: N = ceil(H / rMax), riser = H / N, run = N * tread.
+ * Throws when the rise cannot be bridged within [minRiser, maxRiser].
+ */
+export function stairMathFor(
+  rise: number,
+  treadDepth: number = SPATIAL_DEFAULTS.stair.preferredTread,
+): StairMath {
+  const { minRiser, maxRiser } = SPATIAL_DEFAULTS.stair
+  if (!(rise > 0) || !Number.isFinite(rise)) {
+    throw new Error(`[LevelWeaver] invalid stair rise ${rise}.`)
+  }
+  const stepCount = Math.max(2, Math.ceil(rise / maxRiser))
+  const stepHeight = rise / stepCount
+  if (stepHeight < minRiser - EPSILON || stepHeight > maxRiser + EPSILON) {
+    throw new Error(
+      `[LevelWeaver] stair rise ${rise.toFixed(2)} m needs riser ${stepHeight.toFixed(4)} m, ` +
+        `outside [${minRiser}, ${maxRiser}]. Adjust wall height / floor spacing.`,
+    )
+  }
+  if (treadDepth < SPATIAL_DEFAULTS.stair.minTread - EPSILON) {
+    throw new Error(
+      `[LevelWeaver] stair tread ${treadDepth} m below minimum ${SPATIAL_DEFAULTS.stair.minTread} m.`,
+    )
+  }
+  return { stepCount, stepHeight, stepDepth: treadDepth, run: stepCount * treadDepth }
+}
+
+export interface ConfigIssue {
+  code: string
+  message: string
+}
+
+/**
+ * Gate (door) opening width for a wall of usable length `wallLength`.
+ * Single source of truth shared by the corridor router and the door
+ * cutter so the corridor mouth and the wall hole always agree (§28).
+ *
+ * The gate never exceeds the configured gate width or the corridor mouth;
+ * on short walls it shrinks to fit (corner margins kept). It is NOT
+ * clamped back up to the minimum: a wall too short for a legal gate is a
+ * placement failure the validators must report, not a dimension to fake.
+ */
+export function gateWidthFor(
+  config: LevelConfig,
+  wallLength: number,
+  corridorWidth?: number,
+): number {
+  const mouth = Math.min(config.doorWidth, corridorWidth ?? config.corridorWidth)
+  const fit = wallLength - 2 * SPATIAL_DEFAULTS.doorCornerMargin - 0.1
+  return Math.min(mouth, fit)
+}
+
+/**
+ * Lawbook §73: coarse feasibility before generation. Returns hard errors;
+ * the caller must refuse to generate (never silently shrink dimensions).
+ */
+export function validateConfigFeasibility(config: LevelConfig): ConfigIssue[] {
+  const issues: ConfigIssue[] = []
+  const wall = config.wallHeight
+  const doorW = config.doorWidth
+  const doorH = config.doorHeight
+
+  if (!(wall >= 3.2 - EPSILON && wall <= 5.5 + EPSILON)) {
+    issues.push({
+      code: 'CONFIG_WALL_HEIGHT',
+      message: `wallHeight ${wall} m outside [3.2, 5.5].`,
+    })
+  }
+  if (!(doorW >= MIN_CLEAR_WIDTH - EPSILON)) {
+    issues.push({
+      code: 'CONFIG_DOOR_WIDTH',
+      message:
+        `doorWidth ${doorW} m below agent minimum clear width ${MIN_CLEAR_WIDTH.toFixed(2)} m. ` +
+        `The 1.8 m player cannot pass.`,
+    })
+  }
+  if (!(doorH >= MIN_CLEAR_HEIGHT - EPSILON)) {
+    issues.push({
+      code: 'CONFIG_DOOR_HEIGHT',
+      message:
+        `doorHeight ${doorH} m below agent minimum clear height ${MIN_CLEAR_HEIGHT.toFixed(2)} m. ` +
+        `The 1.8 m player cannot pass.`,
+    })
+  }
+  // Header above the gate must fit inside the wall.
+  if (doorH > wall - 0.3 + EPSILON) {
+    issues.push({
+      code: 'CONFIG_DOOR_TALLER_THAN_WALL',
+      message:
+        `doorHeight ${doorH} m does not fit in wallHeight ${wall} m ` +
+        `(needs 0.30 m header). Lower the gate or raise the wall.`,
+    })
+  }
+  // Corridor must admit the agent.
+  if (!(config.corridorWidth >= MIN_CLEAR_WIDTH - EPSILON)) {
+    issues.push({
+      code: 'CONFIG_CORRIDOR_WIDTH',
+      message:
+        `corridorWidth ${config.corridorWidth} m below agent minimum ${MIN_CLEAR_WIDTH.toFixed(2)} m.`,
+    })
+  }
+  // Floor spacing must leave headroom: wall + slab allowance.
+  const floorSpacing = wall + 0.5
+  if (!(floorSpacing >= SPATIAL_DEFAULTS.clearCeilingHeight + SPATIAL_DEFAULTS.floorThickness - EPSILON)) {
+    issues.push({
+      code: 'CONFIG_FLOOR_SPACING',
+      message: `floor spacing ${floorSpacing.toFixed(2)} m leaves no legal ceiling/headroom.`,
+    })
+  }
+  // Stair riser feasibility for this floor height (lawbook §41).
+  try {
+    stairMathFor(floorSpacing)
+  } catch (err) {
+    issues.push({
+      code: 'CONFIG_STAIR_RISE',
+      message: err instanceof Error ? err.message : String(err),
+    })
+  }
+  if (!(config.roomCount >= 1)) {
+    issues.push({ code: 'CONFIG_ROOM_COUNT', message: 'roomCount must be >= 1.' })
+  }
+  if (!(config.floorCount >= 1 && config.floorCount <= 5)) {
+    issues.push({ code: 'CONFIG_FLOOR_COUNT', message: 'floorCount must be in [1, 5].' })
+  }
+  return issues
+}

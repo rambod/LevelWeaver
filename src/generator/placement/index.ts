@@ -24,12 +24,20 @@ export function placeRooms(
     roomsByFloor.get(room.floorIndex)!.push(room)
   }
 
-  // Process each floor independently
-  for (const [floorIndex, floorRooms] of roomsByFloor) {
-    const floorPlaced = placeRoomsOnFloor(floorRooms, boundary, config, random, floorIndex)
+  // Process floors bottom-up so upper rooms can stack over their
+  // already-placed vertical partners (lawbook §40: stairs need real
+  // XZ overlap between the linked rooms — independent per-floor layouts
+  // can never host a legal flight).
+  const allById = new Map(rooms.map(r => [r.id, r]))
+  const placedById = new Map<string, Room>()
+  const floorIndices = [...roomsByFloor.keys()].sort((a, b) => a - b)
+  for (const floorIndex of floorIndices) {
+    const floorRooms = roomsByFloor.get(floorIndex)!
+    const floorPlaced = placeRoomsOnFloor(floorRooms, boundary, config, random, floorIndex, allById, placedById)
     for (const room of floorPlaced) {
       placedRooms.push(room)
       roomMap.set(room.id, room)
+      placedById.set(room.id, room)
     }
   }
 
@@ -42,7 +50,11 @@ function placeRoomsOnFloor(
   boundary: Boundary,
   config: LevelConfig,
   random: SeededRandom,
-  _floorIndex: number
+  _floorIndex: number,
+  // All rooms (for cross-floor vertical partners) + rooms already placed
+  // on lower floors (stack targets with final positions).
+  allById?: Map<string, Room>,
+  placedById?: Map<string, Room>
 ): Room[] {
   const placed: Room[] = []
   const occupied: { x: number; z: number; w: number; d: number; roomId: string }[] = []
@@ -75,10 +87,17 @@ function placeRoomsOnFloor(
     const connections = adjacency.get(room.id) || []
     let pos: { x: number; z: number } | null = null
 
+    // Stack over an already-placed vertical partner first: a stair flight
+    // must overlap the upper room, so linked rooms share XZ volume. The
+    // candidate with the most overlap wins (deterministic partner order).
+    if (allById && placedById) {
+      pos = tryStackOnPartner(room, allById, placedById, placed, boundary, clearance, occupied)
+    }
+
     // Attach directly beside an already-placed connected room so the
     // corridor between them is a short straight stub, not a long route
     // across the map.
-    if (connections.length > 0) {
+    if (!pos && connections.length > 0) {
       const placedConnections = connections.filter(c =>
         placed.some(p => p.id === c)
       )
@@ -97,9 +116,11 @@ function placeRoomsOnFloor(
       }
     }
 
-    // Fallback: random valid position
+    // Fallback: random valid position — biased toward vertical partners
+    // so linked rooms land near each other (overlap for future stairs)
+    // even when exact stacking did not fit.
     if (!pos) {
-      pos = findRandomPosition(room, boundary, occupied, clearance, random)
+      pos = findRandomPosition(room, boundary, occupied, clearance, random, verticalAttractors(room, allById, placedById))
     }
 
     // Last resort: force place with overlap resolution
@@ -131,6 +152,77 @@ function centerPosition(
   const x = Math.max(-boundary.width / 2 + halfW, Math.min(boundary.width / 2 - halfW, boundary.center.x))
   const z = Math.max(-boundary.depth / 2 + halfD, Math.min(boundary.depth / 2 - halfD, boundary.center.y))
   return { x, z }
+}
+
+
+function overlapArea(
+  pos: { x: number; z: number }, room: Room,
+  partner: { x: number; z: number; w: number; d: number },
+): number {
+  const aMinX = pos.x - room.width / 2
+  const aMaxX = pos.x + room.width / 2
+  const aMinZ = pos.z - room.depth / 2
+  const aMaxZ = pos.z + room.depth / 2
+  const bMinX = partner.x - partner.w / 2
+  const bMaxX = partner.x + partner.w / 2
+  const bMinZ = partner.z - partner.d / 2
+  const bMaxZ = partner.z + partner.d / 2
+  return Math.max(0, Math.min(aMaxX, bMaxX) - Math.max(aMinX, bMinX)) *
+    Math.max(0, Math.min(aMaxZ, bMaxZ) - Math.max(aMinZ, bMinZ))
+}
+
+// Vertical stacking: rooms linked across floors share XZ so a legal stair
+// can pierce both. Tries the partner center, then deterministic rings of
+// offsets; keeps the fitting candidate with the largest overlap area.
+// Same-floor rooms still keep full clearance (no cheating on overlaps).
+function tryStackOnPartner(
+  room: Room,
+  allById: Map<string, Room>,
+  placedById: Map<string, Room>,
+  placed: Room[],
+  boundary: Boundary,
+  clearance: number,
+  occupied: { x: number; z: number; w: number; d: number; roomId: string }[]
+): { x: number; z: number } | null {
+  const partners = room.connections
+    .map(id => ({ id, ref: allById.get(id) }))
+    .filter((p): p is { id: string; ref: Room } => !!p.ref && p.ref.floorIndex !== room.floorIndex)
+    .map(p => placedById.get(p.id))
+    .filter((p): p is Room => !!p)
+    .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
+  if (partners.length === 0) return null
+
+  const offsets = [
+    { x: 0, z: 0 },
+    { x: 1.5, z: 0 }, { x: -1.5, z: 0 }, { x: 0, z: 1.5 }, { x: 0, z: -1.5 },
+    { x: 3, z: 0 }, { x: -3, z: 0 }, { x: 0, z: 3 }, { x: 0, z: -3 },
+    { x: 3, z: 3 }, { x: -3, z: 3 }, { x: 3, z: -3 }, { x: -3, z: -3 },
+    { x: 5, z: 0 }, { x: -5, z: 0 }, { x: 0, z: 5 }, { x: 0, z: -5 },
+  ]
+
+  let best: { x: number; z: number } | null = null
+  let bestScore = 0
+  for (const partner of partners) {
+    const target = { x: partner.position.x, z: partner.position.z, w: partner.width, d: partner.depth }
+    for (const off of offsets) {
+      const cand = { x: target.x + off.x, z: target.z + off.z }
+      if (!fitsInBoundary(cand, room, boundary)) continue
+      if (!isPointInBoundary(cand, boundary, 2)) continue
+      if (overlapsAny(cand, room, occupied, clearance)) continue
+      // Overlap with the partner, discounted by distance to already-placed
+      // same-floor neighbors (keeps corridors short too).
+      let score = overlapArea(cand, room, target)
+      if (score <= 0) continue
+      for (const other of placed) {
+        score -= 0.02 * Math.sqrt((cand.x - other.position.x) ** 2 + (cand.z - other.position.z) ** 2)
+      }
+      if (score > bestScore) {
+        bestScore = score
+        best = cand
+      }
+    }
+  }
+  return best
 }
 
 
@@ -215,12 +307,34 @@ function fitsInBoundary(
 }
 
 
+// Vertical partner positions to stay near: final positions for placed
+// lower-floor partners, topology intent positions for not-yet-placed ones.
+// Keeps stair-linked families in the same neighborhood so flights can
+// overlap both rooms even when exact stacking failed.
+function verticalAttractors(
+  room: Room,
+  allById?: Map<string, Room>,
+  placedById?: Map<string, Room>,
+): { x: number; z: number }[] {
+  if (!allById) return []
+  const out: { x: number; z: number }[] = []
+  for (const id of room.connections) {
+    const ref = allById.get(id)
+    if (!ref || ref.floorIndex === room.floorIndex) continue
+    const placed = placedById?.get(id)
+    out.push(placed ? { x: placed.position.x, z: placed.position.z } : { x: ref.position.x, z: ref.position.z })
+  }
+  return out
+}
+
+
 function findRandomPosition(
   room: Room,
   boundary: Boundary,
   occupied: { x: number; z: number; w: number; d: number; roomId: string }[],
   clearance: number,
-  random: SeededRandom
+  random: SeededRandom,
+  attract?: { x: number; z: number }[]
 ): { x: number; z: number } | null {
   const margin = 2
   const halfW = room.width / 2
@@ -233,16 +347,27 @@ function findRandomPosition(
 
   if (maxX < minX || maxZ < minZ) return null
 
+  // Best-of-N: with attractors, keep the valid candidate closest to the
+  // vertical family instead of a uniform far-flung pick.
+  let best: { x: number; z: number } | null = null
+  let bestScore = Infinity
   const attempts = 60
   for (let i = 0; i < attempts; i++) {
     const x = random.nextFloat(minX, maxX)
     const z = random.nextFloat(minZ, maxZ)
     if (!isPointInBoundary({ x, z }, boundary, margin)) continue
-    if (!overlapsAny({ x, z }, room, occupied, clearance)) {
-      return { x, z }
+    if (overlapsAny({ x, z }, room, occupied, clearance)) continue
+    if (!attract || attract.length === 0) return { x, z }
+    let score = Infinity
+    for (const a of attract) {
+      score = Math.min(score, Math.sqrt((x - a.x) ** 2 + (z - a.z) ** 2) + random.nextFloat(0, 4))
+    }
+    if (score < bestScore) {
+      bestScore = score
+      best = { x, z }
     }
   }
-  return null
+  return best
 }
 
 
@@ -320,53 +445,66 @@ export function resolveOverlaps(rooms: Room[], boundary: Boundary, minGap = 1.0)
 
 
 function resolveOverlapsOnFloor(rooms: Room[], boundary: Boundary, _floorIndex: number, minGap: number): Room[] {
-  const result = [...rooms]
-  const maxIterations = 100
-  let pushForce = 0.3
+  // Least-penetration separation (lawbook §19): each overlapping pair is
+  // resolved along its minimum-penetration axis by EXACTLY the missing
+  // distance (half each). Single-axis exact pushes cannot overshoot, so
+  // the loop converges instead of oscillating; boundary clamps run once
+  // per sweep (a clamp can reintroduce overlap, the next sweep fixes it).
+  // Bounded and deterministic. If the floor is genuinely overfull, the
+  // remainder is left for the validators to report honestly.
+  const result = rooms.map(r => ({ ...r, position: { ...r.position } }))
   const minSeparation = minGap // wall-to-wall gap (must fit corridors)
+  const eps = 1e-4
+  const maxSweeps = 300
 
-  for (let iter = 0; iter < maxIterations; iter++) {
-    let hasOverlap = false
-    let maxOverlap = 0
-
-    for (let i = 0; i < result.length; i++) {
-      for (let j = i + 1; j < result.length; j++) {
-        const a = result[i]
-        const b = result[j]
-
-        const dx = a.position.x - b.position.x
-        const dz = a.position.z - b.position.z
-        const minDistX = (a.width + b.width) / 2 + minSeparation
-        const minDistZ = (a.depth + b.depth) / 2 + minSeparation
-
-        const overlapX = minDistX - Math.abs(dx)
-        const overlapZ = minDistZ - Math.abs(dz)
-
-        if (overlapX > 0 && overlapZ > 0) {
-          hasOverlap = true
-          maxOverlap = Math.max(maxOverlap, overlapX, overlapZ)
-          
-          // Push apart proportionally to overlap
-          const pushFactor = pushForce * (1 + overlapX / minDistX + overlapZ / minDistZ)
-          const pushX = overlapX * pushFactor * (dx >= 0 ? 1 : -1)
-          const pushZ = overlapZ * pushFactor * (dz >= 0 ? 1 : -1)
-
-          result[i] = { ...a, position: { ...a.position, x: a.position.x + pushX, z: a.position.z + pushZ } }
-          result[j] = { ...b, position: { ...b.position, x: b.position.x - pushX, z: b.position.z - pushZ } }
-
-          clampToBoundary(result[i], boundary)
-          clampToBoundary(result[j], boundary)
+  // Up to two rounds: separation sweeps, then grid scatter to break a
+  // clamp deadlock, then sweeps again. Anything left is genuinely
+  // overfull and goes to the validators honestly.
+  for (let round = 0; round < 2; round++) {
+    let converged = false
+    for (let sweep = 0; sweep < maxSweeps; sweep++) {
+      let worst = 0
+      for (let i = 0; i < result.length; i++) {
+        for (let j = i + 1; j < result.length; j++) {
+          const a = result[i]
+          const b = result[j]
+          const dx = a.position.x - b.position.x
+          const dz = a.position.z - b.position.z
+          const minDistX = (a.width + b.width) / 2 + minSeparation
+          const minDistZ = (a.depth + b.depth) / 2 + minSeparation
+          const overlapX = minDistX - Math.abs(dx)
+          const overlapZ = minDistZ - Math.abs(dz)
+          if (overlapX > eps && overlapZ > eps) {
+            worst = Math.max(worst, overlapX, overlapZ)
+            // Deterministic direction: by sign, zero distance splits by id.
+            const signX = dx > eps ? 1 : dx < -eps ? -1 : a.id < b.id ? 1 : -1
+            const signZ = dz > eps ? 1 : dz < -eps ? -1 : a.id < b.id ? 1 : -1
+            if (overlapX <= overlapZ) {
+              const push = overlapX / 2 + eps
+              a.position.x += push * signX
+              b.position.x -= push * signX
+            } else {
+              const push = overlapZ / 2 + eps
+              a.position.z += push * signZ
+              b.position.z -= push * signZ
+            }
+          }
         }
       }
+      for (const room of result) clampToBoundary(room, boundary)
+      if (worst <= eps) {
+        converged = true
+        break
+      }
     }
-
-    if (!hasOverlap) break
-    // If overlaps persist, increase push force
-    if (iter > 50) pushForce *= 1.1
+    if (converged) break
+    if (round === 0) {
+      const scattered = verifyAndFixOverlaps(result, boundary, minGap)
+      for (let i = 0; i < result.length; i++) result[i].position = { ...scattered[i].position }
+    }
   }
 
-  // Final verification - if still overlapping, spread them out
-  return verifyAndFixOverlaps(result, boundary, minGap)
+  return result
 }
 
 

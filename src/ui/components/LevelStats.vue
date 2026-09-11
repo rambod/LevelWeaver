@@ -12,7 +12,15 @@ defineProps<{
     <div class="info-row"><span>Corridors:</span> <strong>{{ level.corridors.length }}</strong></div>
     <div class="info-row"><span>Stairs:</span> <strong>{{ level.stairs.length }}</strong></div>
     <div class="info-row"><span>Floors:</span> <strong>{{ level.config.floorCount }}</strong></div>
+    <div class="info-row"><span>Wall:</span> <strong>{{ level.config.wallHeight.toFixed(1) }} m</strong></div>
+    <div class="info-row"><span>Gate:</span> <strong>{{ level.config.doorWidth.toFixed(1) }} × {{ level.config.doorHeight.toFixed(1) }} m</strong></div>
     <div class="info-row"><span>Seed:</span> <strong>{{ level.seed }}</strong></div>
+    <div v-if="level.validation && level.validation.errors.length > 0" class="info-row issues">
+      <span>Issues:</span> <strong>{{ level.validation.errors.length }} error(s)</strong>
+    </div>
+    <div v-for="issue in (level.validation ? level.validation.errors.slice(0, 4) : [])" :key="issue.code + issue.message" class="issue">
+      [{{ issue.code }}] {{ issue.message }}
+    </div>
   </div>
 </template>
 
@@ -30,5 +38,15 @@ defineProps<{
 .info-row {
   display: flex;
   justify-content: space-between;
+}
+
+.info-row.issues {
+  color: #ff8888;
+}
+
+.issue {
+  font-size: 0.7rem;
+  color: #ff8888;
+  line-height: 1.35;
 }
 </style>

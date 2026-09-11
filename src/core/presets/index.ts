@@ -164,6 +164,10 @@ export function getDefaultConfig(): LevelConfig {
     deadEnds: 0.05,
     largeRoomCount: 2,
     wallHeight: 3.5,
+    // Gate (door) clear opening: must admit the 1.8 m playtester
+    // (lawbook §24-25: >= 0.80 m wide, >= 2.00 m high).
+    doorWidth: 1.8,
+    doorHeight: 2.4,
     theme: 'greybox',
   }
 }

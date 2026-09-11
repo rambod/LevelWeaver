@@ -102,6 +102,14 @@ export interface LevelConfig {
   /** Room wall height in meters (3.2 - 5.5). Drives room heights, corridor
    * height, and floor spacing together so stacked floors never intersect. */
   wallHeight: number
+  /** Gate (door opening) clear width in meters. Every traversable doorway
+   * uses this width (shrunk only when a wall is physically too short).
+   * Lawbook §24: must stay >= agent minimum clear width (0.80 m). */
+  doorWidth: number
+  /** Gate (door opening) clear height in meters. Every traversable doorway
+   * uses this height. Lawbook §25: must stay >= agent minimum clear height
+   * (2.00 m) and fit below the wall height with a header. */
+  doorHeight: number
 }
 
 export interface GeometryDescription {

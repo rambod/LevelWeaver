@@ -39,6 +39,22 @@ export class SeededRandom {
     return this.state
   }
 
+  /**
+   * Lawbook §8.1: hierarchical deterministic streams. Derives an
+   * independent sub-seed from (root state, stage label) so a harmless
+   * change to decoration RNG can never reshuffle room topology.
+   */
+  derive(label: string): SeededRandom {
+    // Mix current state with the label hash (xmur3-style finalizer),
+    // then advance this stream so sibling derives differ in order.
+    let h = (this.state ^ hashString(label)) >>> 0
+    h = Math.imul(h ^ (h >>> 16), 0x45d9f3b) >>> 0
+    h = Math.imul(h ^ (h >>> 16), 0x45d9f3b) >>> 0
+    h = (h ^ (h >>> 16)) >>> 0
+    this.next()
+    return new SeededRandom(h)
+  }
+
   setState(state: number): void {
     this.state = state >>> 0
   }

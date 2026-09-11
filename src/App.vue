@@ -79,6 +79,8 @@ const animate = (time: number = 0) => {
 
 // Generate level: run the pure core generator via the store, then sync
 // the preview scene, collision cache, and camera to the new level.
+// Impossible configurations fail with an explicit message (lawbook §73)
+// instead of silently producing broken geometry.
 const generate = async () => {
   isGenerating.value = true
   await nextTick()
@@ -88,6 +90,15 @@ const generate = async () => {
     const level = generatedLevel.value as GeneratedLevel | null
     if (!level) return
     syncScene(level)
+    if (level.validation && level.validation.errors.length > 0) {
+      console.warn(
+        `[LevelWeaver] level has ${level.validation.errors.length} hard validation error(s):`,
+        level.validation.errors.map(e => `[${e.code}] ${e.message}`),
+      )
+    }
+  } catch (err) {
+    console.error('Generation failed:', err)
+    alert(err instanceof Error ? err.message : String(err))
   } finally {
     isGenerating.value = false
   }
@@ -255,6 +266,8 @@ onUnmounted(() => {
           <ParamSlider label="Connectivity" v-model="config.connectivity" :min="0" :max="1" :step="0.05" @change="generate" />
           <ParamSlider label="Verticality" v-model="config.verticality" :min="0" :max="1" :step="0.05" @change="generate" />
           <ParamSlider label="Wall Height (m)" v-model="config.wallHeight" :min="3.2" :max="5.5" :step="0.1" @change="generate" />
+          <ParamSlider label="Gate Width (m)" v-model="config.doorWidth" :min="0.8" :max="3" :step="0.1" @change="generate" />
+          <ParamSlider label="Gate Height (m)" v-model="config.doorHeight" :min="2" :max="3" :step="0.1" @change="generate" />
           <ParamSlider label="Dead Ends" v-model="config.deadEnds" :min="0" :max="0.5" :step="0.05" @change="generate" />
 
           <div class="panel-section">

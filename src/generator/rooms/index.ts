@@ -14,7 +14,11 @@ const ROOM_BASE_SIZES: Record<RoomType, { w: number; d: number; h: number }> = {
   objective: { w: 8, d: 8, h: 3.5 },
   storage: { w: 7, d: 10, h: 3.5 },
   connector: { w: 5, d: 5, h: 3.5 },
-  verticalConnector: { w: 4, d: 4, h: 4 },
+  // Stair hall: sized to host a legal stair flight. A 4 m rise needs
+  // ~6.5 m of straight run (or ~4.7 m folded) plus landings and approach
+  // space — a 4x4 closet can never host stairs (lawbook §40-43), so the
+  // hall reserves real circulation volume instead of forcing broken links.
+  verticalConnector: { w: 7, d: 9, h: 4 },
 }
 
 
@@ -24,10 +28,20 @@ export function assignRoomSizes(rooms: Room[], config: LevelConfig, random: Seed
     const variation = config.roomSizeVariation
     const sizeMultiplier = 1 + random.nextFloat(-variation, variation)
 
+    let width = Math.max(3, base.w * sizeMultiplier)
+    let depth = Math.max(3, base.d * sizeMultiplier)
+    if (room.type === 'verticalConnector') {
+      // Stair-hall minimum: a legal folded flight needs ~4.9 m along one
+      // axis and ~2.9 m across (footprint + wall inset). Variation must
+      // never shrink the hall below a hostable volume (lawbook §17: size
+      // rules account for intended portals — here, the stair shaft).
+      width = Math.max(5.5, width)
+      depth = Math.max(6.5, depth)
+    }
     return {
       ...room,
-      width: Math.max(3, base.w * sizeMultiplier),
-      depth: Math.max(3, base.d * sizeMultiplier),
+      width,
+      depth,
       // Uniform wall height from properties (stays below floor spacing).
       height: config.wallHeight,
     }

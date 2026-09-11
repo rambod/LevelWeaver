@@ -1,6 +1,7 @@
 import type { LevelConfig, Room, Corridor, Boundary, DoorOpening, StairsGeometry } from '@/core/types'
-import { DOOR_HEIGHT, floorHeightFor, corridorHeightFor } from '@/core/types'
-import { SeededRandom } from '@/core/random'
+import { floorHeightFor, corridorHeightFor } from '@/core/types'
+import { SeededRandom, hashString } from '@/core/random'
+import { gateWidthFor, validateConfigFeasibility, SPATIAL_DEFAULTS } from '@/core/rules'
 import { buildLevelGraph, validateLevelGraph } from '@/core/levelGraph'
 import { generateBoundary } from '@/generator/boundary'
 import { generateTopology } from '@/generator/topology'
@@ -8,7 +9,16 @@ import { assignRoomSizes, placeRooms, resolveOverlaps } from '@/generator/rooms'
 import { generateCorridors } from '@/generator/corridors'
 import { generateRoomGeometry, generateCorridorGeometry } from '@/generator/geometry'
 import type { RoomSlabHoles } from '@/generator/geometry'
-import { planStairs, buildStairsGeometry } from '@/generator/vertical'
+import { planStairs, buildStairsGeometry, rewriteVerticalLinks, type StairPlan } from '@/generator/vertical'
+import {
+  reportOf,
+  validateDoors,
+  validateRealizedConnectivity,
+  validateRoomPlacement,
+  validateStairs,
+  type GenerationIssue,
+  type ValidationReport,
+} from '@/core/validation'
 
 export interface GeneratedLevel {
   config: LevelConfig
@@ -21,62 +31,157 @@ export interface GeneratedLevel {
   seed: number
   /** Floor spacing actually used (from wall height). */
   floorHeight: number
+  /** Structured stage-gate findings (lawbook §84). Errors mean the level
+   * violates a hard invariant even though a preview is still returned. */
+  validation: ValidationReport
 }
 
-export function generateLevel(config: LevelConfig): GeneratedLevel {
-  const random = new SeededRandom(config.seed)
+export function generateLevel(rawConfig: LevelConfig): GeneratedLevel {
+  // Normalize: older configs / presets may lack the gate dimensions.
+  // Defaults preserve the previous look (1.8 x 2.4 m gates).
+  const config: LevelConfig = {
+    ...rawConfig,
+    doorWidth: rawConfig.doorWidth ?? 1.8,
+    doorHeight: rawConfig.doorHeight ?? 2.4,
+  }
+
+  // Stage 0: feasibility gate (lawbook §73). Impossible configurations
+  // fail with a clear message — never by silently shrinking dimensions.
+  const configErrors = validateConfigFeasibility(config)
+  if (configErrors.length > 0) {
+    throw new Error(
+      `[LevelWeaver] impossible configuration:\n` +
+        configErrors.map(e => `  [${e.code}] ${e.message}`).join('\n'),
+    )
+  }
+
+  // Lawbook §8.1: hierarchical deterministic streams. Each stage draws
+  // from its own sub-seed so decoration tweaks can never reshuffle rooms.
+  const root = new SeededRandom(config.seed)
+  const boundaryRng = root.derive('boundary')
+  const topologyRng = root.derive('topology')
+  const sizingRng = root.derive('sizing')
   // All vertical dimensions derive from the configured wall height so
   // stacked floors, corridors, stairs, and doors stay consistent.
   const floorHeight = floorHeightFor(config)
   const corridorHeight = corridorHeightFor(config)
 
   // Stage 1: Generate boundary
-  const boundary = generateBoundary(config, random)
+  const boundary = generateBoundary(config, boundaryRng)
 
-  // Stage 2: Generate topology (room graph)
-  let rooms = generateTopology(config, boundary, random)
+  // Stage 3: Assign room sizes (fixed for all layout attempts: topology
+  // is preserved across retries, lawbook §70).
+  const sizedRooms = assignRoomSizes(generateTopology(config, boundary, topologyRng), config, sizingRng)
 
-  // Stage 3: Assign room sizes
-  rooms = assignRoomSizes(rooms, config, random)
+  // Stages 4-7b: spatial layout with BOUNDED deterministic retry (lawbook
+  // §69-70). Placement is the fragile stage: one shot can strand stairs
+  // behind unstackable rooms. Each attempt re-runs placement → vertical
+  // rewrite → corridors → doors → stairs with a derived attempt seed and
+  // keeps the first layout whose realized traversal is fully connected.
+  // Attempt seeds are stable hashes, never hidden reseeds.
+  const MAX_LAYOUT_ATTEMPTS = 8
+  let layout = runLayoutAttempt(sizedRooms, boundary, config, floorHeight, 0)
+  for (let attempt = 1; attempt < MAX_LAYOUT_ATTEMPTS; attempt++) {
+    if (layout.hardErrors === 0) break
+    const next = runLayoutAttempt(sizedRooms, boundary, config, floorHeight, attempt)
+    // Keep the layout with fewer hard errors (ties: more stairs wins —
+    // redundant vertical circulation is a soft goal, §63).
+    if (
+      next.hardErrors < layout.hardErrors ||
+      (next.hardErrors === layout.hardErrors && next.stairPlans.length > layout.stairPlans.length)
+    ) {
+      layout = next
+    }
+  }
+  const { rooms, corridors, doorOpenings, stairPlans, slabHoles } = layout
 
-  // Stage 4: Place rooms spatially
-  rooms = placeRooms(rooms, boundary, config, random)
+// One spatial layout attempt (stages 4-7b). Pure and deterministic for
+// (rooms, config, attempt): the attempt RNG is a stable hash, and every
+// downstream stage (corridors, stairs) is itself deterministic.
+function runLayoutAttempt(
+  sizedRooms: Room[],
+  boundary: Boundary,
+  config: LevelConfig,
+  floorHeight: number,
+  attempt: number,
+): {
+  rooms: Room[]
+  corridors: Corridor[]
+  doorOpenings: Map<string, DoorOpening[]>
+  stairPlans: StairPlan[]
+  slabHoles: Map<string, RoomSlabHoles>
+  hardErrors: number
+} {
+  // Fresh copies: placement spreads rooms but shares connection arrays,
+  // and the vertical rewrite reassigns them — never mutate the topology.
+  const roomsInput = sizedRooms.map(r => ({ ...r, connections: [...r.connections] }))
+  const placementRng = new SeededRandom(hashString(`${config.seed}:layout:${attempt}`))
 
-  // Stage 5: Resolve overlaps (keep corridor-sized gaps between rooms)
+  // Stage 4-5: place + resolve (per-floor, corridor-sized gaps).
+  let rooms = placeRooms(roomsInput, boundary, config, placementRng)
   rooms = resolveOverlaps(rooms, boundary, config.corridorWidth + 1.0)
 
-  // Stage 6: Generate corridors
+  // Stage 5b: vertical links rewritten by final overlap (lawbook §49).
+  rewriteVerticalLinks(rooms, floorHeight)
+
+  // Stage 6-7: corridors + gate openings (shared gate rule, §28).
   const corridors = generateCorridors(rooms, config)
+  const doorOpenings = computeDoorOpenings(rooms, corridors, config)
 
-  // Stage 7: Compute door openings from corridor connections
-  const doorOpenings = computeDoorOpenings(rooms, corridors)
-
-  // Stage 7b: Plan stairs (tower shafts first, in-room fallback) using
-  // doors + corridor slabs for placement rules, and reserve matching
-  // floor/ceiling holes for the stairwells.
+  // Stage 7b: stairs with reserved slab holes.
   const corridorSlabs = collectCorridorSlabs(corridors)
   const corridorDegree = new Map<string, number>()
   for (const corridor of corridors) {
     corridorDegree.set(corridor.startRoomId, (corridorDegree.get(corridor.startRoomId) ?? 0) + 1)
     corridorDegree.set(corridor.endRoomId, (corridorDegree.get(corridor.endRoomId) ?? 0) + 1)
   }
-  const stairPlans = planStairs(rooms, doorOpenings, { corridorSlabsByFloor: corridorSlabs, boundary, corridorDegree, floorHeight })
-  mergeTowerDoors(rooms, doorOpenings, stairPlans)
+  const quiet = attempt > 0
+  const stairPlans = planStairs(rooms, doorOpenings, {
+    corridorSlabsByFloor: corridorSlabs,
+    boundary,
+    corridorDegree,
+    floorHeight,
+    quiet,
+  })
+  mergeTowerDoors(rooms, doorOpenings, stairPlans, config)
   const slabHoles = computeSlabHoles(rooms, stairPlans)
+
+  // Attempt score: realized-traversal hard errors (lawbook §10, §62).
+  // Door/overlap/stair-dimension issues are attempt-independent enough
+  // (same topology/sizes) that connectivity decides between attempts.
+  const hardErrors = validateRealizedConnectivity(rooms, corridors, stairPlans, config.floorCount)
+    .filter(i => i.severity === 'error').length
+  return { rooms, corridors, doorOpenings, stairPlans, slabHoles, hardErrors }
+}
 
   // Stage 8: Generate geometry
   const roomGeometry = generateRoomGeometry(rooms, doorOpenings, slabHoles)
   const corridorGeometry = generateCorridorGeometry(corridors, corridorHeight)
   const stairs = buildStairsGeometry(stairPlans, rooms, floorHeight)
 
-  // Stage 8b: Validate the abstract level graph. Stair links count as
-  // connections: a room whose only link is vertical is reachable.
+  // Stage 8b: stage-gate validation (lawbook §68). Graph intent is NOT
+  // enough: BFS runs over realized corridors + built stairs, rooms are
+  // checked for overlap/nesting/bounds, gates for clear passability, and
+  // stairs for riser/tread/width lawfulness. Findings are structured
+  // (never bare console text) and travel with the level.
+  const issues: GenerationIssue[] = []
   const graph = buildLevelGraph(rooms, corridors, config.floorCount, boundary)
-  const validation = validateLevelGraph(graph, stairPlans.map(p => p.link))
-  if (validation.isolatedRooms.length > 0) {
+  const legacy = validateLevelGraph(graph, stairPlans.map(p => p.link))
+  if (legacy.isolatedRooms.length > 0) {
     console.warn(
-      `[LevelWeaver] ${validation.isolatedRooms.length} room(s) have no corridor or stair connections:`,
-      validation.isolatedRooms,
+      `[LevelWeaver] ${legacy.isolatedRooms.length} room(s) have no corridor or stair connections:`,
+      legacy.isolatedRooms,
+    )
+  }
+  issues.push(...validateRealizedConnectivity(rooms, corridors, stairPlans, config.floorCount))
+  issues.push(...validateRoomPlacement(rooms, boundary))
+  issues.push(...validateDoors(rooms, doorOpenings))
+  issues.push(...validateStairs(stairPlans))
+  const validation = reportOf(issues)
+  if (validation.errors.length > 0) {
+    console.warn(
+      `[LevelWeaver] ${validation.errors.length} hard validation error(s):`,
+      validation.errors.map(e => `[${e.code}] ${e.message}`),
     )
   }
 
@@ -90,6 +195,7 @@ export function generateLevel(config: LevelConfig): GeneratedLevel {
     corridorGeometry,
     seed: config.seed,
     floorHeight,
+    validation,
   }
 }
 
@@ -120,10 +226,12 @@ function collectCorridorSlabs(corridors: Corridor[]): Map<number, { minX: number
 
 // Tower shaft mouths: door openings cut in the host wall where the shaft
 // attaches (mouth matches the shaft, like corridor mouths match corridors).
+// Gate dimensions come from settings so the player always fits.
 function mergeTowerDoors(
   rooms: Room[],
   doorOpenings: Map<string, DoorOpening[]>,
-  stairPlans: ReturnType<typeof planStairs>
+  stairPlans: ReturnType<typeof planStairs>,
+  config: LevelConfig,
 ): void {
   const roomMap = new Map(rooms.map(r => [r.id, r]))
   for (const plan of stairPlans) {
@@ -134,8 +242,8 @@ function mergeTowerDoors(
       roomId: plan.hostRoomId,
       wallIndex: plan.towerDoor.wallIndex,
       position: { x: plan.towerDoor.x, y: (host?.position.y ?? 0) + 0.1, z: plan.towerDoor.z },
-      width: 1.8,
-      height: 2.4,
+      width: config.doorWidth,
+      height: config.doorHeight,
     })
     doorOpenings.set(plan.hostRoomId, list)
   }
@@ -206,7 +314,7 @@ function computeSlabHoles(
   return holes
 }
 
-function computeDoorOpenings(rooms: Room[], corridors: Corridor[]): Map<string, DoorOpening[]> {
+function computeDoorOpenings(rooms: Room[], corridors: Corridor[], config: LevelConfig): Map<string, DoorOpening[]> {
   const doorMap = new Map<string, DoorOpening[]>()
   const roomMap = new Map(rooms.map(r => [r.id, r]))
 
@@ -218,15 +326,16 @@ function computeDoorOpenings(rooms: Room[], corridors: Corridor[]): Map<string, 
     // Add door to start room (opening matches the corridor mouth).
     // The wall is chosen by direction to the other room (same rule as the
     // corridor router); the center reuses the corridor's door point so the
-    // hole and the mouth land on identical centers.
-    const startDoor = findDoorPosition(startRoom, endRoom.position, corridor.startPos, corridor.width)
+    // hole and the mouth land on identical centers, and the width uses the
+    // shared gateWidthFor rule so they agree on width too.
+    const startDoor = findDoorPosition(startRoom, endRoom.position, corridor.startPos, config)
     if (startDoor) {
       if (!doorMap.has(startRoom.id)) doorMap.set(startRoom.id, [])
       doorMap.get(startRoom.id)!.push(startDoor)
     }
 
     // Add door to end room
-    const endDoor = findDoorPosition(endRoom, startRoom.position, corridor.endPos, corridor.width)
+    const endDoor = findDoorPosition(endRoom, startRoom.position, corridor.endPos, config)
     if (endDoor) {
       if (!doorMap.has(endRoom.id)) doorMap.set(endRoom.id, [])
       doorMap.get(endRoom.id)!.push(endDoor)
@@ -240,7 +349,7 @@ function findDoorPosition(
   room: Room,
   targetPos: { x: number; z: number },
   doorPos: { x: number; y: number; z: number },
-  corridorWidth: number
+  config: LevelConfig
 ): DoorOpening | null {
   const halfW = room.width / 2
   const halfD = room.depth / 2
@@ -255,7 +364,7 @@ function findDoorPosition(
   // Determine which wall the corridor connects to
   let wallIndex: number
   let doorCenter: number
-  const doorHeight = DOOR_HEIGHT
+  const doorHeight = config.doorHeight
 
   if (Math.abs(relTX) > Math.abs(relTZ)) {
     // Connects to +X or -X wall
@@ -275,12 +384,16 @@ function findDoorPosition(
     doorCenter = relDX
   }
 
-  // Clamp door position to wall bounds with margin. The opening matches
-  // the corridor mouth; on narrow walls it shrinks to fit.
+  // Clamp door position to wall bounds with margin. Width follows the
+  // shared gate rule (never wider than the setting, the corridor mouth,
+  // or the wall itself). The corridor router uses the same rule, so the
+  // mouth and the hole agree exactly.
   const wallLength = wallIndex % 2 === 0 ? room.width : room.depth
-  const doorWidth = Math.max(1.0, Math.min(corridorWidth, wallLength - 0.6))
-  const maxCenter = wallLength / 2 - doorWidth / 2 - 0.3
-  const minCenter = -wallLength / 2 + doorWidth / 2 + 0.3
+  const doorWidth = gateWidthFor(config, wallLength, config.corridorWidth)
+  if (!(doorWidth > 0.05)) return null // wall far too short: no fake hole
+  const cornerMargin = SPATIAL_DEFAULTS.doorCornerMargin
+  const maxCenter = wallLength / 2 - doorWidth / 2 - cornerMargin
+  const minCenter = -wallLength / 2 + doorWidth / 2 + cornerMargin
   const clampedCenter = maxCenter >= minCenter
     ? Math.max(minCenter, Math.min(maxCenter, doorCenter))
     : 0

@@ -83,6 +83,15 @@ export function generateTopology(config: LevelConfig, boundary: Boundary, random
     })
   }
 
+  // Lawbook §39 + §62: every floor must be occupied (a gap floor breaks
+  // all stairs past it — vertical links only span adjacent floors), and
+  // every floor in a multi-floor level needs a stair-hostable room (a
+  // floor of only 4 m closets cannot host a legal flight or a tower in a
+  // dense map). Both repairs run BEFORE connections so all graph
+  // guarantees apply to the final assignment.
+  ensureEveryFloorOccupied(nodes, config)
+  ensureStairHallPerFloor(nodes, config)
+
   // Build connections based on topology shape
   buildConnections(nodes, config, boundary, random)
 
@@ -166,8 +175,59 @@ function getRoomPosition(
   return { x: 0, z: 0 }
 }
 
-function getRoomWeight(type: RoomType): number {
-  switch (type) {
+// Every floor in [0, floorCount) holds at least one room. Relocates the
+// lowest-id convertible room from the most-populated floor (never
+// spawn/exit); deterministic.
+function ensureEveryFloorOccupied(nodes: Map<string, TopologyNode>, config: LevelConfig): void {
+  if (config.floorCount <= 1) return
+  for (let floor = 0; floor < config.floorCount; floor++) {
+    let occupied = false
+    for (const n of nodes.values()) {
+      if (n.floorIndex === floor) {
+        occupied = true
+        break
+      }
+    }
+    if (occupied) continue
+    const counts = new Map<number, number>()
+    for (const n of nodes.values()) {
+      counts.set(n.floorIndex, (counts.get(n.floorIndex) ?? 0) + 1)
+    }
+    let donorFloor = 0
+    let donorCount = -1
+    for (const [f, c] of counts) {
+      if (c > donorCount) {
+        donorCount = c
+        donorFloor = f
+      }
+    }
+    const candidate = [...nodes.values()]
+      .filter(n => n.floorIndex === donorFloor && n.type !== 'spawn' && n.type !== 'exit')
+      .sort((a, b) => (a.id < b.id ? -1 : 1))[0]
+    if (candidate) candidate.floorIndex = floor
+  }
+}
+
+// Stair-hall law: in a multi-floor level, every floor that hosts stairs
+// (all but the top) needs at least one room whose TYPE can host a flight
+// (hub/arena/hall/objective/verticalConnector). Small types (standard,
+// storage, connector) become a verticalConnector stair hall; spawn/exit
+// are never converted. Deterministic: lowest id wins.
+function ensureStairHallPerFloor(nodes: Map<string, TopologyNode>, config: LevelConfig): void {
+  if (config.floorCount <= 1) return
+  const HOSTABLE: RoomType[] = ['hub', 'arena', 'hall', 'objective', 'verticalConnector']
+  const CONVERTIBLE: RoomType[] = ['standard', 'storage', 'connector']
+  for (let floor = 0; floor < config.floorCount - 1; floor++) {
+    const onFloor = [...nodes.values()].filter(n => n.floorIndex === floor)
+    if (onFloor.some(n => HOSTABLE.includes(n.type))) continue
+    const candidate = onFloor
+      .filter(n => CONVERTIBLE.includes(n.type))
+      .sort((a, b) => (a.id < b.id ? -1 : 1))[0]
+    if (candidate) candidate.type = 'verticalConnector'
+  }
+}
+
+function getRoomWeight(type: RoomType): number {  switch (type) {
     case 'hub': return 1.5
     case 'arena': return 1.3
     case 'hall': return 1.1
@@ -305,6 +365,21 @@ function handleVerticalConnections(
 
     if (lowerRooms.length === 0 || upperRooms.length === 0) continue
 
+    // Cross-floor links already created by the tree phase count: a tiny
+    // room with three stair shafts is over-linked (no room has three clean
+    // shaft sites), so no room gets more than VERTICAL_CAP intent links.
+    // The floor pair's first link always lands (connectivity beats caps).
+    const VERTICAL_CAP = 2
+    const verticalDegree = (id: string): number => {
+      const node = nodes.get(id)!
+      let n = 0
+      for (const c of node.connections) {
+        const other = nodes.get(c)
+        if (other && other.floorIndex !== node.floorIndex) n++
+      }
+      return n
+    }
+
     // Score every cross-floor pair by XZ distance (plus a little seeded
     // jitter for variety), preferring LARGE lower rooms as stair hosts: a
     // walkable 4m rise needs ~7m of run, which only big rooms fit. Stairs
@@ -326,12 +401,16 @@ function handleVerticalConnections(
     // Connect at least one room per floor transition (closest pair).
     addConnection(nodes, pairs[0].lower.id, pairs[0].upper.id)
 
-    // Add more vertical connections based on verticality, closest first.
+    // Add more vertical connections based on verticality, closest first,
+    // skipping pairs whose endpoint already hosts enough shafts.
     const extraVertical = Math.round((lowerRooms.length + upperRooms.length) * config.verticality * 0.3)
     let added = 0
     for (const pair of pairs) {
       if (added >= extraVertical) break
       if (!pair.lower.connections.has(pair.upper.id)) {
+        if (verticalDegree(pair.lower.id) >= VERTICAL_CAP || verticalDegree(pair.upper.id) >= VERTICAL_CAP) {
+          continue
+        }
         addConnection(nodes, pair.lower.id, pair.upper.id)
         added++
       }
@@ -362,11 +441,37 @@ function applyDeadEnds(
     if (node.connections.size < 2) continue
     const connectedId = random.pick(Array.from(node.connections))
     const neighbor = nodes.get(connectedId)
-    // Keep the graph connected: never strand a neighbor with 1 link.
+    // Keep the graph connected: never strand a neighbor with 1 link, and
+    // never cut a bridge (lawbook §10: the playable graph is one component).
+    // Degree >= 2 on both ends is NOT enough — the edge can still be the
+    // only bridge between two clusters. Small graphs: BFS check is cheap.
     if (!neighbor || neighbor.connections.size < 2) continue
     node.connections.delete(connectedId)
     neighbor.connections.delete(node.id)
+    if (!isFullyConnected(nodes)) {
+      node.connections.add(connectedId)
+      neighbor.connections.add(node.id)
+    }
   }
+}
+
+// BFS over intent edges: the playable topology must be one component
+// (lawbook §10). Used to guard dead-end pruning.
+function isFullyConnected(nodes: Map<string, TopologyNode>): boolean {
+  const ids = [...nodes.keys()]
+  if (ids.length === 0) return true
+  const seen = new Set<string>([ids[0]])
+  const queue = [ids[0]]
+  while (queue.length > 0) {
+    const cur = queue.pop()!
+    for (const nb of nodes.get(cur)!.connections) {
+      if (!seen.has(nb)) {
+        seen.add(nb)
+        queue.push(nb)
+      }
+    }
+  }
+  return seen.size === ids.length
 }
 
 function distance(a: { x: number; z: number }, b: { x: number; z: number }): number {
@@ -404,18 +509,66 @@ function nearestOnFloors(
 }
 
 function ensureSameFloorLink(nodes: Map<string, TopologyNode>): void {
-  const floorCounts = new Map<number, number>()
-  for (const node of nodes.values()) {
-    floorCounts.set(node.floorIndex, (floorCounts.get(node.floorIndex) ?? 0) + 1)
+  // Lawbook §10 (applied per floor): every room on a multi-room floor must
+  // reach every other room on that floor via same-floor links. One link
+  // per room is NOT enough — two separate pairs would each satisfy a
+  // degree check while stranding one pair away from the floor's stairs.
+  // Merges same-floor components with nearest-pair links (deterministic).
+  const floors = new Set<number>()
+  for (const node of nodes.values()) floors.add(node.floorIndex)
+  for (const floor of floors) {
+    for (let guard = 0; guard < 64; guard++) {
+      const components = sameFloorComponents(nodes, floor)
+      if (components.length <= 1) break
+      // Nearest room pair across the first two components (ids break ties).
+      const a = [...components[0]].sort()
+      const b = [...components[1]].sort()
+      let bestA = a[0]
+      let bestB = b[0]
+      let bestDist = Infinity
+      for (const idA of a) {
+        for (const idB of b) {
+          const d = distance(nodes.get(idA)!.position, nodes.get(idB)!.position)
+          const key = idA + '|' + idB
+          const bestKey = bestA + '|' + bestB
+          if (d < bestDist || (d === bestDist && key < bestKey)) {
+            bestDist = d
+            bestA = idA
+            bestB = idB
+          }
+        }
+      }
+      addConnection(nodes, bestA, bestB)
+    }
   }
-  for (const node of nodes.values()) {
-    if ((floorCounts.get(node.floorIndex) ?? 0) < 2) continue
-    const hasSameFloor = [...node.connections].some(id => {
-      const other = nodes.get(id)
-      return other !== undefined && other.floorIndex === node.floorIndex
-    })
-    if (hasSameFloor) continue
-    const best = nearestOnFloors(nodes, node, [node.floorIndex])
-    if (best) addConnection(nodes, node.id, best.id)
+}
+
+function sameFloorComponents(nodes: Map<string, TopologyNode>, floor: number): Set<string>[] {
+  const ids = [...nodes.values()].filter(n => n.floorIndex === floor).map(n => n.id)
+  const seen = new Set<string>()
+  const components: Set<string>[] = []
+  for (const id of ids) {
+    if (seen.has(id)) continue
+    const comp = new Set<string>([id])
+    seen.add(id)
+    const queue = [id]
+    while (queue.length > 0) {
+      const cur = queue.pop()!
+      for (const nb of nodes.get(cur)!.connections) {
+        const other = nodes.get(nb)
+        if (!other || other.floorIndex !== floor || seen.has(nb)) continue
+        seen.add(nb)
+        comp.add(nb)
+        queue.push(nb)
+      }
+    }
+    components.push(comp)
   }
+  // Stable order: sort by smallest id so merges are deterministic.
+  components.sort((p, q) => {
+    const a = [...p].sort()[0]
+    const b = [...q].sort()[0]
+    return a < b ? -1 : 1
+  })
+  return components
 }
