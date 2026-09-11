@@ -85,7 +85,8 @@ export type MapShape =
   | 'linear'
   | 'branching'
 
-export interface LevelConfig {  seed: number
+export interface LevelConfig {
+  seed: number
   preset: string
   shape: MapShape
   area: number
@@ -98,6 +99,9 @@ export interface LevelConfig {  seed: number
   deadEnds: number
   largeRoomCount: number
   theme: string
+  /** Room wall height in meters (3.2 - 5.5). Drives room heights, corridor
+   * height, and floor spacing together so stacked floors never intersect. */
+  wallHeight: number
 }
 
 export interface GeometryDescription {
@@ -201,9 +205,20 @@ export interface Rect2D {
 
 // Vertical distance between consecutive floor base levels (meters).
 // Room geometry is built in local coordinates (base at y=0); the
-// renderer/exporter places each floor group at floorIndex * FLOOR_HEIGHT.
-// Keep room heights <= FLOOR_HEIGHT so stacked floors don't interpenetrate.
+// renderer/exporter positions each floor group at floorIndex * spacing.
+// Keep room heights <= spacing so stacked floors don't interpenetrate.
 export const FLOOR_HEIGHT = 4
+
+// Floor spacing derived from the configured wall height: walls plus a
+// half-meter interstitial for slabs and clearance.
+export function floorHeightFor(config: LevelConfig): number {
+  return config.wallHeight + 0.5
+}
+
+// Corridor clear height derived from the wall height.
+export function corridorHeightFor(config: LevelConfig): number {
+  return config.wallHeight - 0.5
+}
 
 export const DOOR_WIDTH = 1.8
 export const DOOR_HEIGHT = 2.4

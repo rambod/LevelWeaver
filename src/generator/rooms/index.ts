@@ -28,7 +28,8 @@ export function assignRoomSizes(rooms: Room[], config: LevelConfig, random: Seed
       ...room,
       width: Math.max(3, base.w * sizeMultiplier),
       depth: Math.max(3, base.d * sizeMultiplier),
-      height: base.h,
+      // Uniform wall height from properties (stays below floor spacing).
+      height: config.wallHeight,
     }
   })
 }

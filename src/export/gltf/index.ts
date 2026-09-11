@@ -1,7 +1,6 @@
 import * as THREE from 'three'
 import { GLTFExporter } from 'three/examples/jsm/exporters/GLTFExporter.js'
 import type { GeneratedLevel } from '../../core/generation'
-import { FLOOR_HEIGHT } from '../../core/types'
 import { createMaterials } from '../../renderer/materials'
 import { createBufferGeometry, isEmptyMesh } from '../../renderer/meshes'
 
@@ -71,7 +70,7 @@ export async function exportGLB(level: GeneratedLevel): Promise<Blob> {
     corrGeo.walls.forEach((wall, i) => addGeometryToGroup(corrGroup, wall, `Wall_${i}`, 0, materialFor))
     addGeometryToGroup(corrGroup, corrGeo.ceiling, 'Ceiling', 2, materialFor)
 
-    corrGroup.position.y = corrGeo.floorIndex * FLOOR_HEIGHT
+    corrGroup.position.y = corrGeo.floorIndex * level.floorHeight
     floorGroup.add(corrGroup)
   }
 
@@ -92,7 +91,7 @@ export async function exportGLB(level: GeneratedLevel): Promise<Blob> {
       stairGeo.tower.walls.forEach((wall, i) => addGeometryToGroup(stairGroup, wall, `TowerWall_${i}`, 0, materialFor))
     }
 
-    stairGroup.position.y = stairGeo.startFloor * FLOOR_HEIGHT
+    stairGroup.position.y = stairGeo.startFloor * level.floorHeight
     floorGroup.add(stairGroup)
   }
 

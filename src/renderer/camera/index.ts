@@ -308,6 +308,10 @@ export class CameraController {
       xPos.x = newPosition.x
       if (!this.checkCollision(xPos, collisionBoxes)) {
         this.camera.position.x = newPosition.x
+      } else {
+        // Step-up (X): rise minimally and retry X alone, so stair treads
+        // and thresholds climb without diagonal pops or bobbing.
+        this.tryStepUp('x', newPosition.x, collisionBoxes)
       }
 
       // Try Z only
@@ -315,21 +319,9 @@ export class CameraController {
       zPos.z = newPosition.z
       if (!this.checkCollision(zPos, collisionBoxes)) {
         this.camera.position.z = newPosition.z
-      }
-
-      // Step-up: rise up to PLAYER_STEP_UP and retry the horizontal move.
-      // This is what makes stair treads and door thresholds walkable
-      // instead of invisible walls.
-      const stepped = this.camera.position.clone()
-      stepped.y += PLAYER_STEP_UP
-      if (!this.checkCollision(stepped, collisionBoxes)) {
-        const steppedTarget = stepped.clone()
-        steppedTarget.x = newPosition.x
-        steppedTarget.z = newPosition.z
-        if (!this.checkCollision(steppedTarget, collisionBoxes)) {
-          this.camera.position.copy(steppedTarget)
-          this.canJump = true
-        }
+      } else {
+        // Step-up (Z): same, axis-separated.
+        this.tryStepUp('z', newPosition.z, collisionBoxes)
       }
 
       // Try Y only
@@ -359,6 +351,29 @@ export class CameraController {
 
   private checkCollision(position: THREE.Vector3, collisionBoxes: THREE.Box3[]): boolean {
     return checkPlayerCollision(position, collisionBoxes, PLAYER_RADIUS, this.playerHeight)
+  }
+
+  // Step-up for one horizontal axis: rise by the smallest increment that
+  // frees the move (0.12/0.24/0.35m), so climbing stairs settles onto each
+  // tread instead of bobbing a full step-up every frame. Settles velocity
+  // so gravity doesn't slam the player back down between treads.
+  private tryStepUp(axis: 'x' | 'z', target: number, collisionBoxes: THREE.Box3[]): void {
+    for (const rise of [0.12, 0.24, PLAYER_STEP_UP]) {
+      const over = this.camera.position.clone()
+      over.y += rise
+      if (this.checkCollision(over, collisionBoxes)) continue
+      const stepped = over.clone()
+      if (axis === 'x') stepped.x = target
+      else stepped.z = target
+      if (!this.checkCollision(stepped, collisionBoxes)) {
+        if (axis === 'x') this.camera.position.x = target
+        else this.camera.position.z = target
+        this.camera.position.y = over.y
+        this.velocity.y = 0
+        this.canJump = true
+        return
+      }
+    }
   }
 
   private updateOrbitMode(): void {

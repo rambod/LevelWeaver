@@ -258,14 +258,14 @@ function createThickWall(
 }
 
 
-export function generateCorridorGeometry(corridors: Corridor[]): CorridorGeometry[] {
+export function generateCorridorGeometry(corridors: Corridor[], wallHeight = 3): CorridorGeometry[] {
   return corridors.map(corridor => {
     // Use pathPoints if available, otherwise fall back to straight line
     const points = corridor.pathPoints && corridor.pathPoints.length > 0
       ? corridor.pathPoints
       : [corridor.startPos, corridor.endPos]
 
-    return buildCorridorGeometry(corridor, points)
+    return buildCorridorGeometry(corridor, points, wallHeight)
   })
 }
 
@@ -493,12 +493,12 @@ function buildWallRibbon(
   return b.build(materialIndex)
 }
 
-function buildCorridorGeometry(corridor: Corridor, points: Vec3[]): CorridorGeometry {
+function buildCorridorGeometry(corridor: Corridor, points: Vec3[], wallHeight: number): CorridorGeometry {
   const width = corridor.width
   // Local coordinates: the corridor group is positioned at the floor level
   // by the renderer/exporter, so build around y=0 here (see room geometry).
   const floorY = 0
-  const wallH = 3
+  const wallH = wallHeight
 
   // Drop degenerate consecutive points (zero-length segments).
   const clean: Vec3[] = []

@@ -11,6 +11,7 @@ export class LevelScene {
   public boundsHelper: THREE.Box3Helper
   private materials: Map<number, THREE.Material>
   private currentLevel: GeneratedLevel | null = null
+  private floorHeight: number = FLOOR_HEIGHT
 
   constructor() {
     this.scene = new THREE.Scene()
@@ -68,6 +69,7 @@ export class LevelScene {
 
   updateLevel(level: GeneratedLevel): void {
     this.currentLevel = level
+    this.floorHeight = level.floorHeight
     this.clearLevel()
     this.buildLevelGeometry(level)
     this.updateBoundsHelper(level)
@@ -172,7 +174,7 @@ export class LevelScene {
         corrGroup.add(mesh)
       }
 
-      corrGroup.position.y = corrGeo.floorIndex * FLOOR_HEIGHT
+      corrGroup.position.y = corrGeo.floorIndex * this.floorHeight
       this.levelGroup.add(corrGroup)
     }
 
@@ -248,7 +250,7 @@ export class LevelScene {
           })
         }
 
-        stairGroup.position.y = stairGeo.startFloor * FLOOR_HEIGHT
+        stairGroup.position.y = stairGeo.startFloor * this.floorHeight
         this.levelGroup.add(stairGroup)
       }
     }
@@ -300,8 +302,8 @@ export class LevelScene {
             // Mesh matrices are local to the stair group; the group adds
             // the floor-level Y offset, so apply both.
             meshBox.applyMatrix4(obj.matrix)
-            meshBox.min.y += stair.startFloor * FLOOR_HEIGHT
-            meshBox.max.y += stair.startFloor * FLOOR_HEIGHT
+            meshBox.min.y += stair.startFloor * this.floorHeight
+            meshBox.max.y += stair.startFloor * this.floorHeight
             stairBox.union(meshBox)
           }
         })

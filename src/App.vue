@@ -254,6 +254,7 @@ onUnmounted(() => {
           <ParamSlider label="Corridor Width" v-model="config.corridorWidth" :min="1" :max="6" :step="0.5" @change="generate" />
           <ParamSlider label="Connectivity" v-model="config.connectivity" :min="0" :max="1" :step="0.05" @change="generate" />
           <ParamSlider label="Verticality" v-model="config.verticality" :min="0" :max="1" :step="0.05" @change="generate" />
+          <ParamSlider label="Wall Height (m)" v-model="config.wallHeight" :min="3.2" :max="5.5" :step="0.1" @change="generate" />
           <ParamSlider label="Dead Ends" v-model="config.deadEnds" :min="0" :max="0.5" :step="0.05" @change="generate" />
 
           <div class="panel-section">

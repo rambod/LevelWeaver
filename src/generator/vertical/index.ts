@@ -65,6 +65,8 @@ export interface StairPlanContext {
   boundary: Boundary
   /** Corridor links per room (for critical-first ordering). */
   corridorDegree: Map<string, number>
+  /** Floor spacing (from wall height). Defaults to FLOOR_HEIGHT. */
+  floorHeight?: number
 }
 
 function rectsOverlap(a: Rect2D, b: Rect2D, pad = 0): boolean {
@@ -105,6 +107,41 @@ export function doorWalkZone(door: DoorOpening): Rect2D {
 
 export function stairBlocksDoor(stair: Rect2D, door: DoorOpening): boolean {
   return rectsOverlap(stair, doorWalkZone(door), 0)
+}
+
+// Signed distance to rect (positive inside, negative outside).
+export function signedRectDist(px: number, pz: number, r: Rect2D): number {
+  const dx = Math.max(r.minX - px, 0, px - r.maxX)
+  const dz = Math.max(r.minZ - pz, 0, pz - r.maxZ)
+  const outside = Math.sqrt(dx * dx + dz * dz)
+  if (outside > 0) return -outside
+  return Math.min(px - r.minX, r.maxX - px, pz - r.minZ, r.maxZ - pz)
+}
+
+// Approach zone in front of a stair entry (1.5m beyond the low end).
+export function entryZoneOf(
+  rect: Rect2D, axis: 'x' | 'z', dir: 1 | -1, ext = 1.5
+): Rect2D {
+  if (axis === 'z') {
+    return dir > 0
+      ? { minX: rect.minX, maxX: rect.maxX, minZ: rect.minZ - ext, maxZ: rect.minZ }
+      : { minX: rect.minX, maxX: rect.maxX, minZ: rect.maxZ, maxZ: rect.maxZ + ext }
+  }
+  return dir > 0
+    ? { minX: rect.minX - ext, maxX: rect.minX, minZ: rect.minZ, maxZ: rect.maxZ }
+    : { minX: rect.maxX, maxX: rect.maxX + ext, minZ: rect.minZ, maxZ: rect.maxZ }
+}
+
+// Maneuvering strip just past a top landing along the exit direction.
+export function exitZoneOf(landing: Rect2D, axis: 'x' | 'z', exitSign: 1 | -1, ext = 1.2): Rect2D {
+  if (axis === 'z') {
+    return exitSign > 0
+      ? { minX: landing.minX, maxX: landing.maxX, minZ: landing.maxZ, maxZ: landing.maxZ + ext }
+      : { minX: landing.minX, maxX: landing.maxX, minZ: landing.minZ - ext, maxZ: landing.minZ }
+  }
+  return exitSign > 0
+    ? { minX: landing.maxX, maxX: landing.maxX + ext, minZ: landing.minZ, maxZ: landing.maxZ }
+    : { minX: landing.minX - ext, maxX: landing.minX, minZ: landing.minZ, maxZ: landing.maxZ }
 }
 
 // Minimum edge-to-edge gap (negative when overlapping).
@@ -155,11 +192,13 @@ export function planStairs(
     return list
   }
 
-  // Walkable step math from the floor height (not from room size: a short
-  // run never justifies ladder steps — oversized stairs simply don't fit
-  // and the link is reported instead of built broken).
-  const stepCount = Math.max(10, Math.min(26, Math.round(FLOOR_HEIGHT / STAIR_RISER)))
-  const stepHeight = FLOOR_HEIGHT / stepCount
+  // Walkable step math from the actual floor height (not from room size:
+  // a short run never justifies ladder steps — oversized stairs simply
+  // don't fit and the link is reported instead of built broken). No upper
+  // clamp: tall walls need proportionally more risers at the same slope.
+  const rise = context?.floorHeight ?? FLOOR_HEIGHT
+  const stepCount = Math.max(8, Math.round(rise / STAIR_RISER))
+  const stepHeight = rise / stepCount
   const stepDepth = STAIR_TREAD
   const run = (stepCount - 1) * stepDepth
   const depth = run + LANDING_DEPTH
@@ -421,12 +460,65 @@ function tryInRoomPlan(
         }
         if (blocked) continue
 
+        // 4c. The flight must not pass under an upper corridor slab:
+        // headroom below a slab crossing overhead is un-walkable.
+        for (const s of upperSlabs) {
+          if (rectsOverlap(rect, s, 0.2)) {
+            blocked = true
+            break
+          }
+        }
+        if (blocked) continue
+
+        // 5. Entry approach: 1.5m of maneuvering room in front of the
+        // bottom step, inside the host room and clear of doors/stairs.
+        // (Flights crammed nose-against a wall read as stuck.)
+        {
+          const entry = entryZoneOf(rect, axis, dir)
+          const insideHost =
+            entry.minX >= hostRect.minX - 0.1 && entry.maxX <= hostRect.maxX + 0.1 &&
+            entry.minZ >= hostRect.minZ - 0.1 && entry.maxZ <= hostRect.maxZ + 0.1
+          if (!insideHost) continue
+          let entryBlocked = false
+          for (const d of doors) {
+            if (rectsOverlap(entry, doorWalkZone(d), 0)) {
+              entryBlocked = true
+              break
+            }
+          }
+          if (!entryBlocked) {
+            for (const f of sameFloorPrints) {
+              if (rectsOverlap(entry, f, 0)) {
+                entryBlocked = true
+                break
+              }
+            }
+          }
+          if (entryBlocked) continue
+        }
+
         // 4. Upper arrival through the link's upper room (shared rule:
         // landing inside the overlap, shaft clear of slabs/stairs/holes).
+        // Exit maneuvering room past the landing: the exit center must not
+        // straddle the upper room's walls (stuck landing), nor sit under a
+        // slab (checked above for the flight; rechecked for the exit here).
         const overlap = rectIntersection(rect, upperRect)
         if (overlap) {
           const landing = landingRectOf({ x: cx, z: cz, width, depth, axis, dir, switchback, stepCount: st.stepCount, stepDepth: st.stepDepth })
           if (!checkUpperArrival(rect, landing, upper, upperSlabs, st)) continue
+          const exitSign = (dir > 0) !== switchback ? 1 : -1
+          const exit = exitZoneOf(landing, axis, exitSign)
+          const exitCx = (exit.minX + exit.maxX) / 2
+          const exitCz = (exit.minZ + exit.maxZ) / 2
+          if (Math.abs(signedRectDist(exitCx, exitCz, upperRect)) < 0.4) continue
+          let exitBlocked = false
+          for (const s of upperSlabs) {
+            if (rectsOverlap(exit, s, 0.1)) {
+              exitBlocked = true
+              break
+            }
+          }
+          if (exitBlocked) continue
         }
 
         const facing = axis === facingAxis && dir === facingSign ? 3 : 0
@@ -605,6 +697,31 @@ function tryTowerPlan(
       if (!flightInsideTower(flight, rect)) continue
       const landing = landingRectOf({ x: flightX, z: flightZ, width, depth, axis: side.axis, dir: side.sign, switchback: true, stepCount: st.stepCount, stepDepth: st.stepDepth })
       if (!checkUpperArrival(flight, landing, upper, upperSlabs, st)) continue
+
+      // Exit maneuvering room past the landing (overlap arrivals only;
+      // roof decks are open air).
+      {
+        const overlap = rectIntersection(flight, roomRect(upper))
+        if (overlap) {
+          const exitSign = side.sign > 0 ? -1 : 1 // switchbacks fold back
+          const exit = exitZoneOf(landing, side.axis, exitSign)
+          const exitCx = (exit.minX + exit.maxX) / 2
+          const exitCz = (exit.minZ + exit.maxZ) / 2
+          if (Math.abs(signedRectDist(exitCx, exitCz, roomRect(upper))) < 0.4) continue
+          // Parapet ring vs upper doorways: an upper gate caught in the
+          // shaft curb (hole excluded) can never open.
+          const upperDoors = st.doorsByRoom.get(upper.id) ?? []
+          let parapetBlocked = false
+          for (const d of upperDoors) {
+            const zw = doorWalkZone(d)
+            if (rectsOverlap(zw, rect, 0) && !rectsOverlap(zw, overlap, 0)) {
+              parapetBlocked = true
+              break
+            }
+          }
+          if (parapetBlocked) continue
+        }
+      }
 
       // Score: facing partner, clearance to towers/doors.
       let towerClear = Infinity

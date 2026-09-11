@@ -1,5 +1,5 @@
 import type { Room, RoomType, LevelConfig, Boundary } from '@/core/types'
-import { FLOOR_HEIGHT } from '@/core/types'
+import { floorHeightFor } from '@/core/types'
 import { SeededRandom } from '@/core/random'
 import { isPointInBoundary } from '@/generator/boundary'
 
@@ -92,7 +92,7 @@ export function generateTopology(config: LevelConfig, boundary: Boundary, random
     rooms.push({
       id: node.id,
       type: node.type,
-      position: { x: node.position.x, y: node.floorIndex * FLOOR_HEIGHT, z: node.position.z },
+      position: { x: node.position.x, y: node.floorIndex * floorHeightFor(config), z: node.position.z },
       width: 0, // Will be set in room sizing
       depth: 0,
       height: 4,

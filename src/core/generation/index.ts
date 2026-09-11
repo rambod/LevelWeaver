@@ -1,5 +1,5 @@
 import type { LevelConfig, Room, Corridor, Boundary, DoorOpening, StairsGeometry } from '@/core/types'
-import { FLOOR_HEIGHT, DOOR_HEIGHT } from '@/core/types'
+import { DOOR_HEIGHT, floorHeightFor, corridorHeightFor } from '@/core/types'
 import { SeededRandom } from '@/core/random'
 import { buildLevelGraph, validateLevelGraph } from '@/core/levelGraph'
 import { generateBoundary } from '@/generator/boundary'
@@ -19,10 +19,16 @@ export interface GeneratedLevel {
   roomGeometry: ReturnType<typeof generateRoomGeometry>
   corridorGeometry: ReturnType<typeof generateCorridorGeometry>
   seed: number
+  /** Floor spacing actually used (from wall height). */
+  floorHeight: number
 }
 
 export function generateLevel(config: LevelConfig): GeneratedLevel {
   const random = new SeededRandom(config.seed)
+  // All vertical dimensions derive from the configured wall height so
+  // stacked floors, corridors, stairs, and doors stay consistent.
+  const floorHeight = floorHeightFor(config)
+  const corridorHeight = corridorHeightFor(config)
 
   // Stage 1: Generate boundary
   const boundary = generateBoundary(config, random)
@@ -54,14 +60,14 @@ export function generateLevel(config: LevelConfig): GeneratedLevel {
     corridorDegree.set(corridor.startRoomId, (corridorDegree.get(corridor.startRoomId) ?? 0) + 1)
     corridorDegree.set(corridor.endRoomId, (corridorDegree.get(corridor.endRoomId) ?? 0) + 1)
   }
-  const stairPlans = planStairs(rooms, doorOpenings, { corridorSlabsByFloor: corridorSlabs, boundary, corridorDegree })
+  const stairPlans = planStairs(rooms, doorOpenings, { corridorSlabsByFloor: corridorSlabs, boundary, corridorDegree, floorHeight })
   mergeTowerDoors(rooms, doorOpenings, stairPlans)
   const slabHoles = computeSlabHoles(rooms, stairPlans)
 
   // Stage 8: Generate geometry
   const roomGeometry = generateRoomGeometry(rooms, doorOpenings, slabHoles)
-  const corridorGeometry = generateCorridorGeometry(corridors)
-  const stairs = buildStairsGeometry(stairPlans, rooms, FLOOR_HEIGHT)
+  const corridorGeometry = generateCorridorGeometry(corridors, corridorHeight)
+  const stairs = buildStairsGeometry(stairPlans, rooms, floorHeight)
 
   // Stage 8b: Validate the abstract level graph. Stair links count as
   // connections: a room whose only link is vertical is reachable.
@@ -83,6 +89,7 @@ export function generateLevel(config: LevelConfig): GeneratedLevel {
     roomGeometry,
     corridorGeometry,
     seed: config.seed,
+    floorHeight,
   }
 }
 
