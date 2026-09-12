@@ -70,7 +70,12 @@ const DOOR_STUB_LENGTH = 1.2
 
 export function generateCorridors(
   rooms: Room[],
-  config: LevelConfig
+  config: LevelConfig,
+  // Lawbook §70 repair step 2 ("choose another portal wall"), used ONLY
+  // by the best-of-two variant pass: when true, edges whose preferred
+  // mouths route foul retry through alternate walls before surrendering.
+  // Default false = legacy facing-wall mouths, byte-identical to V0.1.0.
+  allowAltMouths = false,
 ): Corridor[] {
   const corridors: Corridor[] = []
   const roomMap = new Map(rooms.map(r => [r.id, r]))
@@ -203,7 +208,7 @@ export function generateCorridors(
         return
       }
     }
-    const built = createCorridor(a, b, config, roomBounds, roomRects, corridorObstacles, claimsOf(a.id), claimsOf(b.id), corridors)
+    const built = createCorridor(a, b, config, roomBounds, roomRects, corridorObstacles, claimsOf(a.id), claimsOf(b.id), corridors, allowAltMouths)
     // Intruding or mouth-pinched routes are re-realized as hops when
     // possible: a corridor through another room reads as a bug, a sealed
     // mouth reads as a locked door — two clean hops read as design. Gets
@@ -314,16 +319,59 @@ function createCorridor(
   corridorObstacles: CorridorCapsule[],
   claimsA: ClaimedMouth[] = [],
   claimsB: ClaimedMouth[] = [],
-  builtCorridors: Corridor[] = []
+  builtCorridors: Corridor[] = [],
+  allowAltMouths = false,
 ): { corridor: Corridor | null; midFoul: string | null; mouthFoul: boolean; crossFoul: boolean } {
   // Door points on the room walls facing each other. The clamp matches
   // core/generation's door computation exactly so the corridor mouth and
   // the wall opening land on the same center with the same width.
-  const startDoor = findDoorPosition(roomA, roomB.position, config.corridorWidth, config, claimsA)
-  const endDoor = findDoorPosition(roomB, roomA.position, config.corridorWidth, config, claimsB)
+  //
+  // Lawbook §70 repair step 2 ("choose another portal wall"): when
+  // allowAltMouths is set (best-of-two variant pass only — never the
+  // primary pass), edges whose preferred mouths route foul retry the SAME
+  // edge through alternate walls before surrendering. A side-wall L-route
+  // with clean gates beats a facing-wall route with a sealed gate. The
+  // no-ban attempt runs first with byte-identical logic, so edges that
+  // already route clean produce byte-identical corridors.
+  const firstDoors = {
+    start: findDoorPosition(roomA, roomB.position, config.corridorWidth, config, claimsA),
+    end: findDoorPosition(roomB, roomA.position, config.corridorWidth, config, claimsB),
+  }
+  if (!firstDoors.start || !firstDoors.end) {
+    return { corridor: null, midFoul: null, mouthFoul: false, crossFoul: false }
+  }
+  const banCombos: { banA: Set<number>; banB: Set<number> }[] = allowAltMouths
+    ? [
+        { banA: new Set(), banB: new Set() },
+        { banA: new Set([firstDoors.start.wallIndex]), banB: new Set() },
+        { banA: new Set(), banB: new Set([firstDoors.end.wallIndex]) },
+        { banA: new Set([firstDoors.start.wallIndex]), banB: new Set([firstDoors.end.wallIndex]) },
+      ]
+    : [{ banA: new Set(), banB: new Set() }]
+  let fallbackResult: { corridor: Corridor | null; midFoul: string | null; mouthFoul: boolean; crossFoul: boolean } | null = null
+  for (const { banA, banB } of banCombos) {
+    const startDoor = banA.size === 0 && banB.size === 0
+      ? firstDoors.start
+      : findDoorPosition(roomA, roomB.position, config.corridorWidth, config, claimsA, banA)
+    const endDoor = banA.size === 0 && banB.size === 0
+      ? firstDoors.end
+      : findDoorPosition(roomB, roomA.position, config.corridorWidth, config, claimsB, banB)
+    if (!startDoor || !endDoor) continue
+    const result = routeWithDoors(startDoor, endDoor)
+    if (!result.corridor) continue
+    if (!result.midFoul && !result.mouthFoul && !result.crossFoul) return result
+    if (!fallbackResult) fallbackResult = result
+  }
+  // No clean mouth combination: ship the preferred-mouth fallback (legacy
+  // behavior) so validators and retry see the honest foul instead of a
+  // silent drop. Subdivision (mid/mouth) still gets its signal from it.
+  if (fallbackResult) return fallbackResult
+  return { corridor: null, midFoul: null, mouthFoul: false, crossFoul: false }
 
-  if (!startDoor || !endDoor) return { corridor: null, midFoul: null, mouthFoul: false, crossFoul: false }
-
+function routeWithDoors(
+  startDoor: DoorSpot,
+  endDoor: DoorSpot,
+): { corridor: Corridor | null; midFoul: string | null; mouthFoul: boolean; crossFoul: boolean } {
   const startPos: Vec3 = { x: startDoor.x, y: roomA.position.y, z: startDoor.z }
   const endPos: Vec3 = { x: endDoor.x, y: roomB.position.y, z: endDoor.z }
 
@@ -440,7 +488,8 @@ function createCorridor(
     mouthFoul: fallbackFoul !== null && fallbackFoul.startsWith('mouth'),
     crossFoul: fallbackFoul === 'crossing',
   }
-}
+} // end routeWithDoors
+} // end createCorridor
 
 // Straight exit legs: replace the routed points within LEG_OUT meters of
 // each door with guaranteed-straight throat samples along the door
@@ -711,7 +760,12 @@ function findDoorPosition(
   targetPos: { x: number; z: number },
   corridorWidth: number,
   config?: LevelConfig,
-  claimed: ClaimedMouth[] = []
+  claimed: ClaimedMouth[] = [],
+  // Lawbook §70 repair step 2 ("choose another portal wall"): walls to
+  // skip when hunting a mouth. The router bans a fouled facing wall and
+  // retries the edge through a side wall (clean L-route) instead of
+  // shipping a sealed gate.
+  bannedWalls: Set<number> = new Set(),
 ): DoorSpot | null {
   const halfW = room.width / 2
   const halfD = room.depth / 2
@@ -771,6 +825,7 @@ function findDoorPosition(
 
   let picked: { wallIndex: number; lateral: number; opening: number } | null = null
   for (const w of wallOrder) {
+    if (bannedWalls.has(w)) continue
     const slot = tryWall(w)
     if (slot) {
       picked = { wallIndex: w, ...slot }
@@ -778,18 +833,23 @@ function findDoorPosition(
     }
   }
   if (!picked) {
-    // Every wall is full: share the facing mouth (merged funnel). Coincident
-    // throats stay parallel and walkable; a corner-crammed mouth would pinch shut.
-    const wLen = facing % 2 === 0 ? room.width : room.depth
+    // Every (non-banned) wall is full: share a mouth (merged funnel).
+    // Coincident throats stay parallel and walkable; a corner-crammed
+    // mouth would pinch shut. Honors bans: a banned facing wall never
+    // becomes the funnel — all banned means no mouth at all.
+    const funnelOrder = wallOrder.filter(w => !bannedWalls.has(w))
+    if (funnelOrder.length === 0) return null
+    const funnelWall = funnelOrder[0]
+    const wLen = funnelWall % 2 === 0 ? room.width : room.depth
     const op = config
       ? gateWidthFor(config, wLen, corridorWidth)
       : Math.max(1.0, Math.min(corridorWidth, wLen - 0.6))
     if (op <= 0.05) return null
-    const h = facing % 2 === 0 ? halfW : halfD
+    const h = funnelWall % 2 === 0 ? halfW : halfD
     const lo = -h + op / 2 + margin
     const hi = h - op / 2 - margin
-    const relAlong = facing % 2 === 0 ? relX : relZ
-    picked = { wallIndex: facing, lateral: Math.max(lo, Math.min(hi, relAlong)), opening: op }
+    const relAlong = funnelWall % 2 === 0 ? relX : relZ
+    picked = { wallIndex: funnelWall, lateral: Math.max(lo, Math.min(hi, relAlong)), opening: op }
   }
   const { wallIndex, lateral, opening } = picked
 

@@ -18,6 +18,7 @@ import {
   validateCorridors,
   validateDoors,
   validateExportModel,
+  validateLinkLengths,
   validateNavigationGrid,
   validatePortalCapacity,
   validatePortalSampling,
@@ -34,6 +35,13 @@ import {
   type GenerationIssue,
   type ValidationReport,
 } from '@/core/validation'
+
+// Links longer than this (room-center distance, same floor) are monster
+// candidates: beyond the topology near-pick radius (45 m) with slack.
+const MONSTER_LINK_OVER = 48
+// Midpoint search radius shared with corridor subdivision: a monster WITH
+// a midpoint room subdivides into hops instead of being pruned.
+const MONSTER_MID_RADIUS = 12
 
 export interface GeneratedLevel {
   config: LevelConfig
@@ -143,12 +151,67 @@ export function generateLevel(rawConfig: LevelConfig): GeneratedLevel {
     }
     if (clean(layout)) break
   }
+
+  // Best-of-two mouth repair (lawbook §70 step 2): the attempts above all
+  // use legacy facing-wall mouths. If the winning layout's only hard
+  // fouls are mouth-geometry failures (sealed gates, endpoint mouth
+  // intrusions — NOT placement failures, which mouths cannot cure),
+  // rebuild the SAME placement with alternate-wall mouths and keep the
+  // strictly better variant. Legacy wins ties, so clean seeds and
+  // non-mouth failures reproduce exactly; only sealed layouts can change,
+  // and only toward fewer hard errors. One extra routing pass, only when
+  // triggered — clean generations pay nothing.
+  if (layoutNeedsMouthRepair(layout)) {
+    const altCorridors = generateCorridors(layout.roomsBase, config, true)
+    const alt = finishLayout(layout.roomsBase, altCorridors, boundary, config, floorHeight)
+    if (compareTiers(alt.tiers, layout.tiers) < 0) {
+      layout = alt
+    }
+  }
+
   const { rooms, corridors, doorOpenings, stairPlans, slabHoles } = layout
+
+// A layout qualifies for mouth repair when mouths can plausibly cure it:
+// at least one sealed gate or endpoint mouth intrusion, and no broken
+// placement (overlap/nesting/out-of-bounds) that mouths cannot fix.
+function layoutNeedsMouthRepair(layout: LayoutResult): boolean {
+  let mouthFoul = false
+  for (const issue of layout.issues) {
+    if (issue.severity !== 'error') continue
+    if (
+      issue.code === 'ROOM_OVERLAP' ||
+      issue.code === 'ROOM_NESTED' ||
+      issue.code === 'ROOM_OUT_OF_BOUNDS'
+    ) {
+      return false
+    }
+    if (issue.code === 'PORTAL_SEALED') mouthFoul = true
+    // Endpoint mouth intrusions carry the '(mouth foul)' marker; unrelated
+    // room crossings do not (see validateCorridorIntrusions).
+    if (issue.code === 'CORRIDOR_ROOM_COLLISION' && issue.message.includes('(mouth foul)')) {
+      mouthFoul = true
+    }
+  }
+  return mouthFoul
+}
 
 // One spatial layout attempt (stages 4-7b). Pure and deterministic for
 // (rooms, config, attempt, topoAttempt): the placement RNG nests both
 // attempt indices as a stable hash, and every downstream stage
 // (corridors, stairs) is itself deterministic.
+interface LayoutResult {
+  /** Post-rewrite rooms, pre-hop (pristine base for variant rebuilds). */
+  roomsBase: Room[]
+  /** Rooms with realized hop edges recorded (§87). */
+  rooms: Room[]
+  corridors: Corridor[]
+  doorOpenings: Map<string, DoorOpening[]>
+  stairPlans: StairPlan[]
+  slabHoles: Map<string, RoomSlabHoles>
+  tiers: ErrorTiers
+  issues: GenerationIssue[]
+}
+
 function runLayoutAttempt(
   sizedRooms: Room[],
   boundary: Boundary,
@@ -156,14 +219,7 @@ function runLayoutAttempt(
   floorHeight: number,
   attempt: number,
   topoAttempt: number,
-): {
-  rooms: Room[]
-  corridors: Corridor[]
-  doorOpenings: Map<string, DoorOpening[]>
-  stairPlans: StairPlan[]
-  slabHoles: Map<string, RoomSlabHoles>
-  tiers: ErrorTiers
-} {
+): LayoutResult {
   // Fresh copies: placement spreads rooms but shares connection arrays,
   // and the vertical rewrite reassigns them — never mutate the topology.
   const roomsInput = sizedRooms.map(r => ({ ...r, connections: [...r.connections] }))
@@ -174,14 +230,42 @@ function runLayoutAttempt(
     : new SeededRandom(hashString(`${config.seed}:layout:${topoAttempt}:${attempt}`))
 
   // Stage 4-5: place + resolve (per-floor, circulation gaps per §22).
-  let rooms = placeRooms(roomsInput, boundary, config, placementRng)
-  rooms = resolveOverlaps(rooms, boundary, circulationGap(config))
+  let roomsBase = placeRooms(roomsInput, boundary, config, placementRng)
+  roomsBase = resolveOverlaps(roomsBase, boundary, circulationGap(config))
 
   // Stage 5b: vertical links rewritten by final overlap (lawbook §49).
-  rewriteVerticalLinks(rooms, floorHeight)
+  rewriteVerticalLinks(roomsBase, floorHeight)
+
+  // Stage 5c: prune redundant monster loop-links (lawbook §12 loop
+  // feasibility: reasonable geometric distance). Intent pairs chosen on
+  // pre-placement positions can land absurdly far apart (sparse floors,
+  // far extra picks); without a midpoint room to hop through they would
+  // realize as 100 m monster corridors collecting seals and crossings.
+  // Redundant ones are dropped explicitly — backbone bridges stay (they
+  // are reported as LONG_LINK warnings so retry prefers compact
+  // placements without failing legitimately sparse maps).
+  pruneMonsterLinks(roomsBase)
 
   // Stage 6-7: corridors + gate openings (shared gate rule, §28).
-  const corridors = generateCorridors(rooms, config)
+  // Primary pass uses legacy facing-wall mouths (V0.1.0 behavior).
+  const corridors = generateCorridors(roomsBase, config, false)
+  return finishLayout(roomsBase, corridors, boundary, config, floorHeight)
+}
+
+// Stages 6b-7b for a fixed placement: hop recording (§87), gate
+// openings, stairs, slab holes, and attempt scoring. Pure for
+// (roomsBase, corridors): the alt-mouth variant rebuilds from the same
+// base, so neither variant pollutes the other with hop edges.
+function finishLayout(
+  roomsBase: Room[],
+  corridors: Corridor[],
+  boundary: Boundary,
+  config: LevelConfig,
+  floorHeight: number,
+): LayoutResult {
+  // Hop copies: subdivision realizations join the graph explicitly on a
+  // fresh copy so variant rebuilds never inherit stale hop edges.
+  const rooms = roomsBase.map(r => ({ ...r, connections: [...r.connections] }))
   // Lawbook §87: long intent edges subdivided into hops (A-M, M-B) are
   // spatial realizations, not silent drops — record the hop edges in the
   // graph explicitly. Same-floor only, so vertical intent is untouched.
@@ -230,8 +314,95 @@ function runLayoutAttempt(
     ...validateRoomPlacement(rooms, boundary),
     ...validateDoors(rooms, doorOpenings),
     ...validateStairs(stairPlans),
+    ...validateLinkLengths(rooms),
   ]
-  return { rooms, corridors, doorOpenings, stairPlans, slabHoles, tiers: tiersOf(attemptIssues) }
+  return { roomsBase, rooms, corridors, doorOpenings, stairPlans, slabHoles, tiers: tiersOf(attemptIssues), issues: attemptIssues }
+}
+
+// Distance from point P to segment AB (2D). Local helper so the prune
+// stays dependency-free (corridors module owns the canonical one).
+function pointSegDist2D(
+  px: number, pz: number,
+  ax: number, az: number,
+  bx: number, bz: number,
+): number {
+  const dx = bx - ax
+  const dz = bz - az
+  const lenSq = dx * dx + dz * dz
+  if (lenSq < 1e-12) return Math.sqrt((px - ax) ** 2 + (pz - az) ** 2)
+  const t = Math.max(0, Math.min(1, ((px - ax) * dx + (pz - az) * dz) / lenSq))
+  return Math.sqrt((px - (ax + t * dx)) ** 2 + (pz - (az + t * dz)) ** 2)
+}
+
+// Stage 5c repair (lawbook §12, §70): drop redundant same-floor intent
+// edges that placement stretched past MONSTER_LINK_OVER with no midpoint
+// room to hop through. Removal is explicit (both connection lists) and
+// guarded by same-floor reachability: an edge goes only when its floor's
+// corridor network stays connected without it. Cross-floor detours do NOT
+// count (a stair detour may never materialize — omitted shafts — which
+// islanded rooms behind phantom stairs in an earlier full-graph version).
+// Backbone bridges always survive. Deterministic: longest first, ids
+// break ties. Pure for the attempt (rooms already attempt-local copies).
+function pruneMonsterLinks(rooms: Room[]): void {
+  const byId = new Map(rooms.map(r => [r.id, r]))
+  const dist = (a: Room, b: Room): number =>
+    Math.sqrt((a.position.x - b.position.x) ** 2 + (a.position.z - b.position.z) ** 2)
+  const hasMidpoint = (a: Room, b: Room): boolean => {
+    for (const r of rooms) {
+      if (r.id === a.id || r.id === b.id) continue
+      if (r.floorIndex !== a.floorIndex) continue
+      if (pointSegDist2D(r.position.x, r.position.z, a.position.x, a.position.z, b.position.x, b.position.z) <= MONSTER_MID_RADIUS) {
+        return true
+      }
+    }
+    return false
+  }
+  const connectedWithout = (skipA: string, skipB: string, floor: number): boolean => {
+    // Same-floor reachability only: a dropped edge may count on a detour
+    // through vertical links, but vertical links often fail to realize
+    // (omitted shafts) while same-floor corridors realize reliably.
+    // Counting a stair detour as redundancy islands rooms behind stairs
+    // that never get built (measured: GRAPH_DISCONNECTED after pruning).
+    const start = rooms.find(r => r.floorIndex === floor)!.id
+    const seen = new Set<string>([start])
+    const queue = [start]
+    while (queue.length > 0) {
+      const cur = queue.pop()!
+      const node = byId.get(cur)
+      if (!node) continue
+      for (const nb of node.connections) {
+        if ((cur === skipA && nb === skipB) || (cur === skipB && nb === skipA)) continue
+        const other = byId.get(nb)
+        if (!other || other.floorIndex !== floor || seen.has(nb)) continue
+        seen.add(nb)
+        queue.push(nb)
+      }
+    }
+    return rooms.filter(r => r.floorIndex === floor).every(r => seen.has(r.id))
+  }
+  const candidates: { a: Room; b: Room; d: number }[] = []
+  const seenPair = new Set<string>()
+  for (const room of rooms) {
+    for (const connId of room.connections) {
+      const key = [room.id, connId].sort().join('|')
+      if (seenPair.has(key)) continue
+      seenPair.add(key)
+      const other = byId.get(connId)
+      if (!other || other.floorIndex !== room.floorIndex) continue
+      const d = dist(room, other)
+      if (d > MONSTER_LINK_OVER) candidates.push({ a: room, b: other, d })
+    }
+  }
+  candidates.sort((p, q) =>
+    q.d !== p.d ? q.d - p.d : (p.a.id + '|' + p.b.id < q.a.id + '|' + q.b.id ? -1 : 1),
+  )
+  for (const { a, b } of candidates) {
+    if (!a.connections.includes(b.id)) continue // dropped as a side effect already
+    if (hasMidpoint(a, b)) continue // subdivision realizes it as hops
+    if (!connectedWithout(a.id, b.id, a.floorIndex)) continue // backbone bridge stays
+    a.connections = a.connections.filter(c => c !== b.id)
+    b.connections = b.connections.filter(c => c !== a.id)
+  }
 }
 
   // Stage 8: Generate geometry
@@ -265,6 +436,7 @@ function runLayoutAttempt(
   issues.push(...validateStairs(stairPlans))
   issues.push(...validateStairHeadroom(rooms, stairPlans, corridors))
   issues.push(...validateStairClipping(rooms, stairPlans))
+  issues.push(...validateLinkLengths(rooms))
   issues.push(...validateSlabOpenings(rooms, stairPlans, slabHoles))
   issues.push(...validateStairsGeometry(stairs))
   issues.push(...validateNavigationGrid(rooms, doorOpenings, corridors, stairPlans, floorHeight))

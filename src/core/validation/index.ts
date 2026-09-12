@@ -33,6 +33,7 @@ export type IssueCode =
   | 'CORRIDOR_ROOM_COLLISION'
   | 'CORRIDOR_CROSSING'
   | 'CORRIDOR_TOO_LOW'
+  | 'CORRIDOR_LONG_LINK'
   | 'STAIR_NO_PLACEMENT'
   | 'STAIR_BAD_RISER'
   | 'STAIR_BAD_TREAD'
@@ -86,7 +87,6 @@ export function errorTier(code: IssueCode): 1 | 2 | 3 {
     case 'PORTAL_TOO_NARROW':
     case 'PORTAL_TOO_LOW':
     case 'PORTAL_CORNER_VIOLATION':
-    case 'PORTAL_SEPARATION':
     case 'PORTAL_SEALED':
     case 'CORRIDOR_TOO_NARROW':
     case 'CORRIDOR_DEGENERATE':
@@ -358,12 +358,15 @@ export function validateDoors(
         const qa = sorted[i].wallIndex % 2 === 0 ? sorted[i].position.x : sorted[i].position.z
         const gap = Math.abs(qa - pa) - (sorted[i - 1].width + sorted[i].width) / 2
         if (gap < SPATIAL_DEFAULTS.doorSeparation - SPATIAL_DEFAULTS.epsilon) {
-          // Overlapping openings share one wall hole (§27 FORBIDDEN) — a
-          // hard error. A merely tight pier is a soft warning.
-          const overlapping = gap < -SPATIAL_DEFAULTS.epsilon
+          // Overlapping gates stay a warning, not an error: the merged
+          // funnel (all walls full, one shared mouth) and tower-door
+          // stacking produce coincident openings BY DESIGN, and no
+          // post-hoc check can tell deliberate sharing from failed
+          // spreading — while a true cram also trips PORTAL_SEALED or
+          // PORTAL_WALL_OVERCROWDED alongside it.
           issues.push({
             code: 'PORTAL_SEPARATION',
-            severity: overlapping ? 'error' : 'warning',
+            severity: 'warning',
             stage: 'doors',
             objectIds: [roomId],
             message: `Two gates in ${roomId} wall ${sorted[i].wallIndex} are ${gap.toFixed(2)} m apart (min ${SPATIAL_DEFAULTS.doorSeparation} m).`,
@@ -606,7 +609,49 @@ export function validateCorridorIntrusions(rooms: Room[], corridors: Corridor[])
   // with the router's verifier, which needs it for door-exempt checks).
   void roomMap
   return issues
-}/** Lawbook §41-48: riser/tread/width lawfulness of every built stair. */
+}
+
+/**
+ * Lawbook §82 corridor efficiency as retry steering: same-floor intent
+ * links stretched past LONG_LINK_OVER (backbone bridges the monster
+ * prune had to keep) are legal but undesirable — 60 m indoor corridors
+ * collect seals and crossings. A WARNING (never an error): legitimately
+ * sparse multi-floor maps keep working, while retry prefers the compact
+ * placement among otherwise-equal candidates (warnings break tier ties).
+ */
+export function validateLinkLengths(rooms: Room[]): GenerationIssue[] {
+  const LONG_LINK_OVER = 60
+  const issues: GenerationIssue[] = []
+  const byId = new Map(rooms.map(r => [r.id, r]))
+  const seen = new Set<string>()
+  for (const room of rooms) {
+    for (const connId of room.connections) {
+      const key = [room.id, connId].sort().join('|')
+      if (seen.has(key)) continue
+      seen.add(key)
+      const other = byId.get(connId)
+      if (!other || other.floorIndex !== room.floorIndex) continue
+      const d = Math.sqrt(
+        (room.position.x - other.position.x) ** 2 +
+        (room.position.z - other.position.z) ** 2,
+      )
+      if (d > LONG_LINK_OVER) {
+        issues.push({
+          code: 'CORRIDOR_LONG_LINK',
+          severity: 'warning',
+          stage: 'topology',
+          objectIds: [room.id, other.id],
+          message:
+            `${room.id} links ${other.id} across ${d.toFixed(0)} m of open floor ` +
+            `(over ${LONG_LINK_OVER} m): legal but fragile — prefer compact placements.`,
+        })
+      }
+    }
+  }
+  return issues
+}
+
+/** Lawbook §41-48: riser/tread/width lawfulness of every built stair. */
 export function validateStairs(plans: StairPlan[]): GenerationIssue[] {
   const issues: GenerationIssue[] = []
   const { minRiser, maxRiser, minTread, clearWidth } = SPATIAL_DEFAULTS.stair
@@ -1040,6 +1085,20 @@ export function validateNavigationGrid(
     if (ix < 0 || iz < 0 || ix >= nx || iz >= nz) return
     walk[fi(f)][ix][iz] = true
   }
+  // Cell index range covering an XZ rect (lawbook §94: validation cost
+  // bounded). The old code scanned the WHOLE map grid per room/stair —
+  // 80 M cell tests per attempt at UI-max area. Ranges are padded by one
+  // cell so float boundaries cannot exclude a passing center; every
+  // predicate below is a pure function of the center, so results are
+  // identical, only the skipped cells (which always failed) are gone.
+  const cellsIn = (
+    loX: number, hiX: number, loZ: number, hiZ: number,
+  ): { ix0: number; ix1: number; iz0: number; iz1: number } => ({
+    ix0: Math.max(0, Math.floor((loX - minX) / CELL) - 1),
+    ix1: Math.min(nx - 1, Math.floor((hiX - minX) / CELL) + 1),
+    iz0: Math.max(0, Math.floor((loZ - minZ) / CELL) - 1),
+    iz1: Math.min(nz - 1, Math.floor((hiZ - minZ) / CELL) + 1),
+  })
   const inRoomInterior = (r: Room, x: number, z: number, erode: number): boolean =>
     x > r.position.x - r.width / 2 + erode &&
     x < r.position.x + r.width / 2 - erode &&
@@ -1048,10 +1107,15 @@ export function validateNavigationGrid(
 
   // 1. Room interiors (eroded by wall + agent margin).
   for (const r of rooms) {
-    for (let ix = 0; ix < nx; ix++) {
-      for (let iz = 0; iz < nz; iz++) {
+    const er = 0.45
+    const { ix0, ix1, iz0, iz1 } = cellsIn(
+      r.position.x - r.width / 2 + er, r.position.x + r.width / 2 - er,
+      r.position.z - r.depth / 2 + er, r.position.z + r.depth / 2 - er,
+    )
+    for (let ix = ix0; ix <= ix1; ix++) {
+      for (let iz = iz0; iz <= iz1; iz++) {
         const p = at(ix, iz)
-        if (inRoomInterior(r, p.x, p.z, 0.45)) open(r.floorIndex, ix, iz)
+        if (inRoomInterior(r, p.x, p.z, er)) open(r.floorIndex, ix, iz)
       }
     }
   }
@@ -1125,8 +1189,9 @@ export function validateNavigationGrid(
     const ez = p.axis === 'z' ? p.z - p.dir * (p.depth / 2) : p.z
     const dxn = p.axis === 'z' ? 0 : p.dir
     const dzn = p.axis === 'z' ? p.dir : 0
-    for (let ix = 0; ix < nx; ix++) {
-      for (let iz = 0; iz < nz; iz++) {
+    const fr = cellsIn(f.minX, f.maxX, f.minZ, f.maxZ)
+    for (let ix = fr.ix0; ix <= fr.ix1; ix++) {
+      for (let iz = fr.iz0; iz <= fr.iz1; iz++) {
         const c = at(ix, iz)
         if (!(c.x > f.minX && c.x < f.maxX && c.z > f.minZ && c.z < f.maxZ)) continue
         const d = Math.max(0, Math.min(p.depth, (c.x - ex) * dxn + (c.z - ez) * dzn))
@@ -1151,8 +1216,9 @@ export function validateNavigationGrid(
     verticalEdges.push({ f: [host.floorIndex, fx, fz], t: [upper.floorIndex, lx, lz] })
     if (p.towerRect) {
       const t = p.towerRect
-      for (let ix = 0; ix < nx; ix++) {
-        for (let iz = 0; iz < nz; iz++) {
+      const tr = cellsIn(t.minX, t.maxX, t.minZ, t.maxZ)
+      for (let ix = tr.ix0; ix <= tr.ix1; ix++) {
+        for (let iz = tr.iz0; iz <= tr.iz1; iz++) {
           const c = at(ix, iz)
           if (c.x > t.minX && c.x < t.maxX && c.z > t.minZ && c.z < t.maxZ) {
             open(host.floorIndex, ix, iz)
@@ -1174,12 +1240,19 @@ export function validateNavigationGrid(
   )
   const queue: [number, number, number][] = []
   // Seed: all walkable cells of the spawn room.
-  for (let ix = 0; ix < nx; ix++) {
-    for (let iz = 0; iz < nz; iz++) {
-      const p = at(ix, iz)
-      if (walk[si][ix][iz] && inRoomInterior(spawn, p.x, p.z, 0.45)) {
-        reached[si][ix][iz] = true
-        queue.push([si, ix, iz])
+  {
+    const er = 0.45
+    const sr = cellsIn(
+      spawn.position.x - spawn.width / 2 + er, spawn.position.x + spawn.width / 2 - er,
+      spawn.position.z - spawn.depth / 2 + er, spawn.position.z + spawn.depth / 2 - er,
+    )
+    for (let ix = sr.ix0; ix <= sr.ix1; ix++) {
+      for (let iz = sr.iz0; iz <= sr.iz1; iz++) {
+        const p = at(ix, iz)
+        if (walk[si][ix][iz] && inRoomInterior(spawn, p.x, p.z, er)) {
+          reached[si][ix][iz] = true
+          queue.push([si, ix, iz])
+        }
       }
     }
   }
@@ -1224,10 +1297,15 @@ export function validateNavigationGrid(
     const rfi = fi(r.floorIndex)
     let walkable = 0
     let hit = 0
-    for (let ix = 0; ix < nx; ix++) {
-      for (let iz = 0; iz < nz; iz++) {
+    const er = 0.45
+    const rr = cellsIn(
+      r.position.x - r.width / 2 + er, r.position.x + r.width / 2 - er,
+      r.position.z - r.depth / 2 + er, r.position.z + r.depth / 2 - er,
+    )
+    for (let ix = rr.ix0; ix <= rr.ix1; ix++) {
+      for (let iz = rr.iz0; iz <= rr.iz1; iz++) {
         const p = at(ix, iz)
-        if (walk[rfi][ix][iz] && inRoomInterior(r, p.x, p.z, 0.45)) {
+        if (walk[rfi][ix][iz] && inRoomInterior(r, p.x, p.z, er)) {
           walkable++
           if (reached[rfi][ix][iz]) hit++
         }

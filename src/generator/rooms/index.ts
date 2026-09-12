@@ -30,15 +30,18 @@ export function assignRoomSizes(rooms: Room[], config: LevelConfig, random: Seed
 
     let width = Math.max(3, base.w * sizeMultiplier)
     let depth = Math.max(3, base.d * sizeMultiplier)
-    // Narrow shapes (ring band, cross arms, linear strips) cannot host
-    // rooms wider than their passage: soft size preference yields to the
-    // hard containment law (lawbook §3, §64-65). Cap leaves room for
-    // neighbors and corridor gaps; ring gets extra margin for band
-    // curvature (a square's corners swing wider than its sides).
+    // Narrow shapes (ring band, cross arms, linear strips, radial disc)
+    // cannot host rooms wider than their passage: soft size preference
+    // yields to the hard containment law (lawbook §3, §64-65). Cap leaves
+    // room for neighbors and corridor gaps; ring gets extra margin for
+    // band curvature (a square's corners swing wider than its sides), and
+    // radial shares the cross/linear factor (square corners swing outside
+    // the disc the same way they overhang the cross arms).
     if (
       config.shape === 'ring' ||
       config.shape === 'cross' ||
-      config.shape === 'linear'
+      config.shape === 'linear' ||
+      config.shape === 'radial'
     ) {
       const factor = config.shape === 'ring' ? 0.7 : 0.8
       const cap = Math.max(4, narrowestPassage(config.shape, config.area, config.roomCount) * factor)
