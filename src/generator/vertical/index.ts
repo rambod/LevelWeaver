@@ -478,7 +478,7 @@ function switchbackDims(stepCount: number, stepDepth: number): { width: number; 
   }
 }
 
-function flightRectOf(x: number, z: number, width: number, depth: number, axis: 'x' | 'z'): Rect2D {
+export function flightRectOf(x: number, z: number, width: number, depth: number, axis: 'x' | 'z'): Rect2D {
   const halfAlong = depth / 2
   const halfAcross = width / 2
   return axis === 'z'

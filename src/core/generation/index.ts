@@ -13,6 +13,7 @@ import { planStairs, buildStairsGeometry, rewriteVerticalLinks, type StairPlan }
 import {
   reportOf,
   validateDoors,
+  validatePortalSampling,
   validateRealizedConnectivity,
   validateRoomPlacement,
   validateStairs,
@@ -146,11 +147,14 @@ function runLayoutAttempt(
   mergeTowerDoors(rooms, doorOpenings, stairPlans, config)
   const slabHoles = computeSlabHoles(rooms, stairPlans)
 
-  // Attempt score: realized-traversal hard errors (lawbook §10, §62).
-  // Door/overlap/stair-dimension issues are attempt-independent enough
-  // (same topology/sizes) that connectivity decides between attempts.
+  // Attempt score: realized-traversal hard errors (lawbook §10, §62)
+  // plus sealed-gate errors (§61 portal sampling). Door/overlap/stair
+  // dimensions are attempt-independent enough (same topology/sizes) that
+  // connectivity + portals decide between attempts.
   const hardErrors = validateRealizedConnectivity(rooms, corridors, stairPlans, config.floorCount)
     .filter(i => i.severity === 'error').length
+    + validatePortalSampling(rooms, doorOpenings, corridors, stairPlans)
+      .filter(i => i.severity === 'error').length
   return { rooms, corridors, doorOpenings, stairPlans, slabHoles, hardErrors }
 }
 
@@ -176,6 +180,7 @@ function runLayoutAttempt(
   issues.push(...validateRealizedConnectivity(rooms, corridors, stairPlans, config.floorCount))
   issues.push(...validateRoomPlacement(rooms, boundary))
   issues.push(...validateDoors(rooms, doorOpenings))
+  issues.push(...validatePortalSampling(rooms, doorOpenings, corridors, stairPlans))
   issues.push(...validateStairs(stairPlans))
   const validation = reportOf(issues)
   if (validation.errors.length > 0) {

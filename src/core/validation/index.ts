@@ -1,6 +1,6 @@
 import type { Room, Corridor, DoorOpening, Boundary } from '@/core/types'
 import { MIN_CLEAR_WIDTH, MIN_CLEAR_HEIGHT, SPATIAL_DEFAULTS } from '@/core/rules'
-import type { StairPlan } from '@/generator/vertical'
+import { flightRectOf, type StairPlan } from '@/generator/vertical'
 
 // Structured validation (LAWBOOK §84, §96). Validators return issues;
 // they never throw and never weaken dimensions to pass.
@@ -17,6 +17,8 @@ export type IssueCode =
   | 'PORTAL_TOO_LOW'
   | 'PORTAL_CORNER_VIOLATION'
   | 'PORTAL_SEPARATION'
+  | 'PORTAL_NO_ENTRY'
+  | 'PORTAL_NO_EXIT'
   | 'STAIR_NO_PLACEMENT'
   | 'STAIR_BAD_RISER'
   | 'STAIR_BAD_TREAD'
@@ -280,8 +282,7 @@ export function validateDoors(
   return issues
 }
 
-/** Lawbook §41-48: riser/tread/width lawfulness of every built stair. */
-export function validateStairs(plans: StairPlan[]): GenerationIssue[] {
+/** Lawbook §41-48: riser/tread/width lawfulness of every built stair. */export function validateStairs(plans: StairPlan[]): GenerationIssue[] {
   const issues: GenerationIssue[] = []
   const { minRiser, maxRiser, minTread, clearWidth } = SPATIAL_DEFAULTS.stair
   for (const p of plans) {
@@ -325,3 +326,105 @@ export function validateStairs(plans: StairPlan[]): GenerationIssue[] {
   }
   return issues
 }
+
+const PORTAL_NORMALS = [
+  { x: 0, z: -1 }, // wall 0 (-Z)
+  { x: 1, z: 0 }, // wall 1 (+X)
+  { x: 0, z: 1 }, // wall 2 (+Z)
+  { x: -1, z: 0 }, // wall 3 (-X)
+];
+
+/** Lawbook §61: every portal has reachable sample space on both sides. */
+export function validatePortalSampling(
+  rooms: Room[],
+  doorsByRoom: Map<string, DoorOpening[]>,
+  corridors: Corridor[],
+  stairPlans: StairPlan[],
+): GenerationIssue[] {
+  const issues: GenerationIssue[] = []
+  const roomMap = new Map(rooms.map(r => [r.id, r]))
+  const inRect = (
+    x: number, z: number,
+    rect: { minX: number; maxX: number; minZ: number; maxZ: number },
+  ): boolean => x > rect.minX && x < rect.maxX && z > rect.minZ && z < rect.maxZ
+
+  // Corridor slabs per floor (walkable approach outside corridor mouths).
+  const slabs = new Map<number, { minX: number; maxX: number; minZ: number; maxZ: number }[]>()
+  for (const c of corridors) {
+    const pts = c.pathPoints && c.pathPoints.length > 0 ? c.pathPoints : [c.startPos, c.endPos]
+    let list = slabs.get(c.floorIndex)
+    if (!list) {
+      list = []
+      slabs.set(c.floorIndex, list)
+    }
+    for (let i = 0; i < pts.length - 1; i++) {
+      list.push({
+        minX: Math.min(pts[i].x, pts[i + 1].x) - c.width / 2 - 0.3,
+        maxX: Math.max(pts[i].x, pts[i + 1].x) + c.width / 2 + 0.3,
+        minZ: Math.min(pts[i].z, pts[i + 1].z) - c.width / 2 - 0.3,
+        maxZ: Math.max(pts[i].z, pts[i + 1].z) + c.width / 2 + 0.3,
+      })
+    }
+  }
+
+  // Stair volumes: flights (host floor) + tower shafts (full height).
+  const flights = new Map<number, { minX: number; maxX: number; minZ: number; maxZ: number }[]>()
+  const towers: { minX: number; maxX: number; minZ: number; maxZ: number }[] = []
+  for (const p of stairPlans) {
+    const host = roomMap.get(p.hostRoomId)
+    if (host) {
+      const f = flightRectOf(p.x, p.z, p.width, p.depth, p.axis)
+      const pad = 0.2
+      let list = flights.get(host.floorIndex)
+      if (!list) {
+        list = []
+        flights.set(host.floorIndex, list)
+      }
+      list.push({ minX: f.minX - pad, maxX: f.maxX + pad, minZ: f.minZ - pad, maxZ: f.maxZ + pad })
+    }
+    if (p.towerRect) towers.push(p.towerRect)
+  }
+
+  for (const [roomId, doors] of doorsByRoom) {
+    const room = roomMap.get(roomId)
+    if (!room) continue
+    const eroded = 0.05
+    const interior = {
+      minX: room.position.x - room.width / 2 + eroded,
+      maxX: room.position.x + room.width / 2 - eroded,
+      minZ: room.position.z - room.depth / 2 + eroded,
+      maxZ: room.position.z + room.depth / 2 - eroded,
+    }
+    for (const d of doors) {
+      const n = PORTAL_NORMALS[d.wallIndex] ?? PORTAL_NORMALS[0]
+      const ix = d.position.x - n.x * 0.6
+      const iz = d.position.z - n.z * 0.6
+      if (!inRect(ix, iz, interior)) {
+        issues.push({
+          code: 'PORTAL_NO_ENTRY',
+          severity: 'error',
+          stage: 'doors',
+          objectIds: [roomId],
+          message: `Gate in ${roomId} wall ${d.wallIndex} has no walkable space inside (sample lands outside the room).`,
+        })
+        continue
+      }
+      const ox = d.position.x + n.x * 0.6
+      const oz = d.position.z + n.z * 0.6
+      const onSlab = (slabs.get(room.floorIndex) ?? []).some(s => inRect(ox, oz, s))
+      const onFlight = (flights.get(room.floorIndex) ?? []).some(s => inRect(ox, oz, s))
+      const inTower = towers.some(s => inRect(ox, oz, s))
+      if (!onSlab && !onFlight && !inTower) {
+        issues.push({
+          code: 'PORTAL_NO_EXIT',
+          severity: 'error',
+          stage: 'doors',
+          objectIds: [roomId],
+          message: `Gate in ${roomId} wall ${d.wallIndex} opens into no walkable region (no corridor, stair, or shaft outside).`,
+        })
+      }
+    }
+  }
+  return issues
+}
+

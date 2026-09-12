@@ -6,7 +6,8 @@ import { presets, shapes, themes } from '@/core/presets'
 import { useLevelStore } from '@/stores/level'
 import { LevelScene } from '@/renderer/scene'
 import { CameraController } from '@/renderer/camera'
-import { snapshotCollisionBoxes } from '@/playtest/collision'
+import { snapshotCollisionBoxes, corridorWallBoxes } from '@/playtest/collision'
+import { corridorHeightFor } from '@/core/types'
 import { findSpawnRoom, spawnEyePosition } from '@/playtest/controller'
 import { exportGLB, downloadGLB } from '@/export/gltf'
 import ParamSlider from '@/ui/controls/ParamSlider.vue'
@@ -111,11 +112,32 @@ const syncScene = (level: GeneratedLevel) => {
     scene?.scene.updateMatrixWorld(true)
     const walkMeshes: THREE.Mesh[] = []
     scene?.levelGroup.traverse(obj => {
-      if (obj instanceof THREE.Mesh && (obj.name === 'floor' || obj.name.startsWith('wall') || obj.name.startsWith('step') || obj.name.startsWith('landing'))) {
+      if (!(obj instanceof THREE.Mesh)) return
+      // Corridor ribbon WALLS are excluded: a diagonal ribbon's mesh AABB
+      // is far fatter than the wall and would seal nearby doorways. Their
+      // place is taken by exact per-segment side boxes below (lawbook §56).
+      // Corridor floors stay (thin slabs, harmless with grounded epsilon).
+      const inCorridor = obj.parent?.userData?.type === 'corridor'
+      if (obj.name === 'floor' || obj.name.startsWith('step') || obj.name.startsWith('landing')) {
+        walkMeshes.push(obj)
+      } else if (obj.name.startsWith('wall') && !inCorridor) {
         walkMeshes.push(obj)
       }
     })
     collisionBoxes = snapshotCollisionBoxes(walkMeshes)
+    for (const corridor of level.corridors) {
+      const pts = corridor.pathPoints && corridor.pathPoints.length > 0
+        ? corridor.pathPoints
+        : [corridor.startPos, corridor.endPos]
+      collisionBoxes.push(
+        ...corridorWallBoxes(
+          pts,
+          corridor.width,
+          corridor.floorIndex * level.floorHeight,
+          corridorHeightFor(level.config),
+        ),
+      )
+    }
 
     // Reset camera to view the level
     cameraController?.reset()
@@ -266,7 +288,7 @@ onUnmounted(() => {
           <ParamSlider label="Connectivity" v-model="config.connectivity" :min="0" :max="1" :step="0.05" @change="generate" />
           <ParamSlider label="Verticality" v-model="config.verticality" :min="0" :max="1" :step="0.05" @change="generate" />
           <ParamSlider label="Wall Height (m)" v-model="config.wallHeight" :min="3.2" :max="5.5" :step="0.1" @change="generate" />
-          <ParamSlider label="Gate Width (m)" v-model="config.doorWidth" :min="0.8" :max="3" :step="0.1" @change="generate" />
+          <ParamSlider label="Gate Width (m)" v-model="config.doorWidth" :min="1" :max="3" :step="0.1" @change="generate" />
           <ParamSlider label="Gate Height (m)" v-model="config.doorHeight" :min="2" :max="3" :step="0.1" @change="generate" />
           <ParamSlider label="Dead Ends" v-model="config.deadEnds" :min="0" :max="0.5" :step="0.05" @change="generate" />
 

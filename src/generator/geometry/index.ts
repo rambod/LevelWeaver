@@ -105,7 +105,7 @@ function createWallMeshes(
   )
 
   // Wall 0: -Z (front) - extends from -halfW to +halfW in X, at z = -halfD
-  walls.push(createThickWallWithDoors(
+  walls.push(...createThickWallWithDoors(
     { x: -halfW, z: -halfD }, { x: halfW, z: -halfD },
     baseY, baseY + height, thickness,
     { x: 0, y: 0, z: -1 },
@@ -113,7 +113,7 @@ function createWallMeshes(
   ))
 
   // Wall 1: +X (right) - extends from -halfD to +halfD in Z, at x = +halfW
-  walls.push(createThickWallWithDoors(
+  walls.push(...createThickWallWithDoors(
     { x: halfW, z: -halfD }, { x: halfW, z: halfD },
     baseY, baseY + height, thickness,
     { x: 1, y: 0, z: 0 },
@@ -121,7 +121,7 @@ function createWallMeshes(
   ))
 
   // Wall 2: +Z (back) - extends from +halfW to -halfW in X, at z = +halfD
-  walls.push(createThickWallWithDoors(
+  walls.push(...createThickWallWithDoors(
     { x: halfW, z: halfD }, { x: -halfW, z: halfD },
     baseY, baseY + height, thickness,
     { x: 0, y: 0, z: 1 },
@@ -129,7 +129,7 @@ function createWallMeshes(
   ))
 
   // Wall 3: -X (left) - extends from +halfD to -halfD in Z, at x = -halfW
-  walls.push(createThickWallWithDoors(
+  walls.push(...createThickWallWithDoors(
     { x: -halfW, z: halfD }, { x: -halfW, z: -halfD },
     baseY, baseY + height, thickness,
     { x: -1, y: 0, z: 0 },
@@ -148,16 +148,20 @@ function createThickWallWithDoors(
   thickness: number,
   outwardNormal: { x: number; y: number; z: number },
   doorOpenings: DoorOpening[]
-): MeshData {
-  // If no doors, use simple thick wall
+): MeshData[] {
+  // Segments stay SEPARATE meshes (never combined into one wall slab).
+  // A combined wall's AABB would cover the door holes and the walk-mode
+  // collider would seal every gate shut (lawbook §52: every opening SHALL
+  // remove wall geometry from its clear opening region — including for
+  // traversal). Empty spans become empty meshes; render/export skip them.
   if (doorOpenings.length === 0) {
-    return createThickWall(start, end, bottomY, topY, thickness, outwardNormal)
+    return [createThickWall(start, end, bottomY, topY, thickness, outwardNormal)]
   }
 
   const dx = end.x - start.x
   const dz = end.z - start.z
   const len = Math.sqrt(dx * dx + dz * dz)
-  if (len < 0.01) return createEmptyMesh()
+  if (len < 0.01) return [createEmptyMesh()]
 
   // Unit vector ALONG the wall (from start to end). Door positions must be
   // projected onto this axis. (Projecting onto the perpendicular would
@@ -201,7 +205,9 @@ function createThickWallWithDoors(
   }
 
   // Wall runs full-height between doors, with a header (lintel) left
-  // above each opening instead of a full-height gap.
+  // above each opening instead of a full-height gap. Segments are
+  // returned separately (see above): the hole between them stays a real
+  // hole in every downstream consumer, including collision.
   const meshes: MeshData[] = []
   let cursor = 0
   for (const span of merged) {
@@ -217,7 +223,7 @@ function createThickWallWithDoors(
     meshes.push(segment(cursor, len, bottomY, topY))
   }
 
-  return combineMeshes(meshes, 0)
+  return meshes
 }
 
 

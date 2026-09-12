@@ -321,8 +321,17 @@ function createCorridor(
   // into ribbed wall artifacts.
   const smoothed = smoothPath(middle, roomRects, corridorObstacles, roomA.floorIndex, config.corridorWidth, roomA.id, roomB.id, startPos, endPos)
 
-  // Stitch door -> stub -> routed middle -> stub -> door.
-  const path = [startPos, ...smoothed, endPos]
+  // Stitch door -> stub -> routed middle -> stub -> door. Smoothing may
+  // shortcut from the stub at a sharp angle; the wide ribbon then sweeps
+  // across the doorway wall and INTO the room (sealed gate in walk mode).
+  // The throat check samples the ribbon EDGES near both doors: if either
+  // edge enters the room interior, fall back to the routed grid path,
+  // which keeps full ribbon clearance by construction.
+  const smoothedPath = [startPos, ...smoothed, endPos]
+  const gridPath = [startPos, ...middle, endPos]
+  const path = corridorThroatClear(smoothedPath, roomA, roomB, config.corridorWidth)
+    ? smoothedPath
+    : gridPath
 
   return {
     id: `corridor_${roomA.id}_${roomB.id}`,
@@ -334,6 +343,58 @@ function createCorridor(
     floorIndex: roomA.floorIndex,
     pathPoints: path,
   }
+}
+
+// Doorway throat check (lawbook §28, §34): within one ribbon-width of
+// either door, both ribbon edges must stay out of the rooms' interiors.
+// Edges may cross the wall BAND (the funnel where a wide corridor meets
+// a narrower gate is legal solid-on-solid), but never the inner face.
+function corridorThroatClear(path: Vec3[], roomA: Room, roomB: Room, width: number): boolean {
+  // Same ribbon-aware offset as smoothing (half width + wall + slack):
+  // the verifier must see everything the analytic wall boxes cover.
+  const half = width / 2 + 0.35
+  const wallErode = 0.35 // wall thickness + epsilon
+  const reach = DOOR_STUB_LENGTH + width / 2 + 0.8
+  const ends: { door: Vec3; room: Room }[] = [
+    { door: path[0], room: roomA },
+    { door: path[path.length - 1], room: roomB },
+  ]
+  for (const { door, room } of ends) {
+    const inner = {
+      minX: room.position.x - room.width / 2 + wallErode,
+      maxX: room.position.x + room.width / 2 - wallErode,
+      minZ: room.position.z - room.depth / 2 + wallErode,
+      maxZ: room.position.z + room.depth / 2 - wallErode,
+    }
+    // Walk the path from this end up to `reach` meters.
+    const pts = door === path[0] ? path : [...path].reverse()
+    let traveled = 0
+    for (let i = 0; i < pts.length - 1 && traveled < reach; i++) {
+      const p = pts[i]
+      const q = pts[i + 1]
+      const segLen = Math.sqrt((q.x - p.x) ** 2 + (q.z - p.z) ** 2)
+      if (segLen < 1e-9) continue
+      const ux = (q.x - p.x) / segLen
+      const uz = (q.z - p.z) / segLen
+      // Edge offsets (perpendicular), sampled every ~0.2 m.
+      const steps = Math.max(1, Math.ceil(segLen / 0.2))
+      for (let s = 0; s <= steps; s++) {
+        const t = (s / steps) * segLen
+        if (traveled + t > reach) break
+        const cx = p.x + ux * t
+        const cz = p.z + uz * t
+        for (const side of [-1, 1]) {
+          const ex = cx + -uz * side * half
+          const ez = cz + ux * side * half
+          if (ex > inner.minX && ex < inner.maxX && ez > inner.minZ && ez < inner.maxZ) {
+            return false
+          }
+        }
+      }
+      traveled += segLen
+    }
+  }
+  return true
 }
 
 export interface DoorSpot {
@@ -624,9 +685,21 @@ function segmentClear(
       })) return false
       continue
     }
-    // Endpoint room: strict everywhere EXCEPT within 3.5m of its own
-    // doorway, where leaving the expanded zone (door exit) and arriving
-    // (door approach) are legal but entering the true room is not.
+    // Endpoint room: the ribbon (not just its centerline) must stay out
+    // of the room interior. The centerline may leave through the doorway,
+    // but both ribbon edges (roomMargin = half width + wall + slack) must
+    // never enter past the inner wall face — a shortcut whose centerline
+    // skims 1.2 m past the room still drags a 1.8 m ribbon inside and
+    // seals the adjacent gate in walk mode.
+    const erode = 0.35 // wall thickness + epsilon: the interior boundary
+    const inner = {
+      minX: r.minX + erode,
+      maxX: r.maxX - erode,
+      minZ: r.minZ + erode,
+      maxZ: r.maxZ - erode,
+    }
+    // Door exit/approach legs (within 3.5 m of the doorway) use the
+    // interior test below; the middle keeps full expanded clearance.
     const door = r.roomId === startRoomId ? doorA : doorB
     const aAtDoor = Math.sqrt((a.x - door.x) ** 2 + (a.z - door.z) ** 2) < 3.5
     const bAtDoor = Math.sqrt((b.x - door.x) ** 2 + (b.z - door.z) ** 2) < 3.5
@@ -644,42 +717,29 @@ function segmentClear(
         maxZ: r.maxZ + roomMargin,
       })) return false
     }
-    // Door-side caps: may leave the true room, never enter it.
-    if (ts > 0.01) {
-      const capEnd = { x: a.x + ux * ts, y: 0, z: a.z + uz * ts }
-      if (segmentEntersRect(a, capEnd, r, 0.4)) return false
-    }
-    if (te < len - 0.01) {
-      const capStart = { x: a.x + ux * te, y: 0, z: a.z + uz * te }
-      if (segmentEntersRect(capStart, b, r, 0.4)) return false
+    // Ribbon strip test over the whole segment: centerline + both edges
+    // sampled every 0.25 m; any sample strictly inside the interior fouls
+    // the shortcut (the door-exit point itself sits on the outer plane,
+    // outside the eroded interior, so legal exits still pass).
+    const px = -uz
+    const pz = ux
+    const steps = Math.max(1, Math.ceil(len / 0.25))
+    for (let s = 0; s <= steps; s++) {
+      const cx = a.x + ux * ((s / steps) * len)
+      const cz = a.z + uz * ((s / steps) * len)
+      for (const lateral of [0, roomMargin, -roomMargin]) {
+        const ex = cx + px * lateral
+        const ez = cz + pz * lateral
+        if (ex > inner.minX && ex < inner.maxX && ez > inner.minZ && ez < inner.maxZ) {
+          return false
+        }
+      }
     }
   }
   for (const c of built) {
     if (segmentCapsuleClearance(a, b, c) < c.halfWidth + 0.1) return false
   }
   return true
-}
-
-// True when the segment ENTERS the (margin-expanded) rect: starting inside
-// and leaving is allowed (door exit), ending inside or crossing is not.
-function segmentEntersRect(
-  a: Vec3,
-  b: Vec3,
-  rect: { minX: number; maxX: number; minZ: number; maxZ: number },
-  margin: number
-): boolean {
-  const r = {
-    minX: rect.minX - margin,
-    maxX: rect.maxX + margin,
-    minZ: rect.minZ - margin,
-    maxZ: rect.maxZ + margin,
-  }
-  const aIn = a.x >= r.minX && a.x <= r.maxX && a.z >= r.minZ && a.z <= r.maxZ
-  const bIn = b.x >= r.minX && b.x <= r.maxX && b.z >= r.minZ && b.z <= r.maxZ
-  if (aIn && bIn) return true
-  if (aIn && !bIn) return false
-  if (!aIn && bIn) return true
-  return lineIntersectsRect(a, b, r)
 }
 
 function findPathSimple(
