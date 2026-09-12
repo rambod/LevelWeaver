@@ -16,9 +16,8 @@
     "noUnusedParameters": false,
     "types": ["node"],
     "noFallthroughCasesInSwitch": true,
-    "baseUrl": ".",
     "paths": {
-      "@/*": ["src/*"]
+      "@/*": ["./src/*"]
     }
   },
   "include": ["dbg*.ts", "stairbot.ts", "tests/**/*.ts"]
