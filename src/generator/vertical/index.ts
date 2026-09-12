@@ -1126,7 +1126,8 @@ function createStairTower(
   const cz = (rect.minZ + rect.maxZ) / 2
   const wX = rect.maxX - rect.minX
   const wZ = rect.maxZ - rect.minZ
-  const t = 0.3
+  // Single source of truth (lawbook §7, §55).
+  const t = SPATIAL_DEFAULTS.wallThickness
   // Local Y: group sits at the host floor base; walls run from the ground
   // (world y=0) to a parapet above the arrival level.
   const yDown = -hostFloor * floorHeight
@@ -1134,7 +1135,7 @@ function createStairTower(
   const yMid = (yDown + yTop) / 2
   const yH = yTop - yDown
 
-  const floor = createBoxMesh(cx, FLOOR_THICKNESS / 2, cz, wX, FLOOR_THICKNESS, wZ, 1)
+  const floor = createBoxMesh(cx, FLOOR_THICKNESS / 2 - 0.004, cz, wX, FLOOR_THICKNESS, wZ, 1)
   const walls: MeshData[] = []
 
   // Outward unit (host -> far end) in world XZ.

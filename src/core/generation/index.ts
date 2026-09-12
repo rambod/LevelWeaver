@@ -12,11 +12,19 @@ import type { RoomSlabHoles } from '@/generator/geometry'
 import { planStairs, buildStairsGeometry, rewriteVerticalLinks, type StairPlan } from '@/generator/vertical'
 import {
   reportOf,
+  validateCorridors,
   validateDoors,
+  validateExportModel,
+  validateNavigationGrid,
+  validatePortalCapacity,
   validatePortalSampling,
   validateRealizedConnectivity,
+  validateRoomAspects,
   validateRoomPlacement,
+  validateSlabOpenings,
+  validateStairHeadroom,
   validateStairs,
+  validateStairsGeometry,
   type GenerationIssue,
   type ValidationReport,
 } from '@/core/validation'
@@ -74,12 +82,18 @@ export function generateLevel(rawConfig: LevelConfig): GeneratedLevel {
   // is preserved across retries, lawbook §70).
   const sizedRooms = assignRoomSizes(generateTopology(config, boundary, topologyRng), config, sizingRng)
 
-  // Stages 4-7b: spatial layout with BOUNDED deterministic retry (lawbook
-  // §69-70). Placement is the fragile stage: one shot can strand stairs
+  // NOTE on lawbook §67 pipeline order: the recommended order reserves
+  // vertical connectors BEFORE corridors, but stair rules need corridor
+  // slabs (headroom) and gate positions (walk zones) as inputs. We route
+  // corridors first, then stairs, and close the loop with (a) vertical
+  // stacking bias during placement, (b) post-placement link rewrite by
+  // real overlap, and (c) bounded layout retry on traversal failure
+  // (§69-70). Placement is the fragile stage: one shot can strand stairs
   // behind unstackable rooms. Each attempt re-runs placement → vertical
   // rewrite → corridors → doors → stairs with a derived attempt seed and
   // keeps the first layout whose realized traversal is fully connected.
   // Attempt seeds are stable hashes, never hidden reseeds.
+  // Same guarantees, no stair built on unknown geometry.
   const MAX_LAYOUT_ATTEMPTS = 8
   let layout = runLayoutAttempt(sizedRooms, boundary, config, floorHeight, 0)
   for (let attempt = 1; attempt < MAX_LAYOUT_ATTEMPTS; attempt++) {
@@ -127,6 +141,17 @@ function runLayoutAttempt(
 
   // Stage 6-7: corridors + gate openings (shared gate rule, §28).
   const corridors = generateCorridors(rooms, config)
+  // Lawbook §87: long intent edges subdivided into hops (A-M, M-B) are
+  // spatial realizations, not silent drops — record the hop edges in the
+  // graph explicitly. Same-floor only, so vertical intent is untouched.
+  for (const c of corridors) {
+    const a = rooms.find(r => r.id === c.startRoomId)
+    const b = rooms.find(r => r.id === c.endRoomId)
+    if (a && b) {
+      if (!a.connections.includes(b.id)) a.connections.push(b.id)
+      if (!b.connections.includes(a.id)) b.connections.push(a.id)
+    }
+  }
   const doorOpenings = computeDoorOpenings(rooms, corridors, config)
 
   // Stage 7b: stairs with reserved slab holes.
@@ -147,14 +172,18 @@ function runLayoutAttempt(
   mergeTowerDoors(rooms, doorOpenings, stairPlans, config)
   const slabHoles = computeSlabHoles(rooms, stairPlans)
 
-  // Attempt score: realized-traversal hard errors (lawbook §10, §62)
-  // plus sealed-gate errors (§61 portal sampling). Door/overlap/stair
-  // dimensions are attempt-independent enough (same topology/sizes) that
-  // connectivity + portals decide between attempts.
-  const hardErrors = validateRealizedConnectivity(rooms, corridors, stairPlans, config.floorCount)
-    .filter(i => i.severity === 'error').length
-    + validatePortalSampling(rooms, doorOpenings, corridors, stairPlans)
-      .filter(i => i.severity === 'error').length
+  // Attempt score: layout-dependent hard errors — realized graph
+  // traversal (§10, §62), sealed gates (§61), stair headroom (§45),
+  // corridor lawfulness (§30/36), and physical grid navigation (§59-60).
+  // Size/topology-bound checks (aspects, capacity, slabs) run once at the end.
+  const attemptIssues: GenerationIssue[] = [
+    ...validateRealizedConnectivity(rooms, corridors, stairPlans, config.floorCount),
+    ...validatePortalSampling(rooms, doorOpenings, corridors, stairPlans),
+    ...validateStairHeadroom(rooms, stairPlans, corridors),
+    ...validateCorridors(corridors),
+    ...validateNavigationGrid(rooms, doorOpenings, corridors, stairPlans),
+  ]
+  const hardErrors = attemptIssues.filter(i => i.severity === 'error').length
   return { rooms, corridors, doorOpenings, stairPlans, slabHoles, hardErrors }
 }
 
@@ -179,9 +208,17 @@ function runLayoutAttempt(
   }
   issues.push(...validateRealizedConnectivity(rooms, corridors, stairPlans, config.floorCount))
   issues.push(...validateRoomPlacement(rooms, boundary))
+  issues.push(...validateRoomAspects(rooms))
   issues.push(...validateDoors(rooms, doorOpenings))
+  issues.push(...validatePortalCapacity(rooms, doorOpenings, config.doorWidth))
   issues.push(...validatePortalSampling(rooms, doorOpenings, corridors, stairPlans))
+  issues.push(...validateCorridors(corridors))
   issues.push(...validateStairs(stairPlans))
+  issues.push(...validateStairHeadroom(rooms, stairPlans, corridors))
+  issues.push(...validateSlabOpenings(rooms, stairPlans, slabHoles))
+  issues.push(...validateStairsGeometry(stairs))
+  issues.push(...validateNavigationGrid(rooms, doorOpenings, corridors, stairPlans))
+  issues.push(...validateExportModel({ roomGeometry, corridorGeometry, stairs }))
   const validation = reportOf(issues)
   if (validation.errors.length > 0) {
     console.warn(

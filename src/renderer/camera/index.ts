@@ -354,11 +354,12 @@ export class CameraController {
   }
 
   // Step-up for one horizontal axis: rise by the smallest increment that
-  // frees the move (0.12/0.24/0.35m), so climbing stairs settles onto each
-  // tread instead of bobbing a full step-up every frame. Settles velocity
-  // so gravity doesn't slam the player back down between treads.
+  // frees the move (0.10/0.19/0.20m — all within the agent maxStepHeight),
+  // so climbing stairs settles onto each tread instead of bobbing a full
+  // step-up every frame. Settles velocity so gravity doesn't slam the
+  // player back down between treads.
   private tryStepUp(axis: 'x' | 'z', target: number, collisionBoxes: THREE.Box3[]): void {
-    for (const rise of [0.12, 0.24, PLAYER_STEP_UP]) {
+    for (const rise of [0.1, 0.19, PLAYER_STEP_UP]) {
       const over = this.camera.position.clone()
       over.y += rise
       if (this.checkCollision(over, collisionBoxes)) continue

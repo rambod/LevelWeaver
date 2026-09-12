@@ -1,9 +1,9 @@
 import type { Room, RoomType, LevelConfig } from '@/core/types'
 import { SeededRandom } from '@/core/random'
+import { narrowestPassage } from '@/core/rules'
 
 // Room sizing (pipeline stage: "Assign room sizes"). Spatial placement lives
 // in `@/generator/placement` and is re-exported here for backwards compatibility.
-
 const ROOM_BASE_SIZES: Record<RoomType, { w: number; d: number; h: number }> = {
   spawn: { w: 7, d: 7, h: 3.5 },
   exit: { w: 7, d: 7, h: 3.5 },
@@ -30,6 +30,21 @@ export function assignRoomSizes(rooms: Room[], config: LevelConfig, random: Seed
 
     let width = Math.max(3, base.w * sizeMultiplier)
     let depth = Math.max(3, base.d * sizeMultiplier)
+    // Narrow shapes (ring band, cross arms, linear strips) cannot host
+    // rooms wider than their passage: soft size preference yields to the
+    // hard containment law (lawbook §3, §64-65). Cap leaves room for
+    // neighbors and corridor gaps; ring gets extra margin for band
+    // curvature (a square's corners swing wider than its sides).
+    if (
+      config.shape === 'ring' ||
+      config.shape === 'cross' ||
+      config.shape === 'linear'
+    ) {
+      const factor = config.shape === 'ring' ? 0.7 : 0.8
+      const cap = Math.max(4, narrowestPassage(config.shape, config.area, config.roomCount) * factor)
+      width = Math.min(width, cap)
+      depth = Math.min(depth, cap)
+    }
     if (room.type === 'verticalConnector') {
       // Stair-hall minimum: a legal folded flight needs ~4.9 m along one
       // axis and ~2.9 m across (footprint + wall inset). Variation must
@@ -37,8 +52,7 @@ export function assignRoomSizes(rooms: Room[], config: LevelConfig, random: Seed
       // rules account for intended portals — here, the stair shaft).
       width = Math.max(5.5, width)
       depth = Math.max(6.5, depth)
-    }
-    return {
+    }    return {
       ...room,
       width,
       depth,

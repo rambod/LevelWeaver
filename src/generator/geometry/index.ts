@@ -1,8 +1,10 @@
 import type { Room, Corridor, RoomGeometry, CorridorGeometry, MeshData, DoorOpening, Vec3, Rect2D } from '@/core/types'
 import { DOOR_WIDTH, DOOR_HEIGHT } from '@/core/types'
+import { SPATIAL_DEFAULTS } from '@/core/rules'
 import { createBoxMesh, createOrientedBox, combineMeshes, createEmptyMesh } from '@/core/meshdata'
 
-const WALL_THICKNESS = 0.3
+// Single source of truth (lawbook §7, §55): imported, never redefined here.
+const WALL_THICKNESS = SPATIAL_DEFAULTS.wallThickness
 
 
 const FLOOR_THICKNESS = 0.2
@@ -528,16 +530,21 @@ function buildCorridorGeometry(corridor: Corridor, points: Vec3[], wallHeight: n
   const miters = computeMiters(flat)
   const arc = arclengths(flat)
   const halfSlab = width / 2 + WALL_THICKNESS + 0.02
+  // Lawbook §53: corridor slabs sit 4 mm below room-slab level. Room and
+  // corridor tops would otherwise meet edge-to-edge as coplanar faces and
+  // Z-fight along every doorway seam; the lip is far below the grounded
+  // epsilon (0.02) so traversal never feels it.
+  const SEAM_DROP = 0.004
 
   return {
     id: corridor.id,
     floorIndex: corridor.floorIndex,
-    floor: buildSlabRibbon(flat, miters, arc, halfSlab, floorY + FLOOR_THICKNESS, FLOOR_THICKNESS, 1),
+    floor: buildSlabRibbon(flat, miters, arc, halfSlab, floorY + FLOOR_THICKNESS - SEAM_DROP, FLOOR_THICKNESS, 1),
     walls: [
       buildWallRibbon(flat, miters, arc, 1, width / 2, WALL_THICKNESS, floorY, wallH, 0),
       buildWallRibbon(flat, miters, arc, -1, width / 2, WALL_THICKNESS, floorY, wallH, 0),
     ],
-    ceiling: buildSlabRibbon(flat, miters, arc, halfSlab, floorY + wallH, CEILING_THICKNESS, 2),
+    ceiling: buildSlabRibbon(flat, miters, arc, halfSlab, floorY + wallH - SEAM_DROP, CEILING_THICKNESS, 2),
   }
 }
 

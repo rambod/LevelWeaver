@@ -27,7 +27,11 @@ export const MIN_CLEAR_HEIGHT =
 
 export const SPATIAL_DEFAULTS = {
   epsilon: EPSILON,
-  wallThickness: 0.2,
+  // Single source of truth for wall thickness (lawbook §7, §55: 0.15-0.25
+  // recommended; 0.30 chosen for chunky greybox readability and kept
+  // everywhere — room walls, corridor ribbons, tower shafts — by import,
+  // never by literal). Interior-boundary erosion derives from it.
+  wallThickness: 0.3,
   floorThickness: 0.2,
   ceilingThickness: 0.2,
 
@@ -93,6 +97,15 @@ export function stairMathFor(
   if (treadDepth < SPATIAL_DEFAULTS.stair.minTread - EPSILON) {
     throw new Error(
       `[LevelWeaver] stair tread ${treadDepth} m below minimum ${SPATIAL_DEFAULTS.stair.minTread} m.`,
+    )
+  }
+  // Lawbook §50: gameplay walk slope. Uniform riser/tread keeps every
+  // flight below the agent maximum by construction; assert it anyway so a
+  // future tread/riser change trips here instead of shipping ramps.
+  const slopeDeg = (Math.atan(stepHeight / treadDepth) * 180) / Math.PI
+  if (slopeDeg > AGENT_DEFAULTS.maxWalkSlopeDeg + 1e-6) {
+    throw new Error(
+      `[LevelWeaver] stair slope ${slopeDeg.toFixed(1)}° exceeds agent maximum ${AGENT_DEFAULTS.maxWalkSlopeDeg}°.`,
     )
   }
   return { stepCount, stepHeight, stepDepth: treadDepth, run: stepCount * treadDepth }
@@ -195,5 +208,70 @@ export function validateConfigFeasibility(config: LevelConfig): ConfigIssue[] {
   if (!(config.floorCount >= 1 && config.floorCount <= 5)) {
     issues.push({ code: 'CONFIG_FLOOR_COUNT', message: 'floorCount must be in [1, 5].' })
   }
+  // Every floor needs at least one room (lawbook §39): fewer rooms than
+  // floors leaves a gap no stair can bridge.
+  if (config.roomCount < config.floorCount) {
+    issues.push({
+      code: 'CONFIG_FLOOR_ROOMS',
+      message:
+        `roomCount ${config.roomCount} < floorCount ${config.floorCount}: ` +
+        `a floor would stay empty and disconnect the level.`,
+    })
+  }
+  // Total minimum room area must fit the map (lawbook §73).
+  const minTotal = config.roomCount * SPATIAL_DEFAULTS.minRoomArea
+  if (minTotal > config.area + EPSILON) {
+    issues.push({
+      code: 'CONFIG_AREA_ROOMS',
+      message:
+        `${config.roomCount} rooms need at least ${minTotal.toFixed(0)} m² ` +
+        `(minimum ${SPATIAL_DEFAULTS.minRoomArea} m² each) but area is ${config.area} m².`,
+    })
+  }
+  // Corridor must fit the shape's narrowest passage (lawbook §73).
+  // Closed-form lower bounds matching the boundary formulas: rectangle at
+  // maximum aspect, cross arms, ring band, linear strips.
+  const narrowest = narrowestPassage(config.shape, config.area, config.roomCount)
+  if (config.corridorWidth > narrowest + EPSILON) {
+    issues.push({
+      code: 'CONFIG_CORRIDOR_FIT',
+      message:
+        `corridorWidth ${config.corridorWidth} m cannot fit the ${config.shape} ` +
+        `shape's narrowest passage (~${narrowest.toFixed(1)} m at ${config.area} m²).`,
+    })
+  }
   return issues
+}
+
+// Conservative narrow-passage width (meters) for a shape/area. Mirrors
+// `@/generator/boundary` dimensions with worst-case parameters. Shared by
+// config feasibility (§73) and room sizing (soft sizes yield to hard
+// containment, §3).
+export function narrowestPassage(shape: LevelConfig['shape'], area: number, roomCount: number): number {
+  switch (shape) {
+    case 'rectangle': {
+      // Maximum aspect 2.0: depth = sqrt(area / 2).
+      return Math.sqrt(area / 2)
+    }
+    case 'cross': {
+      // Arm width = total width / 3, total = 3 * sqrt(area / 5).
+      return Math.sqrt(area / 5)
+    }
+    case 'ring': {
+      // Walkable band = outer - inner radius (inner = 0.4 * outer).
+      return Math.sqrt(area / Math.PI) * 0.6
+    }
+    case 'linear': {
+      const segLen = Math.sqrt(area / Math.max(1, roomCount)) * 1.2
+      return segLen * 1.5
+    }
+    case 'square':
+    case 'hub':
+    case 'radial':
+    case 'branching':
+    default: {
+      // Roughly square bounds; narrowest dimension ≈ sqrt(area) / 2.
+      return Math.sqrt(area) / 2
+    }
+  }
 }

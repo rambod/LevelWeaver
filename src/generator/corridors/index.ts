@@ -353,7 +353,8 @@ function corridorThroatClear(path: Vec3[], roomA: Room, roomB: Room, width: numb
   // Same ribbon-aware offset as smoothing (half width + wall + slack):
   // the verifier must see everything the analytic wall boxes cover.
   const half = width / 2 + 0.35
-  const wallErode = 0.35 // wall thickness + epsilon
+  // Interior boundary = wall thickness (single source) + epsilon.
+  const wallErode = SPATIAL_DEFAULTS.wallThickness + 0.05 // 0.35
   const reach = DOOR_STUB_LENGTH + width / 2 + 0.8
   const ends: { door: Vec3; room: Room }[] = [
     { door: path[0], room: roomA },
@@ -691,7 +692,8 @@ function segmentClear(
     // never enter past the inner wall face — a shortcut whose centerline
     // skims 1.2 m past the room still drags a 1.8 m ribbon inside and
     // seals the adjacent gate in walk mode.
-    const erode = 0.35 // wall thickness + epsilon: the interior boundary
+    // Interior boundary = wall thickness (single source) + epsilon.
+    const erode = SPATIAL_DEFAULTS.wallThickness + 0.05
     const inner = {
       minX: r.minX + erode,
       maxX: r.maxX - erode,

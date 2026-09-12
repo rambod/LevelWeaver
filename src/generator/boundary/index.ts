@@ -128,3 +128,24 @@ export function getBoundarySpawnPoints(boundary: Boundary, count: number, random
 
   return points
 }
+
+// Lawbook §64-65: containment uses polygon/shape logic, not just the
+// global AABB. A room center inside a ring/cross/radial shape does NOT
+// imply its corners are: all four must test inside (structural thickness
+// included via margin).
+export function roomFootprintInBoundary(
+  center: { x: number; z: number },
+  width: number,
+  depth: number,
+  boundary: Boundary,
+  margin = 0,
+): boolean {
+  const hw = width / 2 + margin
+  const hd = depth / 2 + margin
+  return (
+    isPointInBoundary({ x: center.x - hw, z: center.z - hd }, boundary, 0) &&
+    isPointInBoundary({ x: center.x + hw, z: center.z - hd }, boundary, 0) &&
+    isPointInBoundary({ x: center.x + hw, z: center.z + hd }, boundary, 0) &&
+    isPointInBoundary({ x: center.x - hw, z: center.z + hd }, boundary, 0)
+  )
+}

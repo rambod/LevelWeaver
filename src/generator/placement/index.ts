@@ -1,6 +1,6 @@
 import type { Room, RoomType, LevelConfig, Boundary } from '@/core/types'
 import { SeededRandom } from '@/core/random'
-import { isPointInBoundary } from '@/generator/boundary'
+import { isPointInBoundary, roomFootprintInBoundary } from '@/generator/boundary'
 
 // Spatial room placement (pipeline stage: "Place rooms spatially" +
 // "Resolve overlaps"). Room SIZES live in `@/generator/rooms`; this module
@@ -151,6 +151,7 @@ function centerPosition(
   if (halfW * 2 > boundary.width || halfD * 2 > boundary.depth) return null
   const x = Math.max(-boundary.width / 2 + halfW, Math.min(boundary.width / 2 - halfW, boundary.center.x))
   const z = Math.max(-boundary.depth / 2 + halfD, Math.min(boundary.depth / 2 - halfD, boundary.center.y))
+  if (!roomFootprintInBoundary({ x, z }, room.width, room.depth, boundary, 1)) return null
   return { x, z }
 }
 
@@ -296,14 +297,20 @@ function fitsInBoundary(
   room: Room,
   boundary: Boundary
 ): boolean {
+  // AABB for rectangular shapes + corner containment for ring/cross/
+  // radial (lawbook §64-65): a center inside the shape does not imply
+  // the corners are (ring hole, cross cut-outs).
   const halfW = room.width / 2 + 1
   const halfD = room.depth / 2 + 1
-  return (
-    pos.x - halfW >= -boundary.width / 2 &&
-    pos.x + halfW <= boundary.width / 2 &&
-    pos.z - halfD >= -boundary.depth / 2 &&
-    pos.z + halfD <= boundary.depth / 2
-  )
+  if (
+    pos.x - halfW < -boundary.width / 2 ||
+    pos.x + halfW > boundary.width / 2 ||
+    pos.z - halfD < -boundary.depth / 2 ||
+    pos.z + halfD > boundary.depth / 2
+  ) {
+    return false
+  }
+  return roomFootprintInBoundary(pos, room.width, room.depth, boundary, 1)
 }
 
 
@@ -356,6 +363,7 @@ function findRandomPosition(
     const x = random.nextFloat(minX, maxX)
     const z = random.nextFloat(minZ, maxZ)
     if (!isPointInBoundary({ x, z }, boundary, margin)) continue
+    if (!roomFootprintInBoundary({ x, z }, room.width, room.depth, boundary, 1)) continue
     if (overlapsAny({ x, z }, room, occupied, clearance)) continue
     if (!attract || attract.length === 0) return { x, z }
     let score = Infinity
@@ -377,14 +385,27 @@ function findAnyPosition(
   config: LevelConfig,
   random: SeededRandom
 ): { x: number; z: number } {
+  // Last resort (overlap resolution runs afterward). Still shape-aware:
+  // prefer draws whose footprint tests inside so rooms never start in the
+  // ring hole or off the cross arms (lawbook §64).
   const margin = config.corridorWidth + 1
   const halfW = room.width / 2
   const halfD = room.depth / 2
-
-  return {
-    x: random.nextFloat(-boundary.width / 2 + halfW + margin, boundary.width / 2 - halfW - margin),
-    z: random.nextFloat(-boundary.depth / 2 + halfD + margin, boundary.depth / 2 - halfD - margin),
+  let fallback: { x: number; z: number } | null = null
+  for (let i = 0; i < 20; i++) {
+    const cand = {
+      x: random.nextFloat(-boundary.width / 2 + halfW + margin, boundary.width / 2 - halfW - margin),
+      z: random.nextFloat(-boundary.depth / 2 + halfD + margin, boundary.depth / 2 - halfD - margin),
+    }
+    if (Number.isNaN(cand.x) || Number.isNaN(cand.z)) continue
+    if (!fallback) fallback = cand
+    if (roomFootprintInBoundary(cand, room.width, room.depth, boundary, 0)) {
+      return cand
+    }
   }
+  // Room larger than the bounds (degenerate config): return center-ish and
+  // let the validators report it.
+  return fallback ?? { x: boundary.center.x, z: boundary.center.y }
 }
 
 
@@ -559,14 +580,46 @@ function clampToBoundary(room: Room, boundary: Boundary): void {
 }
 
 
-// Non-rectangular shapes (ring hole, cross cut-outs): if the rect clamp
-// left the room center outside the shape, walk it toward the middle until
-// it is inside (or give up after a few steps and keep the rect position).
+// Non-rectangular shapes (ring hole, cross cut-outs): the rect clamp only
+// bounds the AABB, so corners can still dangle over the void. Search a
+// deterministic spiral of offsets (nearest first) for a fully-inside
+// footprint (lawbook §64-65). Spiral, not radial-to-center: the ring's
+// center IS the hole, so walking inward is exactly wrong — the fix is
+// usually tangential along the band. Bounded; leftovers go to the
+// validator honestly.
+const PULL_OFFSETS: { x: number; z: number }[] = (() => {
+  const pts: { x: number; z: number }[] = [{ x: 0, z: 0 }]
+  for (const r of [1, 2, 3, 4, 6, 8, 11, 14, 18, 23]) {
+    const steps = 8
+    for (let i = 0; i < steps; i++) {
+      const a = (i / steps) * Math.PI * 2
+      pts.push({ x: Math.cos(a) * r, z: Math.sin(a) * r })
+    }
+  }
+  return pts
+})()
+
 function pullIntoBoundary(room: Room, boundary: Boundary): void {
-  if (isPointInBoundary({ x: room.position.x, z: room.position.z }, boundary, 1)) return
-  for (let i = 0; i < 25; i++) {
-    room.position.x += (boundary.center.x - room.position.x) * 0.2
-    room.position.z += (boundary.center.y - room.position.z) * 0.2
-    if (isPointInBoundary({ x: room.position.x, z: room.position.z }, boundary, 1)) return
+  const fits = (x: number, z: number): boolean =>
+    isPointInBoundary({ x, z }, boundary, 1) &&
+    roomFootprintInBoundary({ x, z }, room.width, room.depth, boundary, 0)
+  if (fits(room.position.x, room.position.z)) return
+  for (const off of PULL_OFFSETS) {
+    const x = room.position.x + off.x
+    const z = room.position.z + off.z
+    // Stay inside the rect bounds too (the AABB clamp above still holds).
+    const hw = room.width / 2 + 1
+    const hd = room.depth / 2 + 1
+    if (
+      x - hw < -boundary.width / 2 || x + hw > boundary.width / 2 ||
+      z - hd < -boundary.depth / 2 || z + hd > boundary.depth / 2
+    ) {
+      continue
+    }
+    if (fits(x, z)) {
+      room.position.x = x
+      room.position.z = z
+      return
+    }
   }
 }

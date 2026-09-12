@@ -1,4 +1,5 @@
 import * as THREE from 'three'
+import { SPATIAL_DEFAULTS } from '@/core/rules'
 
 // AABB collision between the player capsule (approximated as a vertical
 // segment with a horizontal radius) and world-space bounding boxes.
@@ -25,7 +26,8 @@ export function corridorWallBoxes(
   width: number,
   yBase: number,
   height: number,
-  wallThickness = 0.3,
+  // Single source of truth (lawbook §7, §55).
+  wallThickness = SPATIAL_DEFAULTS.wallThickness,
 ): THREE.Box3[] {
   const boxes: THREE.Box3[] = []
   const half = width / 2
