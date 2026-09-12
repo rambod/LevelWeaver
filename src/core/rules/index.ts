@@ -6,6 +6,13 @@ import type { LevelConfig } from '@/core/types'
 // functions. Every minimum/default below is the single source of truth;
 // generator stages derive their geometry from here, never from literals.
 
+// Lawbook §8 + §92: determinism key includes the generator version.
+// Same seed + preset + params on a DIFFERENT version may legitimately
+// produce a different level. The version travels with every generated
+// level so stale regression seeds are detectable instead of silently
+// "passing" against new geometry.
+export const GENERATOR_VERSION = '0.1.1'
+
 export const EPSILON = 0.0001
 
 export const AGENT_DEFAULTS = {
@@ -273,6 +280,32 @@ export function validateConfigFeasibility(config: LevelConfig): ConfigIssue[] {
         `(minimum ${SPATIAL_DEFAULTS.minRoomArea} m² each) but area is ${config.area} m².`,
     })
   }
+  // Realistic footprint with circulation gaps (lawbook §22, §73): rooms
+  // cannot share walls — every room needs its footprint PLUS the
+  // wall-to-wall circulation gap on each side, plus corridor overhead.
+  // The old check (rooms * 6 m² <= area) admitted grossly overfull maps
+  // (e.g. 10 rooms + 4 m corridors on 500 m²) that placement could never
+  // separate, producing ROOM_OVERLAP artifacts on random seeds. Reject
+  // them here with a clear message instead of shipping overlaps.
+  // Sized from a realistic average room (~45 m² incl. hubs/arenas), not
+  // the 6 m² closet minimum: the minimum check above stays as the
+  // absolute floor, this one guards packability.
+  {
+    const gap = Math.max(config.corridorWidth + 1.0, 3.5)
+    const cellSide = Math.sqrt(45) + gap
+    const usable = usableMapArea(config.shape, config.area)
+    const needed = config.roomCount * cellSide * cellSide
+    if (needed > usable * 1.2 + EPSILON) {
+      issues.push({
+        code: 'CONFIG_AREA_DENSITY',
+        message:
+          `${config.roomCount} rooms with ${config.corridorWidth.toFixed(1)} m corridors ` +
+          `need ~${needed.toFixed(0)} m² incl. ${gap.toFixed(1)} m circulation gaps, ` +
+          `but ${config.shape} at ${config.area} m² offers ~${usable.toFixed(0)} m² usable. ` +
+          `Reduce rooms, narrow corridors, or enlarge the area.`,
+      })
+    }
+  }
   // Corridor must fit the shape's narrowest passage (lawbook §73).
   // Closed-form lower bounds matching the boundary formulas: rectangle at
   // maximum aspect, cross arms, ring band, linear strips.
@@ -286,6 +319,14 @@ export function validateConfigFeasibility(config: LevelConfig): ConfigIssue[] {
     })
   }
   return issues
+}
+
+// Usable map area for density feasibility (§73): the ring's courtyard
+// hole is not placeable (inner = 0.4 * outer -> 16% of the disc).
+export function usableMapArea(shape: LevelConfig['shape'], area: number): number {
+  // Ring loses its courtyard hole (inner = 0.4 * outer -> 16% of disc).
+  if (shape === 'ring') return area * 0.84
+  return area
 }
 
 // Conservative narrow-passage width (meters) for a shape/area. Mirrors

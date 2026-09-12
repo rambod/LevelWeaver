@@ -209,6 +209,11 @@ export function generateCorridors(
     // mouth reads as a locked door — two clean hops read as design. Gets
     // one extra depth level over length subdivision (cycles are still
     // impossible: banned ancestors accumulate every level).
+    // NOTE: crossings do NOT subdivide — hops span the same region and
+    // still cross, while adding mouths/walls that seal gates (measured:
+    // subdividing crossings turned 1 crossing into 6 sealed/intrusion
+    // errors on dense maps). Crossings ship, validators report, retry
+    // re-routes the whole layout instead.
     if (built && built.corridor && depth < 3 && (built.midFoul || built.mouthFoul)) {
       const mid = findMidpointRoom(a, b, rooms, new Set([...banned, a.id, b.id]))
       if (mid && mid.id !== a.id && mid.id !== b.id) {
@@ -310,14 +315,14 @@ function createCorridor(
   claimsA: ClaimedMouth[] = [],
   claimsB: ClaimedMouth[] = [],
   builtCorridors: Corridor[] = []
-): { corridor: Corridor | null; midFoul: string | null; mouthFoul: boolean } {
+): { corridor: Corridor | null; midFoul: string | null; mouthFoul: boolean; crossFoul: boolean } {
   // Door points on the room walls facing each other. The clamp matches
   // core/generation's door computation exactly so the corridor mouth and
   // the wall opening land on the same center with the same width.
   const startDoor = findDoorPosition(roomA, roomB.position, config.corridorWidth, config, claimsA)
   const endDoor = findDoorPosition(roomB, roomA.position, config.corridorWidth, config, claimsB)
 
-  if (!startDoor || !endDoor) return { corridor: null, midFoul: null, mouthFoul: false }
+  if (!startDoor || !endDoor) return { corridor: null, midFoul: null, mouthFoul: false, crossFoul: false }
 
   const startPos: Vec3 = { x: startDoor.x, y: roomA.position.y, z: startDoor.z }
   const endPos: Vec3 = { x: endDoor.x, y: roomB.position.y, z: endDoor.z }
@@ -329,9 +334,9 @@ function createCorridor(
   // Only skip nearly-coincident rooms. Short corridors between close rooms
   // are legitimate; skipping them would leave door openings with no
   // connecting geometry behind them.
-  if (distance < 0.5) return { corridor: null, midFoul: null, mouthFoul: false }
+  if (distance < 0.5) return { corridor: null, midFoul: null, mouthFoul: false, crossFoul: false }
 
-  const finish = (path: Vec3[]): { corridor: Corridor | null; midFoul: string | null; mouthFoul: boolean } => {
+  const finish = (path: Vec3[]): { corridor: Corridor | null; midFoul: string | null; mouthFoul: boolean; crossFoul: boolean } => {
     const corridor: Corridor = {
       id: `corridor_${roomA.id}_${roomB.id}`,
       startRoomId: roomA.id,
@@ -348,7 +353,7 @@ function createCorridor(
     }
     // Selected paths passed the unified verifier (foul == null), so the
     // mid-room check agrees: no subdivision signal from here.
-    return { corridor, midFoul: null, mouthFoul: false }
+    return { corridor, midFoul: null, mouthFoul: false, crossFoul: false }
   }
 
   // Perpendicular stubs out of each doorway; the routed middle part stays
@@ -418,10 +423,11 @@ function createCorridor(
   }
   // All candidates foul somewhere: ship the grid middle (closest to the
   // routed guarantees) and report fouls for subdivision. Mouth fouls also
-  // subdivide now: a pinched direct edge becomes two hops with fresh
-  // mouth angles. Final validators + retry decide survival.
+  // subdivide: a pinched direct edge becomes two hops with fresh mouth
+  // angles (crossings do NOT — see routePair NOTE). Final validators +
+  // retry decide survival.
   const fallback = finish([startPos, ...middleGrid, endPos])
-  if (!fallback.corridor) return { corridor: null, midFoul: null, mouthFoul: false }
+  if (!fallback.corridor) return { corridor: null, midFoul: null, mouthFoul: false, crossFoul: false }
   const gridPath = [startPos, ...middleGrid, endPos]
   const fallbackFoul = corridorPathFoul(
     gridPath, roomA, roomB, roomRects, corridorObstacles, builtCorridors,
@@ -432,6 +438,7 @@ function createCorridor(
     corridor: fallback.corridor,
     midFoul: corridorMidFoul(gridPath, roomA, roomB, roomRects, config.corridorWidth, roomA.floorIndex),
     mouthFoul: fallbackFoul !== null && fallbackFoul.startsWith('mouth'),
+    crossFoul: fallbackFoul === 'crossing',
   }
 }
 
@@ -545,17 +552,18 @@ function corridorPathFoul(
   }
   // Mouth threads: ±0.6 m along each door's WALL normal (the hole axis,
   // exactly like walk-mode probes) must clear all wall capsules — the
-  // candidate's OWN two doors AND every already-built door on the floor.
-  // (A new corridor's walls sealing a previous door is the same failure
-  // as sealing its own; checking only its own doors leaves the other
-  // direction invisible.)
+  // candidate's OWN two doors vs ALL walls, plus every already-built door
+  // vs the candidate's OWN walls. Old-vs-old pairs were already proven
+  // clean when those corridors shipped and involve nothing new: checking
+  // them here lets one pre-existing foul veto every later candidate.
   const WALL_DIRS = [
     { x: 0, z: -1 }, { x: 1, z: 0 }, { x: 0, z: 1 }, { x: -1, z: 0 },
   ]
-  const threads = [
+  const newThreads = [
     { door: doorA, nx: normalA.x, nz: normalA.z },
     { door: doorB, nx: normalB.x, nz: normalB.z },
   ]
+  const oldThreads: { door: Vec3; nx: number; nz: number }[] = []
   for (const c of builtCorridors) {
     if (c.floorIndex !== floorIndex) continue
     const ends = [
@@ -565,18 +573,34 @@ function corridorPathFoul(
     for (const end of ends) {
       if (!end.pin) continue
       const n = WALL_DIRS[end.pin.wallIndex] ?? WALL_DIRS[0]
-      threads.push({ door: end.pos, nx: n.x, nz: n.z })
+      oldThreads.push({ door: end.pos, nx: n.x, nz: n.z })
     }
   }
-  for (const t of threads) {
+  const threadSealed = (
+    ax: number, az: number, bx: number, bz: number,
+    walls: { ax: number; az: number; bx: number; bz: number; half: number }[],
+  ): boolean => {
+    for (const w of walls) {
+      if (segSegDist2D(ax, az, bx, bz, w.ax, w.az, w.bx, w.bz) < w.half + bodyR - 1e-9) return true
+    }
+    return false
+  }
+  for (const t of newThreads) {
     const ax = t.door.x - t.nx * 0.6
     const az = t.door.z - t.nz * 0.6
     const bx = t.door.x + t.nx * 0.6
     const bz = t.door.z + t.nz * 0.6
-    for (const w of [...ownWalls, ...otherWalls]) {
-      if (segSegDist2D(ax, az, bx, bz, w.ax, w.az, w.bx, w.bz) < w.half + bodyR - 1e-9) {
-        return 'mouth-sealed'
-      }
+    if (threadSealed(ax, az, bx, bz, ownWalls) || threadSealed(ax, az, bx, bz, otherWalls)) {
+      return 'mouth-sealed'
+    }
+  }
+  for (const t of oldThreads) {
+    const ax = t.door.x - t.nx * 0.6
+    const az = t.door.z - t.nz * 0.6
+    const bx = t.door.x + t.nx * 0.6
+    const bz = t.door.z + t.nz * 0.6
+    if (threadSealed(ax, az, bx, bz, ownWalls)) {
+      return 'mouth-sealed'
     }
   }
   for (let k = 0; k < path.length - 1; k++) {
@@ -806,6 +830,60 @@ interface GridNode {
   g: number // cost from start
   f: number // estimated total cost
   parent: GridNode | null
+  /** Insertion sequence: heap tie-break so equal-f pops earliest-first,
+   * exactly matching the old linear min-scan's first-min-wins order. */
+  seq: number
+}
+
+/**
+ * Minimal binary heap for A* (lawbook §94-95: validation cost bounded).
+ * The old linear min-scan was O(openSet) per pop — 25M comparisons for a
+ * 5000-node frontier, the 95-second hang on 40-room maps. Heap pops are
+ * O(log n) with identical (f, seq) ordering, so routed paths are unchanged.
+ */
+class GridHeap {
+  private items: GridNode[] = []
+  get size(): number {
+    return this.items.length
+  }
+  push(node: GridNode): void {
+    const a = this.items
+    a.push(node)
+    let i = a.length - 1
+    while (i > 0) {
+      const p = (i - 1) >> 1
+      if (less(a[i], a[p])) {
+        ;[a[i], a[p]] = [a[p], a[i]]
+        i = p
+      } else break
+    }
+  }
+  pop(): GridNode | undefined {
+    const a = this.items
+    if (a.length === 0) return undefined
+    const top = a[0]
+    const last = a.pop()!
+    if (a.length > 0) {
+      a[0] = last
+      let i = 0
+      for (;;) {
+        const l = i * 2 + 1
+        const r = l + 1
+        let m = i
+        if (l < a.length && less(a[l], a[m])) m = l
+        if (r < a.length && less(a[r], a[m])) m = r
+        if (m === i) break
+        ;[a[i], a[m]] = [a[m], a[i]]
+        i = m
+      }
+    }
+    return top
+  }
+}
+
+function less(a: GridNode, b: GridNode): boolean {
+  if (a.f !== b.f) return a.f < b.f
+  return a.seq < b.seq
 }
 
 /** Exit cone: door-plane reference point + outward normal. */
@@ -868,20 +946,25 @@ function findPathAStar(
     return [start, end]
   }
 
-  // A* on grid
+  // A* on grid (binary heap: identical (f, seq) pop order to the old
+  // linear scan, O(log n) instead of O(n) per pop).
   const openSet = new Map<string, GridNode>()
+  const openHeap = new GridHeap()
   const closedSet = new Set<string>()
-  
+  let seq = 0
+
   const startNode: GridNode = {
     x: Math.round(start.x / cellSize),
     z: Math.round(start.z / cellSize),
     g: 0,
     f: heuristic(start, end),
-    parent: null
+    parent: null,
+    seq: seq++,
   }
-  
+
   const endNodeKey = `${Math.round(end.x / cellSize)},${Math.round(end.z / cellSize)}`
   openSet.set(`${startNode.x},${startNode.z}`, startNode)
+  openHeap.push(startNode)
 
   const directions = [
     { dx: 1, dz: 0, cost: 1 },
@@ -899,17 +982,22 @@ function findPathAStar(
   const straightDist = Math.sqrt((end.x - start.x) ** 2 + (end.z - start.z) ** 2)
   const maxIterations = Math.min(20000, 4000 + Math.round(straightDist * 120))
 
-  while (openSet.size > 0 && iterations < maxIterations) {
+  while (openHeap.size > 0 && iterations < maxIterations) {
     iterations++
 
-    // Find node with lowest f
-    let current: GridNode | null = null
+    // Lowest-f pop; stale heap entries (superseded by a better g for the
+    // same cell) are skipped — the map holds the current best.
+    let current: GridNode | undefined
     let currentKey = ''
-    for (const [key, node] of openSet) {
-      if (!current || node.f < current.f) {
-        current = node
-        currentKey = key
-      }
+    for (;;) {
+      const cand = openHeap.pop()
+      if (!cand) break
+      const key = `${cand.x},${cand.z}`
+      const best = openSet.get(key)
+      if (best !== cand) continue // stale entry
+      current = cand
+      currentKey = key
+      break
     }
 
     if (!current) break
@@ -944,9 +1032,11 @@ function findPathAStar(
           z: nz,
           g: tentativeG,
           f: tentativeG + heuristic({ x: worldX, y: 0, z: worldZ }, end),
-          parent: current
+          parent: current,
+          seq: seq++,
         }
         openSet.set(neighborKey, neighbor)
+        openHeap.push(neighbor)
       }
     }
   }

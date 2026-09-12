@@ -32,9 +32,14 @@ export function useLevelStore() {
   }
 
   function randomSeed(): void {
+    // Lawbook §8/§107: no Math.random() anywhere — including seed picks.
+    // crypto.getRandomValues is the browser-correct nondeterministic
+    // source for the "Random" button; generation itself stays seeded.
+    const buf = new Uint32Array(1)
+    crypto.getRandomValues(buf)
     config.value = {
       ...config.value,
-      seed: Math.floor(Math.random() * 1000000),
+      seed: buf[0] % 1000000,
     }
     generate()
   }

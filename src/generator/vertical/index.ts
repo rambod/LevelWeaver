@@ -820,13 +820,19 @@ function tryTowerPlan(
         ? { minX: Math.min(near, far), maxX: Math.max(near, far), minZ: t0 - halfT, maxZ: t0 + halfT }
         : { minX: t0 - halfT, maxX: t0 + halfT, minZ: Math.min(near, far), maxZ: Math.max(near, far) }
 
-      // a. Inside the map (rect in outer bounds, center in shape).
+      // a. Inside the map: outer AABB plus ALL FOUR corners in the
+      // shape (lawbook §64-65). Center-only tests let tower corners dangle
+      // over the ring hole / off the cross arms on curved shapes.
       const cx = (rect.minX + rect.maxX) / 2
       const cz = (rect.minZ + rect.maxZ) / 2
       if (
         rect.minX < -st.boundary.width / 2 + 0.5 || rect.maxX > st.boundary.width / 2 - 0.5 ||
         rect.minZ < -st.boundary.depth / 2 + 0.5 || rect.maxZ > st.boundary.depth / 2 - 0.5 ||
-        !isPointInBoundary({ x: cx, z: cz }, st.boundary, 1)
+        !isPointInBoundary({ x: cx, z: cz }, st.boundary, 1) ||
+        !isPointInBoundary({ x: rect.minX + 0.3, z: rect.minZ + 0.3 }, st.boundary, 0) ||
+        !isPointInBoundary({ x: rect.maxX - 0.3, z: rect.minZ + 0.3 }, st.boundary, 0) ||
+        !isPointInBoundary({ x: rect.minX + 0.3, z: rect.maxZ - 0.3 }, st.boundary, 0) ||
+        !isPointInBoundary({ x: rect.maxX - 0.3, z: rect.maxZ - 0.3 }, st.boundary, 0)
       ) {
         noteRejection(st, 'tower-outside-boundary')
         continue

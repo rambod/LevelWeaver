@@ -181,12 +181,20 @@ const selectPreset = (presetKey: string) => {
 
 const exportLevel = async () => {
   if (!generatedLevel.value) return
+  if (generatedLevel.value.validation && generatedLevel.value.validation.errors.length > 0) {
+    alert(
+      `Export refused: this level has ${generatedLevel.value.validation.errors.length} hard validation error(s).\n` +
+      generatedLevel.value.validation.errors.slice(0, 3).map(e => `[${e.code}] ${e.message}`).join('\n') +
+      `\nRegenerate with a different seed or loosen the density.`,
+    )
+    return
+  }
   try {
     const blob = await exportGLB(generatedLevel.value)
     downloadGLB(blob, `level_${config.value.seed}.glb`)
   } catch (err) {
     console.error('Export failed:', err)
-    alert('Export failed. Check console for details.')
+    alert(err instanceof Error ? err.message : 'Export failed. Check console for details.')
   }
 }
 

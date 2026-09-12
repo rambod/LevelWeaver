@@ -1,7 +1,7 @@
 import type { LevelConfig, Room, Corridor, Boundary, DoorOpening, StairsGeometry } from '@/core/types'
 import { floorHeightFor, corridorHeightFor } from '@/core/types'
 import { SeededRandom, hashString } from '@/core/random'
-import { circulationGap, gateWidthFor, validateConfigFeasibility, SPATIAL_DEFAULTS } from '@/core/rules'
+import { GENERATOR_VERSION, circulationGap, gateWidthFor, validateConfigFeasibility, SPATIAL_DEFAULTS } from '@/core/rules'
 import { buildLevelGraph, validateLevelGraph } from '@/core/levelGraph'
 import { generateBoundary } from '@/generator/boundary'
 import { generateTopology } from '@/generator/topology'
@@ -14,6 +14,7 @@ import {
   compareTiers,
   reportOf,
   tiersOf,
+  validateCorridorIntrusions,
   validateCorridors,
   validateDoors,
   validateExportModel,
@@ -25,6 +26,7 @@ import {
   validateRoomAspects,
   validateRoomPlacement,
   validateSlabOpenings,
+  validateStairClipping,
   validateStairHeadroom,
   validateStairs,
   validateStairsGeometry,
@@ -44,9 +46,13 @@ export interface GeneratedLevel {
   seed: number
   /** Floor spacing actually used (from wall height). */
   floorHeight: number
+  /** Generator version that produced this level (lawbook §8, §92). */
+  generatorVersion: string
   /** Structured stage-gate findings (lawbook §84). Errors mean the level
    * violates a hard invariant even though a preview is still returned. */
   validation: ValidationReport
+  /** True when the level passed every hard invariant (safe to export). */
+  ok: boolean
 }
 
 export function generateLevel(rawConfig: LevelConfig): GeneratedLevel {
@@ -85,15 +91,19 @@ export function generateLevel(rawConfig: LevelConfig): GeneratedLevel {
   // Stage 3 + stages 4-7b with TWO-LEVEL bounded deterministic retry
   // (lawbook §69-70). Inner loop re-runs placement → vertical rewrite →
   // corridors → doors → stairs with derived layout seeds (topology
-  // preserved). If all 8 layouts keep hard errors, the OUTER loop
+  // preserved). If all layouts keep hard errors, the OUTER loop
   // regenerates topology+sizes from a derived seed (repair step 9:
   // topology regen as last resort — e.g. a topology whose floor-0 rooms
   // are all too small to host any stair). Attempt 0 reproduces the exact
   // legacy stream sequence, and strictly-less replacement keeps it
   // whenever it already wins, so passing seeds never change output.
   // All attempt seeds are stable hashes, never hidden reseeds.
-  const MAX_TOPO_ATTEMPTS = 3
-  const MAX_LAYOUT_ATTEMPTS = 8
+  // Budgets scale DOWN with map size (lawbook §94): a 40-room map runs
+  // ~70 corridor A* searches per attempt, so 24 full attempts hung for
+  // 95 s. Large maps get fewer attempts — attempt 0 is always identical,
+  // so clean seeds reproduce bit-for-bit regardless of budget.
+  const MAX_TOPO_ATTEMPTS = config.roomCount > 30 ? 2 : 3
+  const MAX_LAYOUT_ATTEMPTS = config.roomCount > 30 ? 3 : config.roomCount > 20 ? 5 : 8
   // Attempt-0 topology+sizes, computed once and shared by all attempt-0
   // layouts (regenerating per attempt would consume the RNG stream and
   // reshuffle every seed).
@@ -192,7 +202,7 @@ function runLayoutAttempt(
     corridorDegree.set(corridor.startRoomId, (corridorDegree.get(corridor.startRoomId) ?? 0) + 1)
     corridorDegree.set(corridor.endRoomId, (corridorDegree.get(corridor.endRoomId) ?? 0) + 1)
   }
-  const quiet = attempt > 0
+  const quiet = true
   const stairPlans = planStairs(rooms, doorOpenings, {
     corridorSlabsByFloor: corridorSlabs,
     boundary,
@@ -204,15 +214,18 @@ function runLayoutAttempt(
   const slabHoles = computeSlabHoles(rooms, stairPlans)
 
   // Attempt score: layout-dependent hard errors — realized graph
-  // traversal (§10, §62), sealed gates (§61), stair headroom (§45),
-  // corridor lawfulness (§30/36), and physical grid navigation (§59-60).
-  // Size/topology-bound checks (aspects, capacity, slabs) run once at the end.
+  // traversal (§10, §62), sealed gates (§61), stair headroom (§45) and
+  // stair clipping (§40/49), corridor lawfulness (§30-32/35-36), and
+  // physical grid navigation (§59-60). Size/topology-bound checks
+  // (aspects, capacity, slabs) run once at the end.
   const attemptIssues: GenerationIssue[] = [
     ...validateRealizedConnectivity(rooms, corridors, stairPlans, config.floorCount),
     ...validatePortalSampling(rooms, doorOpenings, corridors, stairPlans),
     ...validatePortalSeals(rooms, doorOpenings, corridors),
     ...validateStairHeadroom(rooms, stairPlans, corridors),
-    ...validateCorridors(corridors),
+    ...validateStairClipping(rooms, stairPlans),
+    ...validateCorridors(corridors, corridorHeightFor(config)),
+    ...validateCorridorIntrusions(rooms, corridors),
     ...validateNavigationGrid(rooms, doorOpenings, corridors, stairPlans, floorHeight),
     ...validateRoomPlacement(rooms, boundary),
     ...validateDoors(rooms, doorOpenings),
@@ -247,9 +260,11 @@ function runLayoutAttempt(
   issues.push(...validatePortalCapacity(rooms, doorOpenings, config.doorWidth))
   issues.push(...validatePortalSampling(rooms, doorOpenings, corridors, stairPlans))
   issues.push(...validatePortalSeals(rooms, doorOpenings, corridors))
-  issues.push(...validateCorridors(corridors))
+  issues.push(...validateCorridors(corridors, corridorHeight))
+  issues.push(...validateCorridorIntrusions(rooms, corridors))
   issues.push(...validateStairs(stairPlans))
   issues.push(...validateStairHeadroom(rooms, stairPlans, corridors))
+  issues.push(...validateStairClipping(rooms, stairPlans))
   issues.push(...validateSlabOpenings(rooms, stairPlans, slabHoles))
   issues.push(...validateStairsGeometry(stairs))
   issues.push(...validateNavigationGrid(rooms, doorOpenings, corridors, stairPlans, floorHeight))
@@ -272,7 +287,9 @@ function runLayoutAttempt(
     corridorGeometry,
     seed: config.seed,
     floorHeight,
+    generatorVersion: GENERATOR_VERSION,
     validation,
+    ok: validation.errors.length === 0,
   }
 }
 

@@ -9,6 +9,16 @@ function floorGroupName(floorIndex: number): string {
 }
 
 export async function exportGLB(level: GeneratedLevel): Promise<Blob> {
+  // Lawbook §96: export SHALL refuse levels with hard errors. Shipping a
+  // GLB with known overlaps, sealed gates, or missing stairs exports the
+  // artifact as if it were a valid level.
+  if (level.validation && level.validation.errors.length > 0) {
+    throw new Error(
+      `[LevelWeaver] export refused: level has ${level.validation.errors.length} hard validation error(s): ` +
+        level.validation.errors.slice(0, 3).map(e => `[${e.code}] ${e.message}`).join(' | ') +
+        `. Regenerate with a different seed or loosen the density.`,
+    )
+  }
   const exporter = new GLTFExporter()
 
   // Create export scene with proper hierarchy. Transforms are preserved

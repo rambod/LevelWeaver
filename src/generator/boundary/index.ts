@@ -95,8 +95,11 @@ export function isPointInBoundary(point: { x: number; z: number }, boundary: Bou
     case 'cross': {
       const armHalfW = boundary.width / 6
       const centerHalf = boundary.width / 2
-      const inHorizontal = Math.abs(point.x) <= centerHalf && Math.abs(point.z) <= armHalfW
-      const inVertical = Math.abs(point.z) <= centerHalf && Math.abs(point.x) <= armHalfW
+      // Margin erodes the arms from every side (lawbook §65-66): the old
+      // code ignored it, so rooms/towers on arm edges tested "inside"
+      // while their walls dangled over the void.
+      const inHorizontal = Math.abs(point.x) <= centerHalf - margin && Math.abs(point.z) <= armHalfW - margin
+      const inVertical = Math.abs(point.z) <= centerHalf - margin && Math.abs(point.x) <= armHalfW - margin
       return inHorizontal || inVertical
     }
 

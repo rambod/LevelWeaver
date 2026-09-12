@@ -1,7 +1,11 @@
 import type { Room, Corridor, DoorOpening, Boundary, StairsGeometry } from '@/core/types'
-import { MIN_CLEAR_WIDTH, MIN_CLEAR_HEIGHT, SPATIAL_DEFAULTS, segSegDist2D } from '@/core/rules'
+import { AGENT_DEFAULTS, MIN_CLEAR_WIDTH, MIN_CLEAR_HEIGHT, SPATIAL_DEFAULTS, segSegDist2D } from '@/core/rules'
 import { flightRectOf, landingRectOf, type StairPlan } from '@/generator/vertical'
 import { roomFootprintInBoundary } from '@/generator/boundary'
+
+// Single source for navigation erosion (lawbook §5, §57): the agent body
+// radius, not a magic literal scattered through the grid rasterizer.
+const AGENT_BODY_RADIUS = AGENT_DEFAULTS.radius // 0.30 m
 
 // Structured validation (LAWBOOK §84, §96). Validators return issues;
 // they never throw and never weaken dimensions to pass.
@@ -26,6 +30,9 @@ export type IssueCode =
   | 'CORRIDOR_TOO_NARROW'
   | 'CORRIDOR_DEGENERATE'
   | 'CORRIDOR_SHORT_SEGMENT'
+  | 'CORRIDOR_ROOM_COLLISION'
+  | 'CORRIDOR_CROSSING'
+  | 'CORRIDOR_TOO_LOW'
   | 'STAIR_NO_PLACEMENT'
   | 'STAIR_BAD_RISER'
   | 'STAIR_BAD_TREAD'
@@ -34,6 +41,7 @@ export type IssueCode =
   | 'STAIR_NO_HEADROOM'
   | 'STAIR_NO_LANDING'
   | 'STAIR_NO_SHAFT'
+  | 'STAIR_CLIPS_ROOM'
   | 'SLAB_NO_OPENING'
   | 'NAV_UNREACHABLE_ROOM'
   | 'NAV_NO_SPAWN'
@@ -78,9 +86,13 @@ export function errorTier(code: IssueCode): 1 | 2 | 3 {
     case 'PORTAL_TOO_NARROW':
     case 'PORTAL_TOO_LOW':
     case 'PORTAL_CORNER_VIOLATION':
+    case 'PORTAL_SEPARATION':
     case 'PORTAL_SEALED':
     case 'CORRIDOR_TOO_NARROW':
     case 'CORRIDOR_DEGENERATE':
+    case 'CORRIDOR_ROOM_COLLISION':
+    case 'CORRIDOR_CROSSING':
+    case 'CORRIDOR_TOO_LOW':
     case 'STAIR_BAD_RISER':
     case 'STAIR_BAD_TREAD':
     case 'STAIR_TOO_NARROW':
@@ -88,6 +100,7 @@ export function errorTier(code: IssueCode): 1 | 2 | 3 {
     case 'STAIR_NO_ARRIVAL':
     case 'STAIR_NO_LANDING':
     case 'STAIR_NO_SHAFT':
+    case 'STAIR_CLIPS_ROOM':
     case 'SLAB_NO_OPENING':
     case 'NAV_NO_SPAWN':
     case 'GEOMETRY_NONFINITE':
@@ -345,9 +358,12 @@ export function validateDoors(
         const qa = sorted[i].wallIndex % 2 === 0 ? sorted[i].position.x : sorted[i].position.z
         const gap = Math.abs(qa - pa) - (sorted[i - 1].width + sorted[i].width) / 2
         if (gap < SPATIAL_DEFAULTS.doorSeparation - SPATIAL_DEFAULTS.epsilon) {
+          // Overlapping openings share one wall hole (§27 FORBIDDEN) — a
+          // hard error. A merely tight pier is a soft warning.
+          const overlapping = gap < -SPATIAL_DEFAULTS.epsilon
           issues.push({
             code: 'PORTAL_SEPARATION',
-            severity: 'warning',
+            severity: overlapping ? 'error' : 'warning',
             stage: 'doors',
             objectIds: [roomId],
             message: `Two gates in ${roomId} wall ${sorted[i].wallIndex} are ${gap.toFixed(2)} m apart (min ${SPATIAL_DEFAULTS.doorSeparation} m).`,
@@ -421,7 +437,7 @@ export function validatePortalCapacity(
 }
 
 /** Lawbook §30/31/36: corridor width lawfulness + degenerate/micro segments. */
-export function validateCorridors(corridors: Corridor[]): GenerationIssue[] {
+export function validateCorridors(corridors: Corridor[], corridorClearHeight?: number): GenerationIssue[] {
   const issues: GenerationIssue[] = []
   for (const c of corridors) {
     if (c.width < MIN_CLEAR_WIDTH - SPATIAL_DEFAULTS.epsilon) {
@@ -431,6 +447,18 @@ export function validateCorridors(corridors: Corridor[]): GenerationIssue[] {
         stage: 'corridors',
         objectIds: [c.startRoomId, c.endRoomId],
         message: `${c.id} is ${c.width.toFixed(2)} m wide, below agent minimum ${MIN_CLEAR_WIDTH.toFixed(2)} m.`,
+      })
+    }
+    if (
+      corridorClearHeight !== undefined &&
+      corridorClearHeight < MIN_CLEAR_HEIGHT - SPATIAL_DEFAULTS.epsilon
+    ) {
+      issues.push({
+        code: 'CORRIDOR_TOO_LOW',
+        severity: 'error',
+        stage: 'corridors',
+        objectIds: [c.startRoomId, c.endRoomId],
+        message: `${c.id} clear height ${corridorClearHeight.toFixed(2)} m is below agent minimum ${MIN_CLEAR_HEIGHT.toFixed(2)} m.`,
       })
     }
     const pts = c.pathPoints && c.pathPoints.length > 0 ? c.pathPoints : [c.startPos, c.endPos]
@@ -459,6 +487,124 @@ export function validateCorridors(corridors: Corridor[]): GenerationIssue[] {
       }
     }
   }
+  return issues
+}
+
+/**
+ * Lawbook §32 + §35 post-hoc tripwires the router cannot self-report:
+ * a shipped corridor whose ribbon crosses an unrelated room interior, or
+ * whose volume crosses another same-floor corridor without a junction,
+ * is a spatial artifact even when the graph looks connected. The router
+ * verifies candidates before shipping, but the fallback path ships the
+ * grid middle with fouls for subdivision — the retry loop and the final
+ * gate must see those fouls as hard errors, never as silent geometry.
+ */
+export function validateCorridorIntrusions(rooms: Room[], corridors: Corridor[]): GenerationIssue[] {
+  const issues: GenerationIssue[] = []
+  const roomMap = new Map(rooms.map(r => [r.id, r]))
+  const erode = SPATIAL_DEFAULTS.wallThickness + 0.05
+  const inRoom = (x: number, z: number, r: Room): boolean =>
+    x > r.position.x - r.width / 2 + erode &&
+    x < r.position.x + r.width / 2 - erode &&
+    z > r.position.z - r.depth / 2 + erode &&
+    z < r.position.z + r.depth / 2 - erode
+  for (const c of corridors) {
+    const pts = c.pathPoints && c.pathPoints.length > 0 ? c.pathPoints : [c.startPos, c.endPos]
+    const edge = c.width / 2 + SPATIAL_DEFAULTS.wallThickness + 0.05
+    for (let k = 0; k < pts.length - 1; k++) {
+      const p = pts[k]
+      const q = pts[k + 1]
+      const segLen = Math.sqrt((q.x - p.x) ** 2 + (q.z - p.z) ** 2)
+      if (segLen < 1e-9) continue
+      const ux = (q.x - p.x) / segLen
+      const uz = (q.z - p.z) / segLen
+      const steps = Math.max(1, Math.ceil(segLen / 0.25))
+      for (let s = 0; s <= steps; s++) {
+        const cx = p.x + ux * ((s / steps) * segLen)
+        const cz = p.z + uz * ((s / steps) * segLen)
+        for (const lateral of [0, edge, -edge]) {
+          const ex = cx + -uz * lateral
+          const ez = cz + ux * lateral
+          for (const r of rooms) {
+            if (r.floorIndex !== c.floorIndex) continue
+            if (!inRoom(ex, ez, r)) continue
+            if (r.id === c.startRoomId || r.id === c.endRoomId) {
+              // Endpoint interiors are legal only at the doorway traverse.
+              const door = r.id === c.startRoomId ? c.startPos : c.endPos
+              if (Math.sqrt((ex - door.x) ** 2 + (ez - door.z) ** 2) < 0.7) continue
+              issues.push({
+                code: 'CORRIDOR_ROOM_COLLISION',
+                severity: 'error',
+                stage: 'corridors',
+                objectIds: [c.id, r.id],
+                message: `${c.id} ribbon re-enters endpoint ${r.id} away from its doorway (mouth foul).`,
+              })
+              k = pts.length // break all segment loops for this corridor
+              s = steps + 1
+              break
+            }
+            issues.push({
+              code: 'CORRIDOR_ROOM_COLLISION',
+              severity: 'error',
+              stage: 'corridors',
+              objectIds: [c.id, r.id],
+              message: `${c.id} passes through unrelated room ${r.id} (lawbook §32).`,
+            })
+            k = pts.length
+            s = steps + 1
+            break
+          }
+          if (k >= pts.length) break
+        }
+        if (k >= pts.length) break
+      }
+      if (k >= pts.length) break
+    }
+  }
+  // Same-floor corridor-vs-corridor crossings without a junction (§35).
+  // Junctions are explicit shared endpoints; any other volume crossing is
+  // either a topological junction that was never recorded or a reroute
+  // failure. Both are hard errors.
+  for (let i = 0; i < corridors.length; i++) {
+    for (let j = i + 1; j < corridors.length; j++) {
+      const a = corridors[i]
+      const b = corridors[j]
+      if (a.floorIndex !== b.floorIndex) continue
+      const sharesEndpoint =
+        a.startRoomId === b.startRoomId || a.startRoomId === b.endRoomId ||
+        a.endRoomId === b.startRoomId || a.endRoomId === b.endRoomId
+      if (sharesEndpoint) continue
+      const pa = a.pathPoints && a.pathPoints.length > 0 ? a.pathPoints : [a.startPos, a.endPos]
+      const pb = b.pathPoints && b.pathPoints.length > 0 ? b.pathPoints : [b.startPos, b.endPos]
+      let crossed = false
+      // Deep volume intersection only (lawbook §35): one centerline
+      // inside the other's wall face. Threshold stays LOOSER than the
+      // router's own capsule separation so routing-clean parallels never
+      // trip here — only true crossings / deep overlaps fail.
+      const deepOverlap = Math.min(a.width, b.width) / 2 + SPATIAL_DEFAULTS.wallThickness
+      for (let ia = 0; ia < pa.length - 1 && !crossed; ia++) {
+        for (let ib = 0; ib < pb.length - 1 && !crossed; ib++) {
+          const d = segSegDist2D(
+            pa[ia].x, pa[ia].z, pa[ia + 1].x, pa[ia + 1].z,
+            pb[ib].x, pb[ib].z, pb[ib + 1].x, pb[ib + 1].z,
+          )
+          if (d < deepOverlap) crossed = true
+        }
+      }
+      if (crossed) {
+        issues.push({
+          code: 'CORRIDOR_CROSSING',
+          severity: 'error',
+          stage: 'corridors',
+          objectIds: [a.id, b.id],
+          message: `${a.id} crosses ${b.id} on floor ${a.floorIndex} without a recorded junction (lawbook §35).`,
+        })
+      }
+    }
+  }
+  // Silence unused-var warnings for the shared map (kept for symmetry
+  // with the router's verifier, which needs it for door-exempt checks).
+  void roomMap
   return issues
 }/** Lawbook §41-48: riser/tread/width lawfulness of every built stair. */
 export function validateStairs(plans: StairPlan[]): GenerationIssue[] {
@@ -661,6 +807,68 @@ export function validateStairHeadroom(
   return issues
 }
 
+/**
+ * Lawbook §40/§49 tripwire: a stair flight must not pierce a NON-target
+ * upper room's floor, and an in-room flight must stay inside its host.
+ * The planner rejects these placements, but a shipped violation means the
+ * reservation logic was bypassed — fail here rather than exporting a
+ * stair to nowhere / through a neighbor's floor.
+ */
+export function validateStairClipping(rooms: Room[], stairPlans: StairPlan[]): GenerationIssue[] {
+  const issues: GenerationIssue[] = []
+  const roomMap = new Map(rooms.map(r => [r.id, r]))
+  const rectOf = (r: Room) => ({
+    minX: r.position.x - r.width / 2,
+    maxX: r.position.x + r.width / 2,
+    minZ: r.position.z - r.depth / 2,
+    maxZ: r.position.z + r.depth / 2,
+  })
+  const overlaps = (
+    a: { minX: number; maxX: number; minZ: number; maxZ: number },
+    b: { minX: number; maxX: number; minZ: number; maxZ: number },
+    pad: number,
+  ): boolean =>
+    a.minX < b.maxX + pad && a.maxX > b.minX - pad && a.minZ < b.maxZ + pad && a.maxZ > b.minZ - pad
+  for (const p of stairPlans) {
+    const id = `stairs_${p.link.lowerRoomId}_${p.link.upperRoomId}`
+    const host = roomMap.get(p.hostRoomId)
+    const upper = roomMap.get(p.link.upperRoomId)
+    if (!host || !upper) continue
+    const flight = flightRectOf(p.x, p.z, p.width, p.depth, p.axis)
+    if (p.kind === 'inroom') {
+      const hr = rectOf(host)
+      if (
+        flight.minX < hr.minX - SPATIAL_DEFAULTS.epsilon ||
+        flight.maxX > hr.maxX + SPATIAL_DEFAULTS.epsilon ||
+        flight.minZ < hr.minZ - SPATIAL_DEFAULTS.epsilon ||
+        flight.maxZ > hr.maxZ + SPATIAL_DEFAULTS.epsilon
+      ) {
+        issues.push({
+          code: 'STAIR_CLIPS_ROOM',
+          severity: 'error',
+          stage: 'stairs',
+          objectIds: [id, host.id],
+          message: `${id} in-room flight escapes its host ${host.id} (missing reservation).`,
+        })
+      }
+    }
+    for (const r of rooms) {
+      if (r.floorIndex !== upper.floorIndex || r.id === upper.id) continue
+      if (overlaps(flight, rectOf(r), 0.2)) {
+        issues.push({
+          code: 'STAIR_CLIPS_ROOM',
+          severity: 'error',
+          stage: 'stairs',
+          objectIds: [id, r.id],
+          message: `${id} flight pierces non-target upper room ${r.id} (stair to nowhere).`,
+        })
+        break
+      }
+    }
+  }
+  return issues
+}
+
 /** Lawbook §46: every stair penetration reserves and cuts its slab opening. */
 export function validateSlabOpenings(
   rooms: Room[],
@@ -774,8 +982,14 @@ export function validateExportModel(level: {
  * Lawbook §59-60: spatial traversal validation. Graph reachability is
  * necessary but not sufficient — this rasterizes per-floor walkability
  * (room interiors + corridor slabs + stair volumes + door throats) at a
- * 0.5 m cell size, links floors through stair arrivals, flood-fills from
+ * 0.25 m cell size, links floors through stair arrivals, flood-fills from
  * Spawn, and requires every playable room to own reached cells.
+ *
+ * Cell size history: 0.5 m cells could not represent the narrowest legal
+ * corridors (1.2 m clear width eroded to a 0.5 m walkable strip — exactly
+ * one cell wide, so any centerline falling between cell centers rasterized
+ * to zero walkable cells and valid levels failed as NAV_UNREACHABLE).
+ * 0.25 m cells keep at least two walkable columns for every legal width.
  */
 export function validateNavigationGrid(
   rooms: Room[],
@@ -786,7 +1000,7 @@ export function validateNavigationGrid(
 ): GenerationIssue[] {
   const issues: GenerationIssue[] = []
   if (rooms.length === 0) return issues
-  const CELL = 0.5
+  const CELL = 0.25
   const roomMap = new Map(rooms.map(r => [r.id, r]))
 
   // Bounds over everything placeable.
@@ -841,10 +1055,11 @@ export function validateNavigationGrid(
       }
     }
   }
-  // 2. Corridor slabs (eroded by wall + margin).
+  // 2. Corridor slabs (eroded by the agent body radius: the walkable
+  // strip is what the 0.3 m-radius agent can occupy, not the wall face).
   for (const c of corridors) {
     const pts = c.pathPoints && c.pathPoints.length > 0 ? c.pathPoints : [c.startPos, c.endPos]
-    const half = c.width / 2 - 0.35
+    const half = c.width / 2 - AGENT_BODY_RADIUS
     if (half <= 0) continue
     for (let i = 0; i < pts.length - 1; i++) {
       const a = pts[i]
