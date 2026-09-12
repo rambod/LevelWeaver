@@ -1,4 +1,4 @@
-import type { Room, Corridor, DoorOpening, Boundary, Rect2D, StairsGeometry } from '@/core/types'
+import type { Room, Corridor, DoorOpening, Boundary, Rect2D, StairsGeometry, MeshData, GeometryDescription } from '@/core/types'
 import { AGENT_DEFAULTS, MIN_CLEAR_WIDTH, MIN_CLEAR_HEIGHT, SPATIAL_DEFAULTS, segSegDist2D } from '@/core/rules'
 import { flightRectOf, flightHighRects, landingRectOf, type StairPlan } from '@/generator/vertical'
 import type { RoomSlabHoles } from '@/generator/geometry'
@@ -50,6 +50,7 @@ export type IssueCode =
   | 'NAV_NO_SPAWN'
   | 'GEOMETRY_NONFINITE'
   | 'GEOMETRY_EMPTY_FLOOR'
+  | 'GEOMETRY_INVALID_MESH'
 
 export interface GenerationIssue {
   code: IssueCode
@@ -108,6 +109,7 @@ export function errorTier(code: IssueCode): 1 | 2 | 3 {
     case 'NAV_NO_SPAWN':
     case 'GEOMETRY_NONFINITE':
     case 'GEOMETRY_EMPTY_FLOOR':
+    case 'GEOMETRY_INVALID_MESH':
       return 1
     default:
       return 2
@@ -296,21 +298,24 @@ export function validateRoomPlacement(rooms: Room[], boundary: Boundary): Genera
 export function validateDoors(
   rooms: Room[],
   doorsByRoom: Map<string, DoorOpening[]>,
+  required = { doorWidth: MIN_CLEAR_WIDTH, doorHeight: MIN_CLEAR_HEIGHT },
 ): GenerationIssue[] {
   const issues: GenerationIssue[] = []
+  const minimumWidth = Math.max(MIN_CLEAR_WIDTH, required.doorWidth)
+  const minimumHeight = Math.max(MIN_CLEAR_HEIGHT, required.doorHeight)
   const roomMap = new Map(rooms.map(r => [r.id, r]))
   for (const [roomId, doors] of doorsByRoom) {
     const room = roomMap.get(roomId)
     if (!room) continue
     const byWall = new Map<number, DoorOpening[]>()
     for (const d of doors) {
-      if (d.width < MIN_CLEAR_WIDTH - SPATIAL_DEFAULTS.epsilon) {
+      if (d.width < minimumWidth - SPATIAL_DEFAULTS.epsilon) {
         issues.push({
           code: 'PORTAL_TOO_NARROW',
           severity: 'error',
           stage: 'doors',
           objectIds: [roomId],
-          message: `Gate in ${roomId} is ${d.width.toFixed(2)} m wide, below agent minimum ${MIN_CLEAR_WIDTH.toFixed(2)} m — the player cannot pass.`,
+          message: `Gate in ${roomId} is ${d.width.toFixed(2)} m wide, below required clear width ${minimumWidth.toFixed(2)} m.`,
         })
       } else if (d.width < SPATIAL_DEFAULTS.doorClearWidth - SPATIAL_DEFAULTS.epsilon) {
         issues.push({
@@ -321,13 +326,13 @@ export function validateDoors(
           message: `Gate in ${roomId} is ${d.width.toFixed(2)} m wide, below design default ${SPATIAL_DEFAULTS.doorClearWidth.toFixed(2)} m.`,
         })
       }
-      if (d.height < MIN_CLEAR_HEIGHT - SPATIAL_DEFAULTS.epsilon) {
+      if (d.height < minimumHeight - SPATIAL_DEFAULTS.epsilon) {
         issues.push({
           code: 'PORTAL_TOO_LOW',
           severity: 'error',
           stage: 'doors',
           objectIds: [roomId],
-          message: `Gate in ${roomId} is ${d.height.toFixed(2)} m high, below agent minimum ${MIN_CLEAR_HEIGHT.toFixed(2)} m — the player cannot pass.`,
+          message: `Gate in ${roomId} is ${d.height.toFixed(2)} m high, below required clear height ${minimumHeight.toFixed(2)} m.`,
         })
       }
       const wallLength = d.wallIndex % 2 === 0 ? room.width : room.depth
@@ -1063,9 +1068,9 @@ export function validateStairsGeometry(stairs: StairsGeometry[]): GenerationIssu
 
 /** Lawbook §79: canonical geometry must be finite and well-formed. */
 export function validateExportModel(level: {
-  roomGeometry: { id: string; floor: { vertices: Float32Array }[]; walls: { vertices: Float32Array }[]; ceiling: { vertices: Float32Array }[] }[]
-  corridorGeometry: { id: string; floor: { vertices: Float32Array }; walls: { vertices: Float32Array }[]; ceiling: { vertices: Float32Array } }[]
-  stairs: { id: string; steps: { vertices: Float32Array }[] }[]
+  roomGeometry: GeometryDescription['rooms']
+  corridorGeometry: GeometryDescription['corridors']
+  stairs: StairsGeometry[]
 }): GenerationIssue[] {
   const issues: GenerationIssue[] = []
   const finite = (v: Float32Array): boolean => {
@@ -1074,15 +1079,37 @@ export function validateExportModel(level: {
     }
     return true
   }
-  const check = (id: string, part: string, v: Float32Array) => {
-    if (!finite(v)) {
+  const check = (id: string, part: string, mesh: MeshData) => {
+    if (!finite(mesh.vertices) || !finite(mesh.normals) || !finite(mesh.uvs)) {
       issues.push({
         code: 'GEOMETRY_NONFINITE',
         severity: 'error',
         stage: 'geometry',
         objectIds: [id],
-        message: `${id} ${part} contains NaN/Infinity coordinates.`,
+        message: `${id} ${part} contains NaN/Infinity mesh attributes.`,
       })
+    }
+    const count = mesh.vertices.length / 3
+    if (!Number.isInteger(count) || mesh.normals.length !== count * 3 ||
+        mesh.uvs.length !== count * 2 || mesh.indices.length % 3 !== 0 ||
+        (count > 0 && mesh.indices.length === 0) ||
+        mesh.indices.some(i => i >= count)) {
+      issues.push({ code: 'GEOMETRY_INVALID_MESH', severity: 'error', stage: 'geometry',
+        objectIds: [id], message: `${id} ${part} has inconsistent attributes or invalid triangle indices.` })
+      return
+    }
+    const v = mesh.vertices, n = mesh.normals
+    for (let i = 0; i < mesh.indices.length; i += 3) {
+      const a = mesh.indices[i] * 3, b = mesh.indices[i + 1] * 3, c = mesh.indices[i + 2] * 3
+      const ux = v[b] - v[a], uy = v[b + 1] - v[a + 1], uz = v[b + 2] - v[a + 2]
+      const vx = v[c] - v[a], vy = v[c + 1] - v[a + 1], vz = v[c + 2] - v[a + 2]
+      const dot = (uy * vz - uz * vy) * n[a] + (uz * vx - ux * vz) * n[a + 1] +
+        (ux * vy - uy * vx) * n[a + 2]
+      if (dot < -SPATIAL_DEFAULTS.epsilon) {
+        issues.push({ code: 'GEOMETRY_INVALID_MESH', severity: 'error', stage: 'geometry',
+          objectIds: [id], message: `${id} ${part} triangle ${i / 3} winding opposes its normal.` })
+        break
+      }
     }
   }
   for (const r of level.roomGeometry) {
@@ -1095,17 +1122,23 @@ export function validateExportModel(level: {
         message: `${r.id} exists in the graph but has no floor surface (lawbook §75).`,
       })
     }
-    r.floor.forEach((f, i) => check(r.id, `floor_${i}`, f.vertices))
-    r.walls.forEach((w, i) => check(r.id, `wall_${i}`, w.vertices))
-    r.ceiling.forEach((c, i) => check(r.id, `ceiling_${i}`, c.vertices))
+    r.floor.forEach((f, i) => check(r.id, `floor_${i}`, f))
+    r.walls.forEach((w, i) => check(r.id, `wall_${i}`, w))
+    r.ceiling.forEach((c, i) => check(r.id, `ceiling_${i}`, c))
   }
   for (const c of level.corridorGeometry) {
-    check(c.id, 'floor', c.floor.vertices)
-    c.walls.forEach((w, i) => check(c.id, `wall_${i}`, w.vertices))
-    check(c.id, 'ceiling', c.ceiling.vertices)
+    check(c.id, 'floor', c.floor)
+    c.walls.forEach((w, i) => check(c.id, `wall_${i}`, w))
+    check(c.id, 'ceiling', c.ceiling)
   }
   for (const s of level.stairs) {
-    s.steps.forEach((st, i) => check(s.id, `step_${i}`, st.vertices))
+    for (const part of ['steps', 'risers', 'stringers', 'landing'] as const) {
+      s[part].forEach((mesh, i) => check(s.id, `${part}_${i}`, mesh))
+    }
+    if (s.tower) {
+      check(s.id, 'tower_floor', s.tower.floor)
+      s.tower.walls.forEach((mesh, i) => check(s.id, `tower_wall_${i}`, mesh))
+    }
   }
   return issues
 }

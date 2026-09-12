@@ -7,10 +7,10 @@ import { createBoxMesh, createOrientedBox, createEmptyMesh } from '@/core/meshda
 const WALL_THICKNESS = SPATIAL_DEFAULTS.wallThickness
 
 
-const FLOOR_THICKNESS = 0.2
+const FLOOR_THICKNESS = SPATIAL_DEFAULTS.floorThickness
 
 
-const CEILING_THICKNESS = 0.2
+const CEILING_THICKNESS = SPATIAL_DEFAULTS.ceilingThickness
 
 
 export interface RoomSlabHoles {
@@ -350,6 +350,22 @@ function newRibbonBuilder() {
     return positions.length / 3 - 1
   }
 
+  // Paths can turn or reverse direction. Orient each triangle against the
+  // intended surface normal rather than assuming the same row order faces out.
+  function triangle(a: number, b: number, c: number): void {
+    const ia = a * 3, ib = b * 3, ic = c * 3
+    const ux = positions[ib] - positions[ia]
+    const uy = positions[ib + 1] - positions[ia + 1]
+    const uz = positions[ib + 2] - positions[ia + 2]
+    const vx = positions[ic] - positions[ia]
+    const vy = positions[ic + 1] - positions[ia + 1]
+    const vz = positions[ic + 2] - positions[ia + 2]
+    const dot = (uy * vz - uz * vy) * normals[ia] +
+      (uz * vx - ux * vz) * normals[ia + 1] +
+      (ux * vy - uy * vx) * normals[ia + 2]
+    indices.push(a, dot < 0 ? c : b, dot < 0 ? b : c)
+  }
+
   // Quad strip between two vertex rows (same length, uniform normal).
   function strip(rowA: RibbonVertex[], rowB: RibbonVertex[], n: { x: number; y: number; z: number }): void {
     for (let i = 0; i < rowA.length - 1; i++) {
@@ -357,7 +373,8 @@ function newRibbonBuilder() {
       const b0 = vert(rowB[i], n)
       const b1 = vert(rowB[i + 1], n)
       const a1 = vert(rowA[i + 1], n)
-      indices.push(a0, b0, b1, a0, b1, a1)
+      triangle(a0, b0, b1)
+      triangle(a0, b1, a1)
     }
   }
 
@@ -367,7 +384,8 @@ function newRibbonBuilder() {
     const b0 = vert(b, n)
     const c0 = vert(c, n)
     const d0 = vert(d, n)
-    indices.push(a0, b0, c0, a0, c0, d0)
+    triangle(a0, b0, c0)
+    triangle(a0, c0, d0)
   }
 
   function build(materialIndex: number): MeshData {

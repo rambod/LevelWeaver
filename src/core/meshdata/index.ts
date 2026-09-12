@@ -70,12 +70,21 @@ export function createOrientedBox(
     })
     const b = f * 4
     const ii = f * 6
+    // Face order must agree with the supplied outward normal. A reflected
+    // basis reverses handedness, so a fixed winding is not sufficient.
+    const [a, p, q] = face.pts
+    const ab = p.map((value, i) => value - a[i])
+    const ac = q.map((value, i) => value - a[i])
+    const dot = (ab[1] * ac[2] - ab[2] * ac[1]) * face.normal[0] +
+      (ab[2] * ac[0] - ab[0] * ac[2]) * face.normal[1] +
+      (ab[0] * ac[1] - ab[1] * ac[0]) * face.normal[2]
+    const reverse = dot < 0
     indices[ii] = b
-    indices[ii + 1] = b + 1
-    indices[ii + 2] = b + 2
+    indices[ii + 1] = b + (reverse ? 2 : 1)
+    indices[ii + 2] = b + (reverse ? 1 : 2)
     indices[ii + 3] = b
-    indices[ii + 4] = b + 2
-    indices[ii + 5] = b + 3
+    indices[ii + 4] = b + (reverse ? 3 : 2)
+    indices[ii + 5] = b + (reverse ? 2 : 3)
   })
 
   return { vertices, indices, normals, uvs, materialIndex }
@@ -172,8 +181,8 @@ export function createBoxMesh(
   ])
   
   const indices = new Uint32Array([
-    0, 1, 2, 0, 2, 3,
-    4, 5, 6, 4, 6, 7,
+    0, 2, 1, 0, 3, 2,
+    4, 6, 5, 4, 7, 6,
     8, 9, 10, 8, 10, 11,
     12, 13, 14, 12, 14, 15,
     16, 17, 18, 16, 18, 19,

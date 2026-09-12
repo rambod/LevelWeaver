@@ -1,4 +1,5 @@
 import type { LevelConfig } from '@/core/types'
+import { presets, shapes, themes } from '@/core/presets'
 
 // Centralized dimensional rules (LAWBOOK §7, §106).
 //
@@ -11,7 +12,13 @@ import type { LevelConfig } from '@/core/types'
 // produce a different level. The version travels with every generated
 // level so stale regression seeds are detectable instead of silently
 // "passing" against new geometry.
-export const GENERATOR_VERSION = '0.1.3'
+export const GENERATOR_VERSION = '0.1.4'
+
+// Bound browser workloads before allocating grids or entering search loops.
+export const CONFIG_LIMITS = {
+  minRooms: 2, maxRooms: 100, minArea: 100, maxArea: 50000, maxFloors: 5,
+  maxSeed: 0xffffffff,
+} as const
 
 export const EPSILON = 0.0001
 
@@ -101,7 +108,7 @@ export function stairMathFor(
         `outside [${minRiser}, ${maxRiser}]. Adjust wall height / floor spacing.`,
     )
   }
-  if (treadDepth < SPATIAL_DEFAULTS.stair.minTread - EPSILON) {
+  if (!Number.isFinite(treadDepth) || treadDepth < SPATIAL_DEFAULTS.stair.minTread - EPSILON) {
     throw new Error(
       `[LevelWeaver] stair tread ${treadDepth} m below minimum ${SPATIAL_DEFAULTS.stair.minTread} m.`,
     )
@@ -167,6 +174,8 @@ export function segSegDist2D(
  * on short walls it shrinks to fit (corner margins kept). It is NOT
  * clamped back up to the minimum: a wall too short for a legal gate is a
  * placement failure the validators must report, not a dimension to fake.
+ * Final door validation also enforces the requested width: a shortened gate
+ * is a diagnostic candidate, never an accepted silent relaxation (§71).
  */
 export function gateWidthFor(
   config: LevelConfig,
@@ -194,9 +203,50 @@ export function circulationGap(config: LevelConfig): number {
  */
 export function validateConfigFeasibility(config: LevelConfig): ConfigIssue[] {
   const issues: ConfigIssue[] = []
+  const numericFields = [
+    'seed', 'area', 'roomCount', 'floorCount', 'roomSizeVariation', 'corridorWidth',
+    'connectivity', 'verticality', 'deadEnds', 'largeRoomCount', 'wallHeight', 'doorWidth', 'doorHeight',
+  ] as const
+  for (const field of numericFields) {
+    if (!Number.isFinite(config[field])) {
+      issues.push({ code: 'CONFIG_NONFINITE', message: `${field} must be a finite number.` })
+    }
+  }
+  if (!shapes.some(s => s.value === config.shape)) {
+    issues.push({ code: 'CONFIG_SHAPE', message: `Unknown shape: ${config.shape}.` })
+  }
+  if (!themes.includes(config.theme)) {
+    issues.push({ code: 'CONFIG_THEME', message: `Unknown theme: ${config.theme}.` })
+  }
+  if (!Object.prototype.hasOwnProperty.call(presets, config.preset)) {
+    issues.push({ code: 'CONFIG_PRESET', message: `Unknown preset: ${config.preset}.` })
+  }
+  // Do not call toFixed, perform spatial arithmetic, or allocate from bad input.
+  if (issues.length) return issues
+  const range = (field: typeof numericFields[number], min: number, max: number, integer = false) => {
+    const value = config[field]
+    if (value < min || value > max || (integer && !Number.isInteger(value))) {
+      issues.push({ code: `CONFIG_${field.replace(/[A-Z]/g, c => `_${c}`).toUpperCase()}`,
+        message: `${field} must be ${integer ? 'an integer ' : ''}in [${min}, ${max}].` })
+    }
+  }
+  range('seed', 0, CONFIG_LIMITS.maxSeed, true)
+  range('roomCount', CONFIG_LIMITS.minRooms, CONFIG_LIMITS.maxRooms, true)
+  range('floorCount', 1, CONFIG_LIMITS.maxFloors, true)
+  range('area', CONFIG_LIMITS.minArea, CONFIG_LIMITS.maxArea)
+  range('largeRoomCount', 0, Math.max(0, config.roomCount - 2), true)
+  for (const field of ['roomSizeVariation', 'connectivity', 'verticality', 'deadEnds'] as const) {
+    range(field, 0, 1)
+  }
+  if (issues.length) return issues
   const wall = config.wallHeight
   const doorW = config.doorWidth
   const doorH = config.doorHeight
+
+  if (doorW > config.corridorWidth + EPSILON) {
+    issues.push({ code: 'CONFIG_DOOR_CORRIDOR_WIDTH',
+      message: `doorWidth ${doorW} m exceeds corridorWidth ${config.corridorWidth} m. Widen the corridor or reduce the requested gate width.` })
+  }
 
   if (!(wall >= 3.2 - EPSILON && wall <= 5.5 + EPSILON)) {
     issues.push({
@@ -253,12 +303,6 @@ export function validateConfigFeasibility(config: LevelConfig): ConfigIssue[] {
       code: 'CONFIG_STAIR_RISE',
       message: err instanceof Error ? err.message : String(err),
     })
-  }
-  if (!(config.roomCount >= 1)) {
-    issues.push({ code: 'CONFIG_ROOM_COUNT', message: 'roomCount must be >= 1.' })
-  }
-  if (!(config.floorCount >= 1 && config.floorCount <= 5)) {
-    issues.push({ code: 'CONFIG_FLOOR_COUNT', message: 'floorCount must be in [1, 5].' })
   }
   // Every floor needs at least one room (lawbook §39): fewer rooms than
   // floors leaves a gap no stair can bridge.

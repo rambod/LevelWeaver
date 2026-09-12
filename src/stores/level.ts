@@ -1,4 +1,4 @@
-import { ref } from 'vue'
+import { ref, shallowRef } from 'vue'
 import type { LevelConfig } from '@/core/types'
 import { getDefaultConfig, applyPreset } from '@/core/presets'
 import { generateLevel, type GeneratedLevel } from '@/core/generation'
@@ -10,28 +10,34 @@ import { generateLevel, type GeneratedLevel } from '@/core/generation'
 // `generatedLevel` and renders it. This keeps the dependency direction
 // UI -> core -> (renderer observes), per LEVELWEAVER.md section 4.
 const config = ref<LevelConfig>(getDefaultConfig())
-const generatedLevel = ref<GeneratedLevel | null>(null)
+const generatedLevel = shallowRef<GeneratedLevel | null>(null)
+const generationError = ref<string | null>(null)
 const isGenerating = ref(false)
 const walkMode = ref(false)
 const showAdvanced = ref(false)
 
 export function useLevelStore() {
-  function generate(): void {
+  function generate(): boolean {
     isGenerating.value = true
+    generationError.value = null
     try {
       generatedLevel.value = generateLevel(config.value)
+      return true
+    } catch (error) {
+      generationError.value = error instanceof Error ? error.message : String(error)
+      return false
     } finally {
       isGenerating.value = false
     }
   }
 
-  function regenerate(): void {
+  function regenerate(): boolean {
     // Deterministic rebuild with the SAME seed (useful after tweaking
     // parameters by hand). Use randomSeed() for a new layout.
-    generate()
+    return generate()
   }
 
-  function randomSeed(): void {
+  function randomSeed(): boolean {
     // Lawbook §8/§107: no Math.random() anywhere — including seed picks.
     // crypto.getRandomValues is the browser-correct nondeterministic
     // source for the "Random" button; generation itself stays seeded.
@@ -41,12 +47,23 @@ export function useLevelStore() {
       ...config.value,
       seed: buf[0] % 1000000,
     }
-    generate()
+    return generate()
   }
 
-  function selectPreset(presetKey: string): void {
+  function selectPreset(presetKey: string): boolean {
     config.value = applyPreset(config.value, presetKey)
-    generate()
+    return generate()
+  }
+
+  function setTheme(theme: string): void {
+    config.value = { ...config.value, theme }
+    const level = generatedLevel.value
+    if (level) {
+      generatedLevel.value = {
+        ...level, config: { ...level.config, theme },
+        rooms: level.rooms.map(room => ({ ...room, materialTheme: theme })),
+      }
+    }
   }
 
   function setWalkMode(enabled: boolean): void {
@@ -60,6 +77,7 @@ export function useLevelStore() {
   return {
     config,
     generatedLevel,
+    generationError,
     isGenerating,
     walkMode,
     showAdvanced,
@@ -67,6 +85,7 @@ export function useLevelStore() {
     regenerate,
     randomSeed,
     selectPreset,
+    setTheme,
     setWalkMode,
     toggleAdvanced,
   }

@@ -10,7 +10,7 @@ export class LevelScene {
   public gridHelper: THREE.GridHelper
   public boundsHelper: THREE.Box3Helper
   private materials: Map<number, THREE.Material>
-  private currentLevel: GeneratedLevel | null = null
+  private themeName = 'greybox'
   private floorHeight: number = FLOOR_HEIGHT
 
   constructor() {
@@ -68,9 +68,9 @@ export class LevelScene {
   }
 
   updateLevel(level: GeneratedLevel): void {
-    this.currentLevel = level
     this.floorHeight = level.floorHeight
     this.clearLevel()
+    this.setTheme(level.config.theme)
     this.buildLevelGeometry(level)
     this.updateBoundsHelper(level)
   }
@@ -268,6 +268,7 @@ export class LevelScene {
     const material = this.materials.get(matIndex) || this.materials.get(0)!
 
     const mesh = new THREE.Mesh(geometry, material)
+    mesh.userData.materialIndex = matIndex
     return mesh
   }
 
@@ -334,11 +335,16 @@ export class LevelScene {
   }
 
   setTheme(themeName: string): void {
+    if (this.themeName === themeName) return
+    const previous = this.materials
     this.materials = createMaterials(themeName)
-    // Rebuild level with new materials if level exists
-    if (this.currentLevel) {
-      this.updateLevel(this.currentLevel)
-    }
+    this.themeName = themeName
+    this.levelGroup.traverse(obj => {
+      if (obj instanceof THREE.Mesh) {
+        obj.material = this.materials.get(obj.userData.materialIndex) ?? this.materials.get(0)!
+      }
+    })
+    previous.forEach(material => material.dispose())
   }
 
   dispose(): void {

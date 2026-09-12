@@ -1,5 +1,12 @@
 # LevelWeaver - Project Brief
 
+**Scope:** Product direction and V0.1 feature boundaries. Read [README.md](README.md)
+for the current architecture, setup, tests, and failure behavior. Illustrative
+types, defaults, and pipeline steps below are design examples; the runtime
+contract and hard validity requirements are defined in the
+[generation lawbook](LEVELWEAVER_GENERATION_LAWBOOK.md). Future ideas are not
+implementation requirements. Changes to this brief must preserve that distinction.
+
 ## 1. Product Summary
 
 LevelWeaver is a browser-based procedural 3D level prototype generator for game developers.

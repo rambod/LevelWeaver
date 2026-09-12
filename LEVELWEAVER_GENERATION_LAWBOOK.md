@@ -2,7 +2,7 @@
 
 **Document type:** Normative generator specification / invariant bible / forbidden-state catalog  
 **Project:** LevelWeaver  
-**Status:** Proposed core rules for V0.1 and future-compatible procedural architecture  
+**Status:** Validity requirements with an explicit V0.1 implementation contract; not a claim of full compliance
 **Primary purpose:** Give coding agents and human contributors a strict, reusable contract for generating spatially valid, traversable, deterministic prototype levels.
 
 ---
@@ -23,6 +23,49 @@ The generator must never knowingly export a level that violates a hard invariant
 A seed that cannot satisfy the requested parameter set within bounded attempts is allowed to fail gracefully. It is **not** allowed to produce broken geometry just to return something.
 
 This specification follows LevelWeaver's existing architecture principle: topology first, geometry later, engine-independent core data, deterministic seed behavior, and Three.js only as a rendering representation.
+
+### V0.1 implementation contract and document maintenance
+
+The numbered laws define required validity and target architecture. Example APIs,
+defaults, and future features are illustrative, not declarations that those APIs
+or features exist. This subsection defines the current public contract; it does
+not waive physical, traversal, or export requirements.
+
+- `generateLevel(config)` rejects invalid configuration by throwing a descriptive
+  error before spatial work. All numeric fields must be finite. Counts are integers;
+  the supported envelope is 2-100 rooms, 1-5 floors, 100-50000 m², and unsigned
+  32-bit integer seeds. Fractions for variation/connectivity/verticality/dead ends
+  are in [0, 1]. Large-room count is in [0, roomCount - 2]. Shape, theme, and preset
+  must be recognized. Existing dimensional feasibility checks also apply.
+- Missing legacy door dimensions normalize to 1.8 × 2.4 m. Other invalid values
+  are rejected, not silently coerced. A configuration inside these ranges can
+  still fail layout feasibility.
+- Requested gate width must not exceed corridor width. Realized door width and
+  height must meet both the agent minimum and the requested dimensions (§71).
+- Search is bounded and deterministic. After exhausted repair attempts, the API
+  may return a **diagnostic candidate** with `ok: false` and structured errors.
+  It may be inspected only with visible failure status. It cannot export or be
+  described as valid. Diagnostic construction is distinct from acceptance under
+  §68; recommended result unions in §97 remain a future API design.
+- Export requires `ok: true`, a validation report without hard errors, and a fresh
+  structural mesh check. Every exported mesh part must have finite positions,
+  normals and UVs, consistent attribute lengths, valid triangle indices, and
+  triangle winding consistent with surface normals.
+  Empty optional cut fragments are permitted; playable floors cannot be empty.
+- Editable parameters are pending inputs. Failed generation preserves the previous
+  artifact. Export names and metadata use that artifact's seed/config/version.
+  Theme changes are material-only and must remain consistent in preview/export.
+- `src/core/rules` owns runtime dimensions; `src/core/presets` owns product defaults.
+  For example, runtime walls are 0.30 m and default floor spacing is wall height
+  plus 0.50 m. The 0.20 m walls and 3.20 m spacing below are reference profiles.
+- Changes to output or validation acceptance increment `GENERATOR_VERSION` and
+  include reproducible tests. See `AGENTS.md` for required commands. Record gaps
+  in `docs/AUDIT.md`; do not weaken laws to hide missing implementation.
+
+The priority order in §2 guides repair selection; **all** hard constraints must
+hold at acceptance. Recommended scoring or a lower error count cannot excuse a
+remaining violation. External research links are background, not executable rules
+or substitutes for tests; verify a source before relying on a new external claim.
 
 ---
 
@@ -2402,7 +2445,7 @@ The following references informed the hard/soft rule separation, graph connectiv
 
 ## 112. LevelWeaver Project Source
 
-- `LEVELWEAVER(1).md`, supplied with the project. Key existing principles include staged generation, deterministic seed behavior, graph before spatial layout, rectangular rooms for V0.1, engine-independent core structures, and 1.8 m first-person player scale.
+- [LEVELWEAVER.md](LEVELWEAVER.md), the project brief. Key existing principles include staged generation, deterministic seed behavior, graph before spatial layout, rectangular rooms for V0.1, engine-independent core structures, and 1.8 m first-person player scale.
 
 ## 113. Accessibility and Human-Scale Geometry References
 
@@ -2494,4 +2537,3 @@ Before LevelWeaver accepts a generated map, all of the following SHALL be true:
 If even one required box is false, the generation is not finished.
 
 **The generator's job is not to create random geometry. Its job is to create random variation inside a rigorously valid spatial system.**
-

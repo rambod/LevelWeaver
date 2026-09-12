@@ -9,7 +9,7 @@ import { CameraController } from '@/renderer/camera'
 import { snapshotCollisionBoxes, corridorWallCapsules, corridorSlabBoxes, emptyCollisionWorld, type CollisionWorld } from '@/playtest/collision'
 import { corridorHeightFor } from '@/core/types'
 import { findSpawnRoom, spawnEyePosition } from '@/playtest/controller'
-import { exportGLB, downloadGLB } from '@/export/gltf'
+import { canExportLevel, exportGLB, downloadGLB, levelFilename } from '@/export/gltf'
 import ParamSlider from '@/ui/controls/ParamSlider.vue'
 import LevelStats from '@/ui/components/LevelStats.vue'
 
@@ -88,12 +88,16 @@ const animate = (time: number = 0) => {
 // the preview scene, collision cache, and camera to the new level.
 // Impossible configurations fail with an explicit message (lawbook §73)
 // instead of silently producing broken geometry.
-const generate = async () => {
+const runGeneration = async (action: () => boolean) => {
+  if (isGenerating.value) return
   isGenerating.value = true
   await nextTick()
 
   try {
-    store.generate()
+    if (!action()) {
+      alert(store.generationError.value ?? 'Generation failed.')
+      return
+    }
     const level = generatedLevel.value as GeneratedLevel | null
     if (!level) return
     syncScene(level)
@@ -111,7 +115,11 @@ const generate = async () => {
   }
 }
 
+const generate = () => runGeneration(store.generate)
+
 const syncScene = (level: GeneratedLevel) => {
+    store.setWalkMode(false)
+    cameraController?.setWalkMode(false)
     scene?.updateLevel(level)
 
     // Cache the walk-mode collision world once per generation.
@@ -169,25 +177,9 @@ const syncScene = (level: GeneratedLevel) => {
     }
 }
 
-const regenerate = () => {
-  // Re-run the generator with the SAME seed: deterministic rebuild.
-  // (Use "Random Seed" for a new layout.)
-  store.regenerate()
-  const level = generatedLevel.value as GeneratedLevel | null
-  if (level) syncScene(level)
-}
-
-const randomSeed = () => {
-  store.randomSeed()
-  const level = generatedLevel.value as GeneratedLevel | null
-  if (level) syncScene(level)
-}
-
-const selectPreset = (presetKey: string) => {
-  store.selectPreset(presetKey)
-  const level = generatedLevel.value as GeneratedLevel | null
-  if (level) syncScene(level)
-}
+const regenerate = () => runGeneration(store.regenerate)
+const randomSeed = () => runGeneration(store.randomSeed)
+const selectPreset = (presetKey: string) => runGeneration(() => store.selectPreset(presetKey))
 
 const exportLevel = async () => {
   if (!generatedLevel.value) return
@@ -200,8 +192,9 @@ const exportLevel = async () => {
     return
   }
   try {
-    const blob = await exportGLB(generatedLevel.value)
-    downloadGLB(blob, `level_${config.value.seed}.glb`)
+    const level = generatedLevel.value
+    const blob = await exportGLB(level)
+    downloadGLB(blob, levelFilename(level))
   } catch (err) {
     console.error('Export failed:', err)
     alert(err instanceof Error ? err.message : 'Export failed. Check console for details.')
@@ -227,6 +220,7 @@ const resetCamera = () => {
 }
 
 watch(() => config.value.theme, (newTheme) => {
+  store.setTheme(newTheme)
   scene?.setTheme(newTheme)
 })
 
@@ -253,7 +247,7 @@ onUnmounted(() => {
         <button class="btn btn-primary" @click="generate" :disabled="isGenerating">
           {{ isGenerating ? 'Generating...' : 'Generate' }}
         </button>
-        <button class="btn btn-secondary" @click="exportLevel" :disabled="!generatedLevel">
+        <button class="btn btn-secondary" @click="exportLevel" :disabled="!canExportLevel(generatedLevel) || isGenerating">
           Export GLB
         </button>
       </div>

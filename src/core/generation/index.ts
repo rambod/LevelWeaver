@@ -317,7 +317,7 @@ function finishLayout(
     ...validateCorridorIntrusions(rooms, corridors),
     ...validateNavigationGrid(rooms, doorOpenings, corridors, stairPlans, floorHeight),
     ...validateRoomPlacement(rooms, boundary),
-    ...validateDoors(rooms, doorOpenings),
+    ...validateDoors(rooms, doorOpenings, config),
     ...validateStairs(stairPlans),
     ...validateLinkLengths(rooms),
   ]
@@ -432,7 +432,7 @@ function pruneMonsterLinks(rooms: Room[]): void {
   issues.push(...validateRealizedConnectivity(rooms, corridors, stairPlans, config.floorCount))
   issues.push(...validateRoomPlacement(rooms, boundary))
   issues.push(...validateRoomAspects(rooms))
-  issues.push(...validateDoors(rooms, doorOpenings))
+  issues.push(...validateDoors(rooms, doorOpenings, config))
   issues.push(...validatePortalCapacity(rooms, doorOpenings, config.doorWidth))
   issues.push(...validatePortalSampling(rooms, doorOpenings, corridors, stairPlans))
   issues.push(...validatePortalSeals(rooms, doorOpenings, corridors, stairPlans))
