@@ -105,13 +105,16 @@ export class LevelScene {
       roomGroup.name = roomGeo.id
       roomGroup.userData = { type: 'room', roomType: roomGeo.type, floorIndex: roomGeo.floorIndex }
 
-      // Floor
-      if (roomGeo.floor.vertices.length > 0) {
-        const mesh = this.createMesh(roomGeo.floor, 1)
-        mesh.name = 'floor'
-        mesh.receiveShadow = true
-        roomGroup.add(mesh)
-      }
+      // Floor (separate part meshes so stairwell holes stay holes in
+      // collision as well as render — never one combined slab).
+      roomGeo.floor.forEach((floorGeo, i) => {
+        if (floorGeo.vertices.length > 0) {
+          const mesh = this.createMesh(floorGeo, 1)
+          mesh.name = `floor_${i}`
+          mesh.receiveShadow = true
+          roomGroup.add(mesh)
+        }
+      })
 
       // Walls
       roomGeo.walls.forEach((wallGeo, i) => {
@@ -124,13 +127,15 @@ export class LevelScene {
         }
       })
 
-      // Ceiling
-      if (roomGeo.ceiling.vertices.length > 0) {
-        const mesh = this.createMesh(roomGeo.ceiling, 2)
-        mesh.name = 'ceiling'
-        mesh.receiveShadow = true
-        roomGroup.add(mesh)
-      }
+      // Ceiling (same separate-parts rule as floors).
+      roomGeo.ceiling.forEach((ceilGeo, i) => {
+        if (ceilGeo.vertices.length > 0) {
+          const mesh = this.createMesh(ceilGeo, 2)
+          mesh.name = `ceiling_${i}`
+          mesh.receiveShadow = true
+          roomGroup.add(mesh)
+        }
+      })
 
       // Position the room group
       const room = level.rooms.find(r => r.id === roomGeo.id)

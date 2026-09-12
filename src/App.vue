@@ -6,7 +6,7 @@ import { presets, shapes, themes } from '@/core/presets'
 import { useLevelStore } from '@/stores/level'
 import { LevelScene } from '@/renderer/scene'
 import { CameraController } from '@/renderer/camera'
-import { snapshotCollisionBoxes, corridorWallCapsules, emptyCollisionWorld, type CollisionWorld } from '@/playtest/collision'
+import { snapshotCollisionBoxes, corridorWallCapsules, corridorSlabBoxes, emptyCollisionWorld, type CollisionWorld } from '@/playtest/collision'
 import { corridorHeightFor } from '@/core/types'
 import { findSpawnRoom, spawnEyePosition } from '@/playtest/controller'
 import { exportGLB, downloadGLB } from '@/export/gltf'
@@ -121,17 +121,27 @@ const syncScene = (level: GeneratedLevel) => {
       if (!(obj instanceof THREE.Mesh)) return
       // Corridor ribbon WALLS are excluded: diagonal ribbon AABBs cover
       // empty triangles and would seal nearby doorways. Exact capsules
-      // below take their place (lawbook §56). Corridor floors stay (thin
-      // slabs, harmless with grounded epsilon).
+      // below take their place (lawbook §56). Corridor FLOORS are
+      // excluded for the same reason: a merged ribbon's AABB spans the
+      // whole path box and head-blocks stair climbers far from the
+      // ribbon — tight per-segment slab boxes below take their place.
+      // Room/stair floors stay (tight boxes, harmless with grounded
+      // epsilon).
       const inCorridor = obj.parent?.userData?.type === 'corridor'
-      if (obj.name === 'floor' || obj.name.startsWith('step') || obj.name.startsWith('landing')) {
+      if (!inCorridor && (obj.name.startsWith('floor') || obj.name.startsWith('step') || obj.name.startsWith('landing'))) {
         walkMeshes.push(obj)
       } else if (obj.name.startsWith('wall') && !inCorridor) {
         walkMeshes.push(obj)
       }
     })
+    const corridorSlabs = (level.corridors ?? []).flatMap(corridor => {
+      const pts = corridor.pathPoints && corridor.pathPoints.length > 0
+        ? corridor.pathPoints
+        : [corridor.startPos, corridor.endPos]
+      return corridorSlabBoxes(pts, corridor.width, corridor.floorIndex * level.floorHeight)
+    })
     collisionWorld = {
-      boxes: snapshotCollisionBoxes(walkMeshes),
+      boxes: [...snapshotCollisionBoxes(walkMeshes), ...corridorSlabs],
       capsules: level.corridors.flatMap(corridor => {
         const pts = corridor.pathPoints && corridor.pathPoints.length > 0
           ? corridor.pathPoints

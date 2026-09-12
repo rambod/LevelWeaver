@@ -341,6 +341,7 @@ export class CameraController {
       this.camera.position.copy(newPosition)
     } else {
       // Try X only
+      const yBeforeStep = this.camera.position.y
       const xPos = this.camera.position.clone()
       xPos.x = newPosition.x
       if (!this.checkCollision(xPos, collision)) {
@@ -348,17 +349,21 @@ export class CameraController {
       } else {
         // Step-up (X): rise minimally and retry X alone, so stair treads
         // and thresholds climb without diagonal pops or bobbing.
-        this.tryStepUp('x', newPosition.x, newPosition, collision)
+        this.tryStepUp('x', newPosition.x, newPosition, collision, true)
       }
 
-      // Try Z only
+      // Try Z only. One rise per frame: if X already rose, Z moves
+      // without rising — rising on both axes in one frame climbs 0.4 m
+      // diagonally, double the agent maximum, popping over treads and
+      // parapets no legal climb can mount (and overshooting waypoints).
+      const risen = this.camera.position.y !== yBeforeStep
       const zPos = this.camera.position.clone()
       zPos.z = newPosition.z
       if (!this.checkCollision(zPos, collision)) {
         this.camera.position.z = newPosition.z
       } else {
         // Step-up (Z): same, axis-separated.
-        this.tryStepUp('z', newPosition.z, newPosition, collision)
+        this.tryStepUp('z', newPosition.z, newPosition, collision, !risen)
       }
 
       // Try Y only
@@ -411,7 +416,7 @@ export class CameraController {
   // and the residual bound already rejects anything still towering after
   // the move (walls, ceilings, slabs stay engaged with huge residuals).
   // Corridor capsules veto outright too, so walls stay unmountable.
-  private tryStepUp(axis: 'x' | 'z', target: number, newPosition: THREE.Vector3, collision: CollisionWorld): void {
+  private tryStepUp(axis: 'x' | 'z', target: number, newPosition: THREE.Vector3, collision: CollisionWorld, allowRise = true): void {
     const stepDbg = (globalThis as unknown as { process?: { env?: Record<string, string | undefined> } })
       .process?.env?.LW_STEP_DEBUG === '1'
     const dest = this.camera.position.clone()
@@ -420,6 +425,11 @@ export class CameraController {
     dest.y = newPosition.y
     const destEngaged = engagedBoxes(dest, collision.boxes, PLAYER_RADIUS, this.playerHeight)
     if (stepDbg) console.log(`[stepup ${axis}] pos=(${this.camera.position.x.toFixed(2)},${this.camera.position.y.toFixed(2)},${this.camera.position.z.toFixed(2)}) tgt=${target.toFixed(2)} destEng=${destEngaged.length}`)
+    // Rise budget spent on the other axis this frame: hold position.
+    if (!allowRise) {
+      if (stepDbg) console.log(`  [${axis}] rise budget spent`)
+      return
+    }
     for (const rise of [0.1, 0.19, PLAYER_STEP_UP]) {
       const over = this.camera.position.clone()
       over.y += rise

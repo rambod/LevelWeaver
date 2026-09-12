@@ -1,7 +1,7 @@
 import type { Room, Corridor, RoomGeometry, CorridorGeometry, MeshData, DoorOpening, Vec3, Rect2D } from '@/core/types'
 import { DOOR_WIDTH, DOOR_HEIGHT } from '@/core/types'
 import { SPATIAL_DEFAULTS } from '@/core/rules'
-import { createBoxMesh, createOrientedBox, combineMeshes, createEmptyMesh } from '@/core/meshdata'
+import { createBoxMesh, createOrientedBox, createEmptyMesh } from '@/core/meshdata'
 
 // Single source of truth (lawbook §7, §55): imported, never redefined here.
 const WALL_THICKNESS = SPATIAL_DEFAULTS.wallThickness
@@ -65,6 +65,12 @@ function generateSingleRoomGeometry(room: Room, doors: DoorOpening[], holes?: Ro
 // (stairwells). Holes are room-local (room centered at origin). Each hole
 // is subtracted from every surviving part in turn, so overlapping holes
 // merge into correct L-shaped remainders instead of double-cutting.
+//
+// Parts stay SEPARATE meshes (never combined): combining them into one
+// slab makes its AABB cover the stairwell holes and seals every stair
+// arrival in walk-mode collision (same law as wall segments vs door
+// holes, lawbook §52). The single-hole-free fast path still returns one
+// box; holed slabs return one mesh per surviving rect.
 function createSlabWithHoles(
   width: number,
   depth: number,
@@ -72,7 +78,7 @@ function createSlabWithHoles(
   thickness: number,
   holes: Rect2D[],
   materialIndex: number
-): MeshData {
+): MeshData[] {
   const yCenter = yTop - thickness / 2
   // Working set of solid rects (local XZ center + size).
   let parts: { cx: number; cz: number; w: number; d: number }[] = [
@@ -108,12 +114,9 @@ function createSlabWithHoles(
     parts = next
   }
   if (parts.length === 1 && holes.length === 0) {
-    return createBoxMesh(0, yCenter, 0, width, thickness, depth, materialIndex)
+    return [createBoxMesh(0, yCenter, 0, width, thickness, depth, materialIndex)]
   }
-  return combineMeshes(
-    parts.map(p => createBoxMesh(p.cx, yCenter, p.cz, p.w, thickness, p.d, materialIndex)),
-    materialIndex,
-  )
+  return parts.map(p => createBoxMesh(p.cx, yCenter, p.cz, p.w, thickness, p.d, materialIndex))
 }
 
 

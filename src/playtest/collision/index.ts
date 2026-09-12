@@ -31,7 +31,77 @@ export function emptyCollisionWorld(): CollisionWorld {
  * diagonal walls (their bounds cover empty triangles and seal nearby
  * doorways); capsules hug the true ribbon instead. Shared endpoints
  * close the joints; the slight outer-corner overfill is conservative.
+ *
+ * Corridor FLOOR collider (same law): one TIGHT box per straight path
+ * segment (centerline swept by the slab half width). The render ribbon
+ * MUST NOT be used as a collider: a single merged ribbon mesh's AABB
+ * spans the whole path bounding box — for a long L-shaped corridor that
+ * box covers rooms and stairs far from the ribbon, and its slab then
+ * head-blocks stair climbers rising into that band anywhere under the
+ * box (bot-proven phantom slabs sealing lawful stairwells).
+ * Per-segment boxes hug the true ribbon; the slight joint overlap is
+ * conservative (safe) for a playtest tool. Corridor ceilings stay
+ * non-colliders (as before): nothing walks on them, and the floor slab
+ * below always engages first from underneath.
  */
+export function corridorSlabBoxes(
+  points: { x: number; z: number }[],
+  width: number,
+  yBase: number,
+  // Single source of truth (lawbook §7, §55).
+  wallThickness = SPATIAL_DEFAULTS.wallThickness,
+): THREE.Box3[] {
+  // Mirror the ribbon builder: slab half width + 0.02 hair, ends extended
+  // into the rooms (SEAM_OVERLAP), top 4 mm below room-slab level.
+  const halfSlab = width / 2 + wallThickness + 0.02
+  const SEAM = wallThickness / 2
+  const SEAM_DROP = 0.004
+  const THICKNESS = SPATIAL_DEFAULTS.floorThickness
+  const yTop = yBase + THICKNESS - SEAM_DROP
+  const yBot = yTop - THICKNESS
+  // Drop degenerate consecutive points (same as the geometry builder).
+  const clean: { x: number; z: number }[] = []
+  for (const p of points) {
+    const prev = clean[clean.length - 1]
+    if (!prev || Math.sqrt((p.x - prev.x) ** 2 + (p.z - prev.z) ** 2) > 1e-4) {
+      clean.push(p)
+    }
+  }
+  if (clean.length < 2) return []
+  const flat = clean.map(p => ({ ...p }))
+  const d0x = flat[1].x - flat[0].x
+  const d0z = flat[1].z - flat[0].z
+  const l0 = Math.sqrt(d0x * d0x + d0z * d0z)
+  if (l0 > 1e-6) {
+    flat[0] = { x: flat[0].x - (d0x / l0) * SEAM, z: flat[0].z - (d0z / l0) * SEAM }
+  }
+  const n = flat.length
+  const d1x = flat[n - 1].x - flat[n - 2].x
+  const d1z = flat[n - 1].z - flat[n - 2].z
+  const l1 = Math.sqrt(d1x * d1x + d1z * d1z)
+  if (l1 > 1e-6) {
+    flat[n - 1] = { x: flat[n - 1].x + (d1x / l1) * SEAM, z: flat[n - 1].z + (d1z / l1) * SEAM }
+  }
+  const out: THREE.Box3[] = []
+  for (let i = 0; i < flat.length - 1; i++) {
+    const p = flat[i]
+    const q = flat[i + 1]
+    const dx = q.x - p.x
+    const dz = q.z - p.z
+    const len = Math.sqrt(dx * dx + dz * dz)
+    if (len < 1e-6) continue
+    // Unit normal × half slab: the swept ribbon's extreme corners.
+    const nx = -dz / len
+    const nz = dx / len
+    const xs = [p.x + nx * halfSlab, p.x - nx * halfSlab, q.x + nx * halfSlab, q.x - nx * halfSlab]
+    const zs = [p.z + nz * halfSlab, p.z - nz * halfSlab, q.z + nz * halfSlab, q.z - nz * halfSlab]
+    out.push(new THREE.Box3(
+      new THREE.Vector3(Math.min(...xs), yBot, Math.min(...zs)),
+      new THREE.Vector3(Math.max(...xs), yTop, Math.max(...zs)),
+    ))
+  }
+  return out
+}
 export interface WallCapsule {
   ax: number
   az: number

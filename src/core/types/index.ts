@@ -136,9 +136,14 @@ export interface RoomGeometry {
   id: string
   type: RoomType
   floorIndex: number
-  floor: MeshData
+  // Slabs stay SEPARATE part meshes (never combined into one slab):
+  // a combined slab's AABB covers the stairwell holes and the walk-mode
+  // collider seals every stair arrival shut (same law as wall segments
+  // vs door holes). Empty spans become empty meshes; render/export skip
+  // them. Parts share the slab's material.
+  floor: MeshData[]
   walls: MeshData[]
-  ceiling: MeshData
+  ceiling: MeshData[]
   doorOpenings: DoorOpening[]
 }
 

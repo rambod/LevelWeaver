@@ -61,10 +61,10 @@ export async function exportGLB(level: GeneratedLevel): Promise<Blob> {
     // Position at room location
     roomGroup.position.set(room.position.x, room.position.y, room.position.z)
 
-    // Add geometry
-    addGeometryToGroup(roomGroup, roomGeo.floor, 'Floor', 1, materialFor)
+    // Add geometry (slab parts stay separate meshes, like walls).
+    roomGeo.floor.forEach((floor, i) => addGeometryToGroup(roomGroup, floor, `Floor_${i}`, 1, materialFor))
     roomGeo.walls.forEach((wall, i) => addGeometryToGroup(roomGroup, wall, `Wall_${i}`, 0, materialFor))
-    addGeometryToGroup(roomGroup, roomGeo.ceiling, 'Ceiling', 2, materialFor)
+    roomGeo.ceiling.forEach((ceiling, i) => addGeometryToGroup(roomGroup, ceiling, `Ceiling_${i}`, 2, materialFor))
 
     floorGroup.add(roomGroup)
   }

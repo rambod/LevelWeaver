@@ -1013,7 +1013,9 @@ export function validateStairArrivalWalls(rooms: Room[], stairPlans: StairPlan[]
     for (const high of flightHighRects(p)) {
       let hit = false
       for (const band of bands) {
-        if (overlaps(high, band, 0.05)) {
+        // Same 0.45 body-diameter pad as the planner: tread-center rects
+        // must clear walls by the agent radius, not merely avoid touch.
+        if (overlaps(high, band, 0.45)) {
           hit = true
           break
         }
@@ -1061,7 +1063,7 @@ export function validateStairsGeometry(stairs: StairsGeometry[]): GenerationIssu
 
 /** Lawbook §79: canonical geometry must be finite and well-formed. */
 export function validateExportModel(level: {
-  roomGeometry: { id: string; floor: { vertices: Float32Array }; walls: { vertices: Float32Array }[]; ceiling: { vertices: Float32Array } }[]
+  roomGeometry: { id: string; floor: { vertices: Float32Array }[]; walls: { vertices: Float32Array }[]; ceiling: { vertices: Float32Array }[] }[]
   corridorGeometry: { id: string; floor: { vertices: Float32Array }; walls: { vertices: Float32Array }[]; ceiling: { vertices: Float32Array } }[]
   stairs: { id: string; steps: { vertices: Float32Array }[] }[]
 }): GenerationIssue[] {
@@ -1084,7 +1086,7 @@ export function validateExportModel(level: {
     }
   }
   for (const r of level.roomGeometry) {
-    if (r.floor.vertices.length === 0) {
+    if (r.floor.length === 0 || r.floor.every(f => f.vertices.length === 0)) {
       issues.push({
         code: 'GEOMETRY_EMPTY_FLOOR',
         severity: 'error',
@@ -1093,9 +1095,9 @@ export function validateExportModel(level: {
         message: `${r.id} exists in the graph but has no floor surface (lawbook §75).`,
       })
     }
-    check(r.id, 'floor', r.floor.vertices)
+    r.floor.forEach((f, i) => check(r.id, `floor_${i}`, f.vertices))
     r.walls.forEach((w, i) => check(r.id, `wall_${i}`, w.vertices))
-    check(r.id, 'ceiling', r.ceiling.vertices)
+    r.ceiling.forEach((c, i) => check(r.id, `ceiling_${i}`, c.vertices))
   }
   for (const c of level.corridorGeometry) {
     check(c.id, 'floor', c.floor.vertices)

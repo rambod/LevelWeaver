@@ -631,11 +631,20 @@ function computeSlabHoles(
 
     const halfW = (plan.axis === 'z' ? plan.width : plan.depth) / 2
     const halfD = (plan.axis === 'z' ? plan.depth : plan.width) / 2
+    // Stairwell opening (bot-proven): the hole is the footprint grown by
+    // body clearance (0.35 m) on every side, NOT the bare footprint. A
+    // body standing on an edge tread (center 0.16+ inside the edge)
+    // reaches 0.4 past it; with a footprint-exact hole the slab edge
+    // grazes the column while the head is above the slab bottom —
+    // residual ~1.2 m of solid slab no step-up clears. The growth stays
+    // under every slab-avoidance pad (0.4+), so holes never eat corridor
+    // slabs the planner routed around.
+    const HOLE_CLEAR = 0.35
     const world = {
-      minX: plan.x - halfW,
-      maxX: plan.x + halfW,
-      minZ: plan.z - halfD,
-      maxZ: plan.z + halfD,
+      minX: plan.x - halfW - HOLE_CLEAR,
+      maxX: plan.x + halfW + HOLE_CLEAR,
+      minZ: plan.z - halfD - HOLE_CLEAR,
+      maxZ: plan.z + halfD + HOLE_CLEAR,
     }
     // Room-local ceiling hole for in-room hosts (tower stairs stand
     // outside: the host ceiling stays intact).
