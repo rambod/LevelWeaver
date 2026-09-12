@@ -10,6 +10,7 @@ Use Node.js 22 LTS and npm (the audit used Node 22.22.3).
 ```sh
 npm ci
 npm run dev
+npm run typecheck
 npm test
 npm run test:seeds
 npm run build
@@ -20,6 +21,13 @@ npm run preview
 `tsx` dependency. `test:seeds` checks a bounded, explicit seed matrix; it is not
 proof that every configuration succeeds. `build` runs Vue/TypeScript checking
 and creates `dist/`. No backend, credentials, or environment variables are needed.
+
+`typecheck` checks browser code with `tsconfig.app.json`, Node diagnostics/tests
+with the root `tsconfig.json`, and Vite configuration with `tsconfig.node.json`.
+Node types are an explicit development dependency. Browser compilation exposes
+only Vite/browser globals. All configurations keep strict typing; unused-variable
+checks also apply to browser code, while exploratory Node scripts may retain
+unused probes. The build runs all three checks so script errors cannot be missed.
 
 ## Workflow and failure behavior
 

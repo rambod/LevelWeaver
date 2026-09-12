@@ -156,19 +156,21 @@ test('export refuses failed, unvalidated, mutated geometry and non-finite transf
 test('export releases temporary resources on success and failure', async (t) => {
   for (const fail of [false, true]) {
     let geometries = 0, materials = 0, disposedGeometries = 0, disposedMaterials = 0
-    const patch = t.mock.method(GLTFExporter.prototype, 'parse', (scene, done, error) => {
+    const parse: GLTFExporter['parse'] = (scene, done, error) => {
       const seen = new Set<THREE.Material>()
-      scene.traverse((obj: THREE.Object3D) => {
+      const roots = Array.isArray(scene) ? scene : [scene]
+      roots.forEach(root => root.traverse((obj: THREE.Object3D) => {
         if (!(obj instanceof THREE.Mesh)) return
         geometries++
         obj.geometry.addEventListener('dispose', () => disposedGeometries++)
         seen.add(obj.material as THREE.Material)
-      })
+      }))
       materials = seen.size
       for (const m of seen) m.addEventListener('dispose', () => disposedMaterials++)
       if (fail) error(new Error('simulated exporter failure'))
       else done(new ArrayBuffer(4))
-    })
+    }
+    const patch = t.mock.method(GLTFExporter.prototype, 'parse', parse)
     if (fail) await assert.rejects(exportGLB(fixtureLevel()), /simulated/)
     else await exportGLB(fixtureLevel())
     assert.ok(geometries > 0)
