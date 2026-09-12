@@ -116,6 +116,41 @@ export interface ConfigIssue {
   message: string
 }
 
+/** Exact 2D segment-to-segment distance (0 when crossing/touching). Pure
+ * math shared by corridor routing and validators (single source). */
+export function segSegDist2D(
+  ax: number, az: number, bx: number, bz: number,
+  cx: number, cz: number, dx: number, dz: number,
+): number {
+  const orient = (px: number, pz: number, qx: number, qz: number, rx: number, rz: number): number =>
+    (qx - px) * (rz - pz) - (qz - pz) * (rx - px)
+  const onSeg = (px: number, pz: number, qx: number, qz: number, rx: number, rz: number): boolean =>
+    Math.min(px, rx) <= qx && qx <= Math.max(px, rx) && Math.min(pz, rz) <= qz && qz <= Math.max(pz, rz)
+  const o1 = orient(ax, az, bx, bz, cx, cz)
+  const o2 = orient(ax, az, bx, bz, dx, dz)
+  const o3 = orient(cx, cz, dx, dz, ax, az)
+  const o4 = orient(cx, cz, dx, dz, bx, bz)
+  if (o1 * o2 < 0 && o3 * o4 < 0) return 0
+  if (o1 === 0 && onSeg(ax, az, cx, cz, bx, bz)) return 0
+  if (o2 === 0 && onSeg(ax, az, dx, dz, bx, bz)) return 0
+  if (o3 === 0 && onSeg(cx, cz, ax, az, dx, dz)) return 0
+  if (o4 === 0 && onSeg(cx, cz, bx, bz, dx, dz)) return 0
+  const ptSeg = (px: number, pz: number, qx: number, qz: number, rx: number, rz: number): number => {
+    const ddx = qx - px
+    const ddz = qz - pz
+    const lenSq = ddx * ddx + ddz * ddz
+    if (lenSq < 1e-12) return Math.sqrt((rx - px) ** 2 + (rz - pz) ** 2)
+    const t = Math.max(0, Math.min(1, ((rx - px) * ddx + (rz - pz) * ddz) / lenSq))
+    return Math.sqrt((rx - (px + t * ddx)) ** 2 + (rz - (pz + t * ddz)) ** 2)
+  }
+  return Math.min(
+    ptSeg(ax, az, bx, bz, cx, cz),
+    ptSeg(ax, az, bx, bz, dx, dz),
+    ptSeg(cx, cz, dx, dz, ax, az),
+    ptSeg(cx, cz, dx, dz, bx, bz),
+  )
+}
+
 /**
  * Gate (door) opening width for a wall of usable length `wallLength`.
  * Single source of truth shared by the corridor router and the door
@@ -134,6 +169,16 @@ export function gateWidthFor(
   const mouth = Math.min(config.doorWidth, corridorWidth ?? config.corridorWidth)
   const fit = wallLength - 2 * SPATIAL_DEFAULTS.doorCornerMargin - 0.1
   return Math.min(mouth, fit)
+}
+
+/**
+ * Lawbook §22: wall-to-wall circulation gap between same-floor rooms.
+ * Corridor width plus wall slabs plus slack — floored at 3.5 m so even
+ * the narrowest corridors keep turn clearance near mouths (a 1.5 m
+ * corridor in a 2.5 m gap cannot turn without sealing gates).
+ */
+export function circulationGap(config: LevelConfig): number {
+  return Math.max(config.corridorWidth + 1.0, 3.5)
 }
 
 /**

@@ -517,7 +517,8 @@ function ensureSameFloorLink(nodes: Map<string, TopologyNode>): void {
   const floors = new Set<number>()
   for (const node of nodes.values()) floors.add(node.floorIndex)
   for (const floor of floors) {
-    for (let guard = 0; guard < 64; guard++) {
+    // Bounded by rooms-per-floor (each merge removes one component).
+    for (let guard = 0; guard < 256; guard++) {
       const components = sameFloorComponents(nodes, floor)
       if (components.length <= 1) break
       // Nearest room pair across the first two components (ids break ties).

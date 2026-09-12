@@ -1,5 +1,6 @@
 import type { Room, RoomType, LevelConfig, Boundary } from '@/core/types'
 import { SeededRandom } from '@/core/random'
+import { circulationGap } from '@/core/rules'
 import { isPointInBoundary, roomFootprintInBoundary } from '@/generator/boundary'
 
 // Spatial room placement (pipeline stage: "Place rooms spatially" +
@@ -77,11 +78,12 @@ function placeRoomsOnFloor(
   })
 
   // Rooms must keep wall-to-wall gaps wide enough for corridors to pass
-  // between them: corridorWidth + wall slabs + slack. Tight enough that
-  // attachment slots stay available (fat universal clearance scatters
-  // rooms randomly and destroys adjacency); routed links use open space.
-  // Each side contributes half the required gap.
-  const clearance = (config.corridorWidth + 1.0) / 2
+  // between them (lawbook §22: circulationGap, floored so narrow
+  // corridors keep turn clearance). Tight enough that attachment slots
+  // stay available (fat universal clearance scatters rooms randomly and
+  // destroys adjacency); routed links use open space. Each side
+  // contributes half the required gap.
+  const clearance = circulationGap(config) / 2
 
   for (const room of sorted) {
     const connections = adjacency.get(room.id) || []
@@ -136,8 +138,8 @@ function placeRoomsOnFloor(
     occupied.push({ ...pos!, w: room.width, d: room.depth, roomId: room.id })
   }
 
-  // Post-process: resolve any remaining overlaps with force-directed relaxation
-  return resolveOverlapsOnFloor(placed, boundary, _floorIndex, config.corridorWidth + 1.0)
+  // Post-process: resolve any remaining overlaps with separation
+  return resolveOverlapsOnFloor(placed, boundary, _floorIndex, circulationGap(config))
 }
 
 
@@ -467,23 +469,34 @@ export function resolveOverlaps(rooms: Room[], boundary: Boundary, minGap = 1.0)
 
 function resolveOverlapsOnFloor(rooms: Room[], boundary: Boundary, _floorIndex: number, minGap: number): Room[] {
   // Least-penetration separation (lawbook §19): each overlapping pair is
-  // resolved along its minimum-penetration axis by EXACTLY the missing
-  // distance (half each). Single-axis exact pushes cannot overshoot, so
-  // the loop converges instead of oscillating; boundary clamps run once
-  // per sweep (a clamp can reintroduce overlap, the next sweep fixes it).
-  // Bounded and deterministic. If the floor is genuinely overfull, the
-  // remainder is left for the validators to report honestly.
+  // resolved along its minimum-penetration axis.
+  //
+  // Rectangular shapes use EXACT half-gap pushes: open space lets pairs
+  // separate instantly with no orbit risk. Curved shapes (ring/cross/
+  // radial) use DAMPED pushes (0.5): rooms arranged in a ring shove each
+  // other around forever under exact pushes (A→B→C→A orbit); damped steps
+  // converge geometrically instead of amplifying the cycle.
+  //
+  // Bounds are constraints IN the loop, not projections after it: exact
+  // clamp projections dominate damped pair pushes and pin piles in place.
+  // Rectangular shapes resolve against four bound boxes exactly; curved
+  // shapes keep the spiral pull. Grid scatter remains the last resort.
+  // Bounded and deterministic; genuinely overfull floors go to the
+  // validators honestly.
   const result = rooms.map(r => ({ ...r, position: { ...r.position } }))
   const minSeparation = minGap // wall-to-wall gap (must fit corridors)
   const eps = 1e-4
-  const maxSweeps = 300
+  const maxSweeps = 600
+  const m = 1 // boundary margin
+  const loX = -boundary.width / 2 + m
+  const hiX = boundary.width / 2 - m
+  const loZ = -boundary.depth / 2 + m
+  const hiZ = boundary.depth / 2 - m
+  const isAABB = ['rectangle', 'square', 'hub', 'linear', 'branching'].includes(boundary.shape)
+  const DAMPING = isAABB ? 1 : 0.5
 
-  // Up to two rounds: separation sweeps, then grid scatter to break a
-  // clamp deadlock, then sweeps again. Anything left is genuinely
-  // overfull and goes to the validators honestly.
-  for (let round = 0; round < 2; round++) {
-    let converged = false
-    for (let sweep = 0; sweep < maxSweeps; sweep++) {
+  const sweep = (): boolean => {
+    for (let s = 0; s < maxSweeps; s++) {
       let worst = 0
       for (let i = 0; i < result.length; i++) {
         for (let j = i + 1; j < result.length; j++) {
@@ -501,31 +514,106 @@ function resolveOverlapsOnFloor(rooms: Room[], boundary: Boundary, _floorIndex: 
             const signX = dx > eps ? 1 : dx < -eps ? -1 : a.id < b.id ? 1 : -1
             const signZ = dz > eps ? 1 : dz < -eps ? -1 : a.id < b.id ? 1 : -1
             if (overlapX <= overlapZ) {
-              const push = overlapX / 2 + eps
+              const push = (overlapX / 2 + eps) * DAMPING
               a.position.x += push * signX
               b.position.x -= push * signX
             } else {
-              const push = overlapZ / 2 + eps
+              const push = (overlapZ / 2 + eps) * DAMPING
               a.position.z += push * signZ
               b.position.z -= push * signZ
             }
           }
         }
       }
-      for (const room of result) clampToBoundary(room, boundary)
-      if (worst <= eps) {
-        converged = true
-        break
+      if (isAABB) {
+        // Four bound boxes as fixed obstacles (exact: bounds don't orbit).
+        for (const r of result) {
+          const minRX = r.position.x - r.width / 2
+          const maxRX = r.position.x + r.width / 2
+          const minRZ = r.position.z - r.depth / 2
+          const maxRZ = r.position.z + r.depth / 2
+          let v = 0
+          if (minRX < loX) v = Math.max(v, loX - minRX)
+          if (v > eps) {
+            worst = Math.max(worst, v)
+            r.position.x += v
+          }
+          v = 0
+          if (maxRX > hiX) v = Math.max(v, maxRX - hiX)
+          if (v > eps) {
+            worst = Math.max(worst, v)
+            r.position.x -= v
+          }
+          v = 0
+          if (minRZ < loZ) v = Math.max(v, loZ - minRZ)
+          if (v > eps) {
+            worst = Math.max(worst, v)
+            r.position.z += v
+          }
+          v = 0
+          if (maxRZ > hiZ) v = Math.max(v, maxRZ - hiZ)
+          if (v > eps) {
+            worst = Math.max(worst, v)
+            r.position.z -= v
+          }
+        }
+      } else {
+        for (const room of result) clampToBoundary(room, boundary)
       }
+      if (worst <= eps) return true
     }
-    if (converged) break
-    if (round === 0) {
-      const scattered = verifyAndFixOverlaps(result, boundary, minGap)
-      for (let i = 0; i < result.length; i++) result[i].position = { ...scattered[i].position }
-    }
+    return false
   }
 
+  if (sweep()) return result
+  // Fit the spread layout rigidly, snap bounds once, converge again.
+  shiftLayoutToFit(result, boundary)
+  for (const room of result) clampToBoundary(room, boundary)
+  if (sweep()) return result
+  // Last resort: scatter crowded cells, then one final convergence.
+  const scattered = verifyAndFixOverlaps(result, boundary, minGap)
+  for (let i = 0; i < result.length; i++) result[i].position = { ...scattered[i].position }
+  sweep()
   return result
+}
+
+// Rigidly translate the floor layout so its bbox fits the bounds (when it
+// fits at all). Fixes edge-pile deadlocks without distorting separations.
+function shiftLayoutToFit(result: Room[], boundary: Boundary): void {
+  const m = 1
+  let minX = Infinity
+  let maxX = -Infinity
+  let minZ = Infinity
+  let maxZ = -Infinity
+  for (const r of result) {
+    minX = Math.min(minX, r.position.x - r.width / 2)
+    maxX = Math.max(maxX, r.position.x + r.width / 2)
+    minZ = Math.min(minZ, r.position.z - r.depth / 2)
+    maxZ = Math.max(maxZ, r.position.z + r.depth / 2)
+  }
+  const loX = -boundary.width / 2 + m
+  const hiX = boundary.width / 2 - m
+  const loZ = -boundary.depth / 2 + m
+  const hiZ = boundary.depth / 2 - m
+  // Shift only when the whole span fits; otherwise leave overfull floors
+  // for the validators. Prefers the smallest move (0 when already inside).
+  let dx = 0
+  if (maxX - minX <= hiX - loX) {
+    if (minX < loX) dx = loX - minX
+    else if (maxX > hiX) dx = hiX - maxX
+  }
+  let dz = 0
+  if (maxZ - minZ <= hiZ - loZ) {
+    dz = 0
+    if (minZ < loZ) dz = loZ - minZ
+    else if (maxZ > hiZ) dz = hiZ - maxZ
+  }
+  if (dx !== 0 || dz !== 0) {
+    for (const r of result) {
+      r.position.x += dx
+      r.position.z += dz
+    }
+  }
 }
 
 

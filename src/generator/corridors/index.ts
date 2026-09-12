@@ -1,5 +1,5 @@
 import type { Room, Corridor, LevelConfig, Vec3 } from '@/core/types'
-import { gateWidthFor, SPATIAL_DEFAULTS } from '@/core/rules'
+import { gateWidthFor, segSegDist2D, SPATIAL_DEFAULTS } from '@/core/rules'
 
 interface Obstacle {
   minX: number
@@ -77,13 +77,16 @@ export function generateCorridors(
   const processed = new Set<string>()
 
   // Room obstacles, inflated so the corridor CENTERLINE keeps enough
-  // clearance for its walls (width/2 + slab + slack).
+  // clearance for its walls AND a passing player (lawbook §33/§101:
+  // corridorWidth/2 + wallThickness + safetyMargin, where the margin
+  // covers the player body at neighboring doorways, not just slack).
+  const routePad = config.corridorWidth / 2 + SPATIAL_DEFAULTS.wallThickness + 0.45
   const roomBounds: (Obstacle & { roomId: string })[] = rooms.map(r => ({
     roomId: r.id,
-    minX: r.position.x - r.width / 2 - config.corridorWidth / 2 - 0.5,
-    maxX: r.position.x + r.width / 2 + config.corridorWidth / 2 + 0.5,
-    minZ: r.position.z - r.depth / 2 - config.corridorWidth / 2 - 0.5,
-    maxZ: r.position.z + r.depth / 2 + config.corridorWidth / 2 + 0.5,
+    minX: r.position.x - r.width / 2 - routePad,
+    maxX: r.position.x + r.width / 2 + routePad,
+    minZ: r.position.z - r.depth / 2 - routePad,
+    maxZ: r.position.z + r.depth / 2 + routePad,
     floorIndex: r.floorIndex,
   }))
 
@@ -129,8 +132,44 @@ export function generateCorridors(
   pairs.sort((p, q) => p.dist - q.dist)
 
   // Already-built corridors act as capsules (per floor) so later routes
-  // stay clear of them without blocking whole rectangles.
+  // stay clear of them without blocking whole rectangles. Door approach
+  // volumes join them (lawbook §56): every realized mouth reserves its
+  // thread (±0.8 m along the normal) plus ribbon + seal margin, so later
+  // corridors can never squeeze past a foreign gate within sealing range.
   const corridorObstacles: CorridorCapsule[] = []
+  const WALL_NORMALS = [
+    { x: 0, z: -1 }, { x: 1, z: 0 }, { x: 0, z: 1 }, { x: -1, z: 0 },
+  ]
+  const claimDoorVolume = (corridor: Corridor): void => {
+    const ends = [
+      { pos: corridor.startPos, door: corridor.startDoor },
+      { pos: corridor.endPos, door: corridor.endDoor },
+    ]
+    for (const end of ends) {
+      if (!end.door) continue
+      const n = WALL_NORMALS[end.door.wallIndex] ?? WALL_NORMALS[0]
+      corridorObstacles.push({
+        ax: end.pos.x - n.x * 0.8,
+        az: end.pos.z - n.z * 0.8,
+        bx: end.pos.x + n.x * 0.8,
+        bz: end.pos.z + n.z * 0.8,
+        halfWidth: corridor.width / 2 + SPATIAL_DEFAULTS.wallThickness + 0.55,
+        floorIndex: corridor.floorIndex,
+      })
+    }
+  }
+
+  // Claimed mouths per room (wall, center, half-width): parallel corridors
+  // spread along walls instead of sharing one hole (§27, §34).
+  const claimedByRoom = new Map<string, ClaimedMouth[]>()
+  const claimsOf = (roomId: string): ClaimedMouth[] => {
+    let list = claimedByRoom.get(roomId)
+    if (!list) {
+      list = []
+      claimedByRoom.set(roomId, list)
+    }
+    return list
+  }
 
   // Keys that actually produced a corridor (dedupes halves against direct
   // pairs and against each other).
@@ -164,23 +203,13 @@ export function generateCorridors(
         return
       }
     }
-    const corridor = createCorridor(a, b, config, roomBounds, roomRects, corridorObstacles)
-    // Intruding routes are re-realized as hops when possible: a corridor
-    // through another room reads as a bug, two clean hops read as design.
-    // Gets one extra depth level over length subdivision (cycles are still
+    const built = createCorridor(a, b, config, roomBounds, roomRects, corridorObstacles, claimsOf(a.id), claimsOf(b.id), corridors)
+    // Intruding or mouth-pinched routes are re-realized as hops when
+    // possible: a corridor through another room reads as a bug, a sealed
+    // mouth reads as a locked door — two clean hops read as design. Gets
+    // one extra depth level over length subdivision (cycles are still
     // impossible: banned ancestors accumulate every level).
-    if (
-      corridor &&
-      depth < 3 &&
-      middleIntrudesRooms(
-        corridor.pathPoints && corridor.pathPoints.length > 0 ? corridor.pathPoints : [corridor.startPos, corridor.endPos],
-        roomRects,
-        corridor.width,
-        corridor.floorIndex,
-        corridor.startPos,
-        corridor.endPos
-      )
-    ) {
+    if (built && built.corridor && depth < 3 && (built.midFoul || built.mouthFoul)) {
       const mid = findMidpointRoom(a, b, rooms, new Set([...banned, a.id, b.id]))
       if (mid && mid.id !== a.id && mid.id !== b.id) {
         const nextBanned = new Set(banned)
@@ -191,10 +220,29 @@ export function generateCorridors(
         return
       }
     }
-    if (corridor) {
+    if (built && built.corridor) {
+      const corridor = built.corridor
       corridors.push(corridor)
       realized.add(key)
       addCorridorObstacles(corridorObstacles, corridor)
+      // Reserve both door approach volumes for later routes (§56).
+      claimDoorVolume(corridor)
+      // Claim both mouths (with their exact centers/widths) so later
+      // corridors on the same walls spread apart instead of stacking.
+      if (corridor.startDoor) {
+        claimsOf(corridor.startRoomId).push({
+          wallIndex: corridor.startDoor.wallIndex,
+          center: corridor.startDoor.lateral,
+          half: corridor.startDoor.width / 2,
+        })
+      }
+      if (corridor.endDoor) {
+        claimsOf(corridor.endRoomId).push({
+          wallIndex: corridor.endDoor.wallIndex,
+          center: corridor.endDoor.lateral,
+          half: corridor.endDoor.width / 2,
+        })
+      }
     }
   }
 }
@@ -258,15 +306,18 @@ function createCorridor(
   config: LevelConfig,
   roomBounds: Obstacle[],
   roomRects: Obstacle[],
-  corridorObstacles: CorridorCapsule[]
-): Corridor | null {
+  corridorObstacles: CorridorCapsule[],
+  claimsA: ClaimedMouth[] = [],
+  claimsB: ClaimedMouth[] = [],
+  builtCorridors: Corridor[] = []
+): { corridor: Corridor | null; midFoul: string | null; mouthFoul: boolean } {
   // Door points on the room walls facing each other. The clamp matches
   // core/generation's door computation exactly so the corridor mouth and
   // the wall opening land on the same center with the same width.
-  const startDoor = findDoorPosition(roomA, roomB.position, config.corridorWidth, config)
-  const endDoor = findDoorPosition(roomB, roomA.position, config.corridorWidth, config)
+  const startDoor = findDoorPosition(roomA, roomB.position, config.corridorWidth, config, claimsA)
+  const endDoor = findDoorPosition(roomB, roomA.position, config.corridorWidth, config, claimsB)
 
-  if (!startDoor || !endDoor) return null
+  if (!startDoor || !endDoor) return { corridor: null, midFoul: null, mouthFoul: false }
 
   const startPos: Vec3 = { x: startDoor.x, y: roomA.position.y, z: startDoor.z }
   const endPos: Vec3 = { x: endDoor.x, y: roomB.position.y, z: endDoor.z }
@@ -278,7 +329,27 @@ function createCorridor(
   // Only skip nearly-coincident rooms. Short corridors between close rooms
   // are legitimate; skipping them would leave door openings with no
   // connecting geometry behind them.
-  if (distance < 0.5) return null
+  if (distance < 0.5) return { corridor: null, midFoul: null, mouthFoul: false }
+
+  const finish = (path: Vec3[]): { corridor: Corridor | null; midFoul: string | null; mouthFoul: boolean } => {
+    const corridor: Corridor = {
+      id: `corridor_${roomA.id}_${roomB.id}`,
+      startRoomId: roomA.id,
+      endRoomId: roomB.id,
+      startPos,
+      endPos,
+      width: config.corridorWidth,
+      floorIndex: roomA.floorIndex,
+      pathPoints: path,
+      // Pinned mouth records: the wall cutter reuses these verbatim (§28),
+      // so mouth and hole agree even after mouth spreading (§34).
+      startDoor: { wallIndex: startDoor.wallIndex, lateral: startDoor.lateral, width: startDoor.opening },
+      endDoor: { wallIndex: endDoor.wallIndex, lateral: endDoor.lateral, width: endDoor.opening },
+    }
+    // Selected paths passed the unified verifier (foul == null), so the
+    // mid-room check agrees: no subdivision signal from here.
+    return { corridor, midFoul: null, mouthFoul: false }
+  }
 
   // Perpendicular stubs out of each doorway; the routed middle part stays
   // clear of both endpoint rooms.
@@ -294,119 +365,330 @@ function createCorridor(
   }
 
   // Find path avoiding other rooms (and built corridors) using A*.
-  // Endpoint rooms stay obstacles too: only the 2.2m door zones around the
-  // stubs are exempt, so routes can't cut through the rooms they connect.
-  const routed = findPathAStar(stubA, stubB, roomBounds, corridorObstacles, roomA.floorIndex)
+  // Endpoint rooms stay obstacles too: only the exit cones at the doors
+  // are exempt, so routes can't cut through the rooms they connect — nor
+  // slide along their walls and swing the ribbon back over the mouth.
+  const coneA: ExitCone = { x: startPos.x, z: startPos.z, nx: startDoor.nx, nz: startDoor.nz }
+  const coneB: ExitCone = { x: endPos.x, z: endPos.z, nx: endDoor.nx, nz: endDoor.nz }
+  const routed = findPathAStar(stubA, stubB, roomBounds, corridorObstacles, roomA.floorIndex, coneA, coneB)
 
-  let middle = routed && routed.length >= 2 ? routed : [stubA, stubB]
+  const middleGrid = routed && routed.length >= 2 ? routed : [stubA, stubB]
 
-  // Post-check: if the routed middle still cuts through rooms (search
-  // budget exhausted on a long artery), retry the offset fallback
-  // explicitly before accepting it.
-  if (middleIntrudesRooms(middle, roomRects, config.corridorWidth, roomA.floorIndex, startPos, endPos)) {
-    const retry = findPathSimple(
-      stubA,
-      stubB,
-      roomBounds.filter(b => b.floorIndex === roomA.floorIndex),
-      corridorObstacles.filter(b => b.floorIndex === roomA.floorIndex)
+  // Straight exit legs: turns inside the door bubble swing the wide ribbon
+  // back across the mouth and seal the gate. Extend the stubs to 2.4 m of
+  // guaranteed-straight throat along each door normal; the verifier below
+  // keeps the legs only when they are actually clear.
+  const middleLegged = straightenExitLegs(
+    middleGrid, stubA, stubB,
+    { x: startDoor.nx, z: startDoor.nz }, { x: endDoor.nx, z: endDoor.nz },
+    startPos, endPos,
+  )
+
+  // String-pulling on both variants (legged first): greedy shortcuts turn
+  // the 1m-grid staircase into clean diagonals with few joints.
+  const smoothedLegged = smoothPath(middleLegged, roomRects, corridorObstacles, roomA.floorIndex, config.corridorWidth, roomA.id, roomB.id, startPos, endPos)
+  const smoothedGrid = smoothPath(middleGrid, roomRects, corridorObstacles, roomA.floorIndex, config.corridorWidth, roomA.id, roomB.id, startPos, endPos)
+
+  // Stitch door -> middle -> door. Candidates ordered by preference; the
+  // unified verifier picks the first whose ribbon (center + both edges)
+  // stays out of every room interior (doors themselves exempt at the hole
+  // traverse) AND whose mouth threads stay clear of all wall volumes.
+  // Grid middle is the honest fallback: A* clearance by construction.
+  const candidates: Vec3[][] = [
+    [startPos, ...smoothedLegged, endPos],
+    [startPos, ...smoothedGrid, endPos],
+    [startPos, ...middleLegged, endPos],
+    [startPos, ...middleGrid, endPos],
+  ]
+  for (const path of candidates) {
+    const foul = corridorPathFoul(
+      path, roomA, roomB, roomRects, corridorObstacles, builtCorridors, config.corridorWidth,
+      roomA.floorIndex, startPos, endPos,
+      { x: startDoor.nx, z: startDoor.nz }, { x: endDoor.nx, z: endDoor.nz },
     )
-    // Accept the retry only if it is actually clean.
-    if (!middleIntrudesRooms(retry, roomRects, config.corridorWidth, roomA.floorIndex, startPos, endPos)) {
-      middle = retry
+    // Temporary selection tracing (dev only): set LW_DEBUG_CORR=1 in a
+    // node harness to see candidate verdicts. No @types/node dependency —
+    // read through globalThis.
+    const debugCorr = (globalThis as unknown as { process?: { env?: Record<string, string | undefined> } })
+      .process?.env?.LW_DEBUG_CORR === '1'
+    if (debugCorr) {
+      console.log(`[corr-sel] ${roomA.id}-${roomB.id} cand len=${path.length} foul=${foul ?? 'CLEAN'}`)
+    }
+    if (!foul) return finish(path)
+  }
+  // All candidates foul somewhere: ship the grid middle (closest to the
+  // routed guarantees) and report fouls for subdivision. Mouth fouls also
+  // subdivide now: a pinched direct edge becomes two hops with fresh
+  // mouth angles. Final validators + retry decide survival.
+  const fallback = finish([startPos, ...middleGrid, endPos])
+  if (!fallback.corridor) return { corridor: null, midFoul: null, mouthFoul: false }
+  const gridPath = [startPos, ...middleGrid, endPos]
+  const fallbackFoul = corridorPathFoul(
+    gridPath, roomA, roomB, roomRects, corridorObstacles, builtCorridors,
+    config.corridorWidth, roomA.floorIndex, startPos, endPos,
+    { x: startDoor.nx, z: startDoor.nz }, { x: endDoor.nx, z: endDoor.nz },
+  )
+  return {
+    corridor: fallback.corridor,
+    midFoul: corridorMidFoul(gridPath, roomA, roomB, roomRects, config.corridorWidth, roomA.floorIndex),
+    mouthFoul: fallbackFoul !== null && fallbackFoul.startsWith('mouth'),
+  }
+}
+
+// Straight exit legs: replace the routed points within LEG_OUT meters of
+// each door with guaranteed-straight throat samples along the door
+// normal (0.4 m spacing). Short corridors keep all four anchor points.
+function straightenExitLegs(
+  middle: Vec3[],
+  stubA: Vec3, stubB: Vec3,
+  normalA: { x: number; z: number }, normalB: { x: number; z: number },
+  doorA: Vec3, doorB: Vec3,
+): Vec3[] {
+  const LEG_OUT = 2.4 // meters of straight throat measured from the door
+  const distToA = (p: Vec3): number => Math.sqrt((p.x - doorA.x) ** 2 + (p.z - doorA.z) ** 2)
+  const distToB = (p: Vec3): number => Math.sqrt((p.x - doorB.x) ** 2 + (p.z - doorB.z) ** 2)
+  let i = 0
+  while (i < middle.length && distToA(middle[i]) < LEG_OUT) i++
+  let j = middle.length - 1
+  while (j >= 0 && distToB(middle[j]) < LEG_OUT) j--
+  const legA: Vec3[] = [stubA]
+  for (let t = DOOR_STUB_LENGTH + 0.4; t < LEG_OUT - 1e-6; t += 0.4) {
+    legA.push({ x: doorA.x + normalA.x * t, y: doorA.y, z: doorA.z + normalA.z * t })
+  }
+  const legB: Vec3[] = []
+  for (let t = DOOR_STUB_LENGTH + 0.4; t < LEG_OUT - 1e-6; t += 0.4) {
+    legB.unshift({ x: doorB.x + normalB.x * t, y: doorB.y, z: doorB.z + normalB.z * t })
+  }
+  legB.push(stubB)
+  if (i > j) return [stubA, ...legA.slice(1), ...legB]
+  return [stubA, ...legA.slice(1), ...middle.slice(i, j + 1), ...legB]
+}
+
+/**
+ * Unified corridor verifier (lawbook §28, §32, §34): ribbon strip samples
+ * (centerline + both edges at half width + wall + slack, every 0.25 m).
+ * A sample inside a NON-endpoint room interior fouls. Inside an endpoint
+ * interior it fouls unless within 0.7 m of that end's door (the hole
+ * traverse). Mouth threads (±0.6 m along each door normal) must additionally
+ * stay a body radius clear of every wall capsule — the candidate's own
+ * walls and already-built corridors' walls alike (turn-in-bubble seals).
+ * Built corridors keep their capsule separation. Returns the fouling room
+ * id for non-endpoint intrusions (subdivision signal), or a generic marker
+ * for mouth/crossing fouls (no meaningful subdivision).
+ */
+function corridorPathFoul(
+  path: Vec3[],
+  roomA: Room, roomB: Room,
+  roomRects: (Obstacle & { roomId?: string })[],
+  built: CorridorCapsule[],
+  builtCorridors: Corridor[],
+  width: number,
+  floorIndex: number,
+  doorA: Vec3, doorB: Vec3,
+  normalA: { x: number; z: number }, normalB: { x: number; z: number },
+): string | null {
+  const edge = width / 2 + SPATIAL_DEFAULTS.wallThickness + 0.05
+  const erode = SPATIAL_DEFAULTS.wallThickness + 0.05
+  const wallT = SPATIAL_DEFAULTS.wallThickness
+  const bodyR = 0.4
+  const floorRooms = roomRects.filter(b => b.floorIndex === floorIndex)
+  const floorBuilt = built.filter(b => b.floorIndex === floorIndex)
+  const insideEroded = (x: number, z: number, r: Obstacle): boolean =>
+    x > r.minX + erode && x < r.maxX - erode && z > r.minZ + erode && z < r.maxZ - erode
+  // Wall capsules for the candidate's own ribbon.
+  const ownWalls: { ax: number; az: number; bx: number; bz: number; half: number }[] = []
+  {
+    const center = width / 2 + wallT / 2
+    const half = wallT / 2
+    for (let k = 0; k < path.length - 1; k++) {
+      const p = path[k]
+      const q = path[k + 1]
+      const segLen = Math.sqrt((q.x - p.x) ** 2 + (q.z - p.z) ** 2)
+      if (segLen < 1e-9) continue
+      const ux = (q.x - p.x) / segLen
+      const uz = (q.z - p.z) / segLen
+      for (const side of [1, -1]) {
+        const nx = -uz * side
+        const nz = ux * side
+        ownWalls.push({
+          ax: p.x + nx * center, az: p.z + nz * center,
+          bx: q.x + nx * center, bz: q.z + nz * center,
+          half,
+        })
+      }
     }
   }
-
-  // String-pulling: greedily skip waypoints while the straight shortcut
-  // stays clear. Removes the 1m-grid staircase zigzag that used to turn
-  // into ribbed wall artifacts.
-  const smoothed = smoothPath(middle, roomRects, corridorObstacles, roomA.floorIndex, config.corridorWidth, roomA.id, roomB.id, startPos, endPos)
-
-  // Stitch door -> stub -> routed middle -> stub -> door. Smoothing may
-  // shortcut from the stub at a sharp angle; the wide ribbon then sweeps
-  // across the doorway wall and INTO the room (sealed gate in walk mode).
-  // The throat check samples the ribbon EDGES near both doors: if either
-  // edge enters the room interior, fall back to the routed grid path,
-  // which keeps full ribbon clearance by construction.
-  const smoothedPath = [startPos, ...smoothed, endPos]
-  const gridPath = [startPos, ...middle, endPos]
-  const path = corridorThroatClear(smoothedPath, roomA, roomB, config.corridorWidth)
-    ? smoothedPath
-    : gridPath
-
-  return {
-    id: `corridor_${roomA.id}_${roomB.id}`,
-    startRoomId: roomA.id,
-    endRoomId: roomB.id,
-    startPos,
-    endPos,
-    width: config.corridorWidth,
-    floorIndex: roomA.floorIndex,
-    pathPoints: path,
+  // Built corridors' exact wall capsules (same floor).
+  const otherWalls: { ax: number; az: number; bx: number; bz: number; half: number }[] = []
+  for (const c of builtCorridors) {
+    if (c.floorIndex !== floorIndex) continue
+    const pts = c.pathPoints && c.pathPoints.length > 0 ? c.pathPoints : [c.startPos, c.endPos]
+    const center = c.width / 2 + wallT / 2
+    const half = wallT / 2
+    for (let k = 0; k < pts.length - 1; k++) {
+      const p = pts[k]
+      const q = pts[k + 1]
+      const segLen = Math.sqrt((q.x - p.x) ** 2 + (q.z - p.z) ** 2)
+      if (segLen < 1e-9) continue
+      const ux = (q.x - p.x) / segLen
+      const uz = (q.z - p.z) / segLen
+      for (const side of [1, -1]) {
+        const nx = -uz * side
+        const nz = ux * side
+        otherWalls.push({
+          ax: p.x + nx * center, az: p.z + nz * center,
+          bx: q.x + nx * center, bz: q.z + nz * center,
+          half,
+        })
+      }
+    }
   }
+  // Mouth threads: ±0.6 m along each door's WALL normal (the hole axis,
+  // exactly like walk-mode probes) must clear all wall capsules — the
+  // candidate's OWN two doors AND every already-built door on the floor.
+  // (A new corridor's walls sealing a previous door is the same failure
+  // as sealing its own; checking only its own doors leaves the other
+  // direction invisible.)
+  const WALL_DIRS = [
+    { x: 0, z: -1 }, { x: 1, z: 0 }, { x: 0, z: 1 }, { x: -1, z: 0 },
+  ]
+  const threads = [
+    { door: doorA, nx: normalA.x, nz: normalA.z },
+    { door: doorB, nx: normalB.x, nz: normalB.z },
+  ]
+  for (const c of builtCorridors) {
+    if (c.floorIndex !== floorIndex) continue
+    const ends = [
+      { pos: c.startPos, pin: c.startDoor },
+      { pos: c.endPos, pin: c.endDoor },
+    ]
+    for (const end of ends) {
+      if (!end.pin) continue
+      const n = WALL_DIRS[end.pin.wallIndex] ?? WALL_DIRS[0]
+      threads.push({ door: end.pos, nx: n.x, nz: n.z })
+    }
+  }
+  for (const t of threads) {
+    const ax = t.door.x - t.nx * 0.6
+    const az = t.door.z - t.nz * 0.6
+    const bx = t.door.x + t.nx * 0.6
+    const bz = t.door.z + t.nz * 0.6
+    for (const w of [...ownWalls, ...otherWalls]) {
+      if (segSegDist2D(ax, az, bx, bz, w.ax, w.az, w.bx, w.bz) < w.half + bodyR - 1e-9) {
+        return 'mouth-sealed'
+      }
+    }
+  }
+  for (let k = 0; k < path.length - 1; k++) {
+    const p = path[k]
+    const q = path[k + 1]
+    const segLen = Math.sqrt((q.x - p.x) ** 2 + (q.z - p.z) ** 2)
+    if (segLen < 1e-9) continue
+    const ux = (q.x - p.x) / segLen
+    const uz = (q.z - p.z) / segLen
+    const steps = Math.max(1, Math.ceil(segLen / 0.25))
+    for (let s = 0; s <= steps; s++) {
+      const cx = p.x + ux * ((s / steps) * segLen)
+      const cz = p.z + uz * ((s / steps) * segLen)
+      for (const lateral of [0, edge, -edge]) {
+        const ex = cx + -uz * lateral
+        const ez = cz + ux * lateral
+        for (const r of floorRooms) {
+          const isEndpoint = r.roomId === roomA.id || r.roomId === roomB.id
+          if (!insideEroded(ex, ez, r)) continue
+          if (isEndpoint) {
+            const door = r.roomId === roomA.id ? doorA : doorB
+            if (Math.sqrt((ex - door.x) ** 2 + (ez - door.z) ** 2) < 0.7) continue
+            return `mouth:${r.roomId ?? 'room'}`
+          }
+          return r.roomId ?? 'room'
+        }
+      }
+    }
+    // Built-corridor separation for this segment (existing strictness).
+    for (const c of floorBuilt) {
+      if (segmentCapsuleClearance(p, q, c) < c.halfWidth + 0.1) return 'crossing'
+    }
+  }
+  return null
+}
+
+// Mid-room intrusion only (subdivision signal): like the verifier but
+// restricted to non-endpoint rooms — mouth regions are the path
+// selector's problem, not a reason to subdivide.
+function corridorMidFoul(
+  path: Vec3[],
+  roomA: Room, roomB: Room,
+  roomRects: (Obstacle & { roomId?: string })[],
+  width: number,
+  floorIndex: number,
+): string | null {
+  const edge = width / 2 + SPATIAL_DEFAULTS.wallThickness + 0.05
+  const erode = SPATIAL_DEFAULTS.wallThickness + 0.05
+  const floorRooms = roomRects.filter(b => b.floorIndex === floorIndex)
+  for (let k = 0; k < path.length - 1; k++) {
+    const p = path[k]
+    const q = path[k + 1]
+    const segLen = Math.sqrt((q.x - p.x) ** 2 + (q.z - p.z) ** 2)
+    if (segLen < 1e-9) continue
+    const ux = (q.x - p.x) / segLen
+    const uz = (q.z - p.z) / segLen
+    const steps = Math.max(1, Math.ceil(segLen / 0.25))
+    for (let s = 0; s <= steps; s++) {
+      const cx = p.x + ux * ((s / steps) * segLen)
+      const cz = p.z + uz * ((s / steps) * segLen)
+      for (const lateral of [0, edge, -edge]) {
+        const ex = cx + -uz * lateral
+        const ez = cz + ux * lateral
+        for (const r of floorRooms) {
+          if (r.roomId === roomA.id || r.roomId === roomB.id) continue
+          if (
+            ex > r.minX + erode && ex < r.maxX - erode &&
+            ez > r.minZ + erode && ez < r.maxZ - erode
+          ) {
+            return r.roomId ?? 'room'
+          }
+        }
+      }
+    }
+  }
+  return null
 }
 
 // Doorway throat check (lawbook §28, §34): within one ribbon-width of
 // either door, both ribbon edges must stay out of the rooms' interiors.
 // Edges may cross the wall BAND (the funnel where a wide corridor meets
 // a narrower gate is legal solid-on-solid), but never the inner face.
-function corridorThroatClear(path: Vec3[], roomA: Room, roomB: Room, width: number): boolean {
-  // Same ribbon-aware offset as smoothing (half width + wall + slack):
-  // the verifier must see everything the analytic wall boxes cover.
-  const half = width / 2 + 0.35
-  // Interior boundary = wall thickness (single source) + epsilon.
-  const wallErode = SPATIAL_DEFAULTS.wallThickness + 0.05 // 0.35
-  const reach = DOOR_STUB_LENGTH + width / 2 + 0.8
-  const ends: { door: Vec3; room: Room }[] = [
-    { door: path[0], room: roomA },
-    { door: path[path.length - 1], room: roomB },
-  ]
-  for (const { door, room } of ends) {
-    const inner = {
-      minX: room.position.x - room.width / 2 + wallErode,
-      maxX: room.position.x + room.width / 2 - wallErode,
-      minZ: room.position.z - room.depth / 2 + wallErode,
-      maxZ: room.position.z + room.depth / 2 - wallErode,
-    }
-    // Walk the path from this end up to `reach` meters.
-    const pts = door === path[0] ? path : [...path].reverse()
-    let traveled = 0
-    for (let i = 0; i < pts.length - 1 && traveled < reach; i++) {
-      const p = pts[i]
-      const q = pts[i + 1]
-      const segLen = Math.sqrt((q.x - p.x) ** 2 + (q.z - p.z) ** 2)
-      if (segLen < 1e-9) continue
-      const ux = (q.x - p.x) / segLen
-      const uz = (q.z - p.z) / segLen
-      // Edge offsets (perpendicular), sampled every ~0.2 m.
-      const steps = Math.max(1, Math.ceil(segLen / 0.2))
-      for (let s = 0; s <= steps; s++) {
-        const t = (s / steps) * segLen
-        if (traveled + t > reach) break
-        const cx = p.x + ux * t
-        const cz = p.z + uz * t
-        for (const side of [-1, 1]) {
-          const ex = cx + -uz * side * half
-          const ez = cz + ux * side * half
-          if (ex > inner.minX && ex < inner.maxX && ez > inner.minZ && ez < inner.maxZ) {
-            return false
-          }
-        }
-      }
-      traveled += segLen
-    }
-  }
-  return true
-}
-
 export interface DoorSpot {
   x: number
   z: number
   /** Outward wall normal (unit, axis aligned). */
   nx: number
   nz: number
+  /** Wall side index (0:-Z, 1:+X, 2:+Z, 3:-X). */
+  wallIndex: number
+  /** Lateral center along the wall (meters from room center). */
+  lateral: number
+  /** Clear opening width (shared gate rule). */
+  opening: number
 }
 
-function findDoorPosition(room: Room, targetPos: { x: number; z: number }, corridorWidth: number, config?: LevelConfig): DoorSpot | null {
+// Claimed mouths per room, to spread parallel corridors along walls
+// (lawbook §27 separation, §34 junctions): two corridors sharing one
+// hole interleave their ribbons and seal the gate.
+export interface ClaimedMouth {
+  wallIndex: number
+  center: number
+  half: number
+}
+
+function findDoorPosition(
+  room: Room,
+  targetPos: { x: number; z: number },
+  corridorWidth: number,
+  config?: LevelConfig,
+  claimed: ClaimedMouth[] = []
+): DoorSpot | null {
   const halfW = room.width / 2
   const halfD = room.depth / 2
   const relX = targetPos.x - room.position.x
@@ -417,50 +699,105 @@ function findDoorPosition(room: Room, targetPos: { x: number; z: number }, corri
   // Opening matches the gate the wall cutter will produce (lawbook §28:
   // corridor mouth and door hole must share one center AND one width).
   // Falls back to the legacy corridor-width rule when no config is given.
-  const wallLength = absX > absZ ? room.depth : room.width
-  const opening = config
-    ? gateWidthFor(config, wallLength, corridorWidth)
-    : Math.max(1.0, Math.min(corridorWidth, wallLength - 0.6))
-  if (opening <= 0.05) return null // wall far too short: no fake mouth
   const margin = SPATIAL_DEFAULTS.doorCornerMargin
-  const clampRel = (v: number, half: number) =>
-    Math.max(-half + opening / 2 + margin, Math.min(half - opening / 2 - margin, v))
+  const sep = SPATIAL_DEFAULTS.doorSeparation
+  const facing = absX > absZ ? (relX > 0 ? 1 : 3) : (relZ > 0 ? 2 : 0)
+  // Wall preference: facing wall first, then the adjacent wall on the
+  // target's side, then the far adjacent, then opposite. A full facing
+  // wall spills onto side walls (clean L-route) instead of cramming the
+  // mouth into a corner — corner mouths pinch diagonal corridors shut.
+  // Deterministic: fixed order, target-side first.
+  const sidePick = facing % 2 === 0 ? (relX >= 0 ? 1 : 3) : (relZ >= 0 ? 2 : 0)
+  const otherAdj = ([0, 1, 2, 3] as const).find(w => w % 2 !== facing % 2 && w !== sidePick) as number
+  const opposite = (facing + 2) % 4
+  const wallOrder = [facing, sidePick, otherAdj, opposite]
 
-  // Determine which wall face the target is closest to
+  const tryWall = (wallIndex: number): { lateral: number; opening: number } | null => {
+    const wLen = wallIndex % 2 === 0 ? room.width : room.depth
+    const op = config
+      ? gateWidthFor(config, wLen, corridorWidth)
+      : Math.max(1.0, Math.min(corridorWidth, wLen - 0.6))
+    if (op <= 0.05) return null // wall far too short: no fake mouth
+    const h = wallIndex % 2 === 0 ? halfW : halfD
+    const lo = -h + op / 2 + margin
+    const hi = h - op / 2 - margin
+    if (hi < lo) return null
+    const clampRel = (v: number): number => Math.max(lo, Math.min(hi, v))
+    const relAlong = wallIndex % 2 === 0 ? relX : relZ
+    let lateral = clampRel(relAlong)
+    const wallClaims = claimed
+      .filter(c => c.wallIndex === wallIndex)
+      .sort((p, q) => p.center - q.center)
+    for (let iter = 0; iter < 8; iter++) {
+      const clash = wallClaims.find(
+        c => Math.abs(lateral - c.center) < op / 2 + c.half + sep - 1e-9,
+      )
+      if (!clash) return { lateral, opening: op }
+      const left = clash.center - (op / 2 + clash.half + sep)
+      const right = clash.center + (op / 2 + clash.half + sep)
+      const dl = Math.abs(lateral - left)
+      const dr = Math.abs(lateral - right)
+      lateral = Math.max(lo, Math.min(hi, dl <= dr ? left : right))
+      if (Math.abs(lateral - clash.center) < op / 2 + clash.half + sep - 1e-9) {
+        return null // this wall is full
+      }
+    }
+    return { lateral, opening: op }
+  }
+
+  let picked: { wallIndex: number; lateral: number; opening: number } | null = null
+  for (const w of wallOrder) {
+    const slot = tryWall(w)
+    if (slot) {
+      picked = { wallIndex: w, ...slot }
+      break
+    }
+  }
+  if (!picked) {
+    // Every wall is full: share the facing mouth (merged funnel). Coincident
+    // throats stay parallel and walkable; a corner-crammed mouth would pinch shut.
+    const wLen = facing % 2 === 0 ? room.width : room.depth
+    const op = config
+      ? gateWidthFor(config, wLen, corridorWidth)
+      : Math.max(1.0, Math.min(corridorWidth, wLen - 0.6))
+    if (op <= 0.05) return null
+    const h = facing % 2 === 0 ? halfW : halfD
+    const lo = -h + op / 2 + margin
+    const hi = h - op / 2 - margin
+    const relAlong = facing % 2 === 0 ? relX : relZ
+    picked = { wallIndex: facing, lateral: Math.max(lo, Math.min(hi, relAlong)), opening: op }
+  }
+  const { wallIndex, lateral, opening } = picked
+
+  // Door world position from the picked wall + lateral center.
   let doorX = room.position.x
   let doorZ = room.position.z
   let nx = 0
   let nz = 0
 
-  if (absX > absZ) {
-    // Connect to X walls (left/right)
-    if (relX > 0) {
-      // Right wall (+X)
-      doorX = room.position.x + halfW
-      doorZ = room.position.z + clampRel(relZ, halfD)
-      nx = 1
-    } else {
-      // Left wall (-X)
-      doorX = room.position.x - halfW
-      doorZ = room.position.z + clampRel(relZ, halfD)
-      nx = -1
-    }
+  if (wallIndex === 1) {
+    // Right wall (+X)
+    doorX = room.position.x + halfW
+    doorZ = room.position.z + lateral
+    nx = 1
+  } else if (wallIndex === 3) {
+    // Left wall (-X)
+    doorX = room.position.x - halfW
+    doorZ = room.position.z + lateral
+    nx = -1
+  } else if (wallIndex === 2) {
+    // Back wall (+Z)
+    doorZ = room.position.z + halfD
+    doorX = room.position.x + lateral
+    nz = 1
   } else {
-    // Connect to Z walls (front/back)
-    if (relZ > 0) {
-      // Back wall (+Z)
-      doorZ = room.position.z + halfD
-      doorX = room.position.x + clampRel(relX, halfW)
-      nz = 1
-    } else {
-      // Front wall (-Z)
-      doorZ = room.position.z - halfD
-      doorX = room.position.x + clampRel(relX, halfW)
-      nz = -1
-    }
+    // Front wall (-Z)
+    doorZ = room.position.z - halfD
+    doorX = room.position.x + lateral
+    nz = -1
   }
 
-  return { x: doorX, z: doorZ, nx, nz }
+  return { x: doorX, z: doorZ, nx, nz, wallIndex, lateral, opening }
 }
 
 interface GridNode {
@@ -471,25 +808,49 @@ interface GridNode {
   parent: GridNode | null
 }
 
+/** Exit cone: door-plane reference point + outward normal. */
+export interface ExitCone {
+  x: number
+  z: number
+  nx: number
+  nz: number
+}
+
+// Door-bubble exemption as a DIRECTIONAL cone, not a disk: routes may
+// leave through the doorway cone but may not slide laterally along the
+// room wall inside the bubble (that swings the wide ribbon back across
+// the mouth and seals the gate). Cone: up to 2.2 m out, lateral half
+// width 1.0 m at the plane widening 0.5 per meter out.
+function inExitCone(x: number, z: number, cone: ExitCone): boolean {
+  const dx = x - cone.x
+  const dz = z - cone.z
+  const along = dx * cone.nx + dz * cone.nz
+  if (along < -0.3 || along > 2.2) return false
+  const latX = dx - along * cone.nx
+  const latZ = dz - along * cone.nz
+  const lat = Math.sqrt(latX * latX + latZ * latZ)
+  return lat <= 1.0 + 0.5 * Math.max(0, along)
+}
+
 function findPathAStar(
   start: Vec3,
   end: Vec3,
   roomBounds: Obstacle[],
   capsules: CorridorCapsule[],
-  floorIndex: number
+  floorIndex: number,
+  coneA: ExitCone,
+  coneB: ExitCone
 ): Vec3[] | null {
   const cellSize = 1.0 // 1m grid resolution
 
   // All same-floor bounds stay obstacles, INCLUDING the endpoint rooms:
-  // only the door zones around the stubs are walkable, so the routed
-  // middle can't cut through the very rooms it connects.
+  // only the exit cones at the doors are walkable, so the routed middle
+  // can't cut through the rooms it connects — nor slide along their
+  // walls inside an overbroad disk exemption.
   const floorRooms = roomBounds.filter(b => b.floorIndex === floorIndex)
   const floorCaps = capsules.filter(b => b.floorIndex === floorIndex)
-  const inDoorZone = (x: number, z: number): boolean => {
-    const ds = Math.sqrt((x - start.x) ** 2 + (z - start.z) ** 2)
-    const de = Math.sqrt((x - end.x) ** 2 + (z - end.z) ** 2)
-    return ds < 2.2 || de < 2.2
-  }
+  const inDoorZone = (x: number, z: number): boolean =>
+    inExitCone(x, z, coneA) || inExitCone(x, z, coneB)
   const blocked = (x: number, z: number): boolean => {
     if (inDoorZone(x, z)) return false
     if (isPointBlocked({ x, y: 0, z }, floorRooms)) return true
@@ -591,7 +952,7 @@ function findPathAStar(
   }
 
   // A* failed, try simplified approach
-  return findPathSimple(start, end, floorRooms, floorCaps)
+  return findPathSimple(start, end, floorRooms, floorCaps, coneA, coneB)
 }
 
 function heuristic(a: Vec3, b: Vec3): number {
@@ -748,14 +1109,17 @@ function findPathSimple(
   start: Vec3,
   end: Vec3,
   roomBounds: Obstacle[],
-  capsules: CorridorCapsule[]
+  capsules: CorridorCapsule[],
+  coneA: ExitCone,
+  coneB: ExitCone
 ): Vec3[] {
-  // Door-zone-aware clearance: samples within 2.2m of either stub live in
+  // Exit-cone-aware clearance: samples inside either doorway cone live in
   // the stub's own inflated doorway zone and must not poison candidates
   // (the old exact rect checks rejected EVERYTHING starting inside the
   // inflated endpoint bounds, degenerating to a direct line through rooms).
+  // Cones (not disks) so laterally sliding candidates still fail here.
   const clear = (path: Vec3[]): boolean =>
-    simplePathClear(path, roomBounds, capsules, start, end)
+    simplePathClear(path, roomBounds, capsules, coneA, coneB)
 
   // Try direct
   if (clear([start, end])) {
@@ -786,8 +1150,8 @@ function simplePathClear(
   path: Vec3[],
   roomBounds: Obstacle[],
   capsules: CorridorCapsule[],
-  start: Vec3,
-  end: Vec3
+  coneA: ExitCone,
+  coneB: ExitCone
 ): boolean {
   for (let i = 0; i < path.length - 1; i++) {
     const p = path[i]
@@ -797,9 +1161,9 @@ function simplePathClear(
     for (let s = 0; s <= steps; s++) {
       const x = p.x + ((q.x - p.x) * s) / steps
       const z = p.z + ((q.z - p.z) * s) / steps
-      // Door zones around both stubs are exempt.
-      if (Math.hypot(x - start.x, z - start.z) < 2.2) continue
-      if (Math.hypot(x - end.x, z - end.z) < 2.2) continue
+      // Exit cones at both doors are exempt.
+      if (inExitCone(x, z, coneA)) continue
+      if (inExitCone(x, z, coneB)) continue
       if (isPointBlocked({ x, y: 0, z }, roomBounds)) return false
       for (const c of capsules) {
         if (distPointToSegment(x, z, c.ax, c.az, c.bx, c.bz) < c.halfWidth) return false
@@ -807,39 +1171,6 @@ function simplePathClear(
     }
   }
   return true
-}
-
-// Sampling intrusion test for a routed middle: does any sample come closer
-// than (width/2 - tolerance) to a non-endpoint room, ignoring the stub
-// zones around both doors?
-function middleIntrudesRooms(
-  middle: Vec3[],
-  roomRects: Obstacle[],
-  corridorWidth: number,
-  floorIndex: number,
-  startPos: Vec3,
-  endPos: Vec3
-): boolean {
-  const rooms = roomRects.filter(b => b.floorIndex === floorIndex)
-  for (let i = 0; i < middle.length - 1; i++) {
-    const p = middle[i]
-    const q = middle[i + 1]
-    const segLen = Math.sqrt((q.x - p.x) ** 2 + (q.z - p.z) ** 2)
-    const steps = Math.max(1, Math.ceil(segLen / 0.5))
-    for (let s = 0; s <= steps; s++) {
-      const x = p.x + ((q.x - p.x) * s) / steps
-      const z = p.z + ((q.z - p.z) * s) / steps
-      // Stub zones around both doors are allowed to touch rooms.
-      if (Math.hypot(x - startPos.x, z - startPos.z) < 2.5) continue
-      if (Math.hypot(x - endPos.x, z - endPos.z) < 2.5) continue
-      for (const r of rooms) {
-        const dx = Math.max(r.minX - x, 0, x - r.maxX)
-        const dz = Math.max(r.minZ - z, 0, z - r.maxZ)
-        if (Math.sqrt(dx * dx + dz * dz) < corridorWidth / 2 - 0.5) return true
-      }
-    }
-  }
-  return false
 }
 
 function lineIntersectsRect(

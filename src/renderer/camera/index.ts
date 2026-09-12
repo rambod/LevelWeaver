@@ -1,5 +1,5 @@
 import * as THREE from 'three'
-import { checkPlayerCollision } from '@/playtest/collision'
+import { checkPlayerCollision, type CollisionWorld } from '@/playtest/collision'
 import {
   PLAYER_HEIGHT,
   PLAYER_RADIUS,
@@ -195,14 +195,39 @@ export class CameraController {
     }
   }
 
+  /**
+   * Fired when the user leaves walk mode without the UI (Esc released the
+   * pointer lock, or Escape pressed when lock was never acquired). The App
+   * layer owns walk-mode state and must switch fully back to orbit mode —
+   * otherwise Esc merely unlocks the mouse while WASD stays captured and
+   * the next canvas click re-locks: an inescapable trap.
+   */
+  public onWalkModeExit: (() => void) | null = null
+
+  private requestWalkModeExit(): void {
+    if (!this.walkMode) return
+    this.onWalkModeExit?.()
+  }
+
   private onPointerLockChange(): void {
-    this.isPointerLocked = document.pointerLockElement === this.domElement
+    const locked = document.pointerLockElement === this.domElement
+    const lost = this.isPointerLocked && !locked
+    this.isPointerLocked = locked
+    // Browser-level Esc unlocks the pointer without telling the page which
+    // key did it — losing the lock while walking IS the exit gesture.
+    if (lost) this.requestWalkModeExit()
   }
 
   // Walk mode keyboard controls
   private onKeyDown(event: KeyboardEvent): void {
     if (!this.walkMode) return
 
+    // Escape with no pointer lock held (lock declined/unavailable, or
+    // already released) is the documented walk-mode exit.
+    if (event.code === 'Escape') {
+      this.requestWalkModeExit()
+      return
+    }
     switch (event.code) {
       case 'KeyW': this.moveForward = true; break
       case 'KeyS': this.moveBackward = true; break
@@ -267,17 +292,17 @@ export class CameraController {
     return this.walkMode
   }
 
-  public update(deltaTime: number, collisionBoxes: THREE.Box3[] = []): void {
+  public update(deltaTime: number, collision: CollisionWorld): void {
     // Clamp huge deltas (tab switch, first frame) for stable physics.
     const dt = Math.min(Math.max(deltaTime, 0), 0.05)
     if (this.walkMode) {
-      this.updateWalkMode(dt, collisionBoxes)
+      this.updateWalkMode(dt, collision)
     } else {
       this.updateOrbitMode()
     }
   }
 
-  private updateWalkMode(deltaTime: number, collisionBoxes: THREE.Box3[]): void {
+  private updateWalkMode(deltaTime: number, collision: CollisionWorld): void {
     // Calculate movement direction
     this.direction.set(0, 0, 0)
     if (this.moveForward) this.direction.z -= 1
@@ -298,36 +323,36 @@ export class CameraController {
     this.velocity.y -= PLAYER_GRAVITY * deltaTime
     moveDelta.y = this.velocity.y * deltaTime
 
-    // Collision detection against precomputed world-space boxes.
+    // Collision detection against the precomputed world.
     const newPosition = this.camera.position.clone().add(moveDelta)
-    if (!this.checkCollision(newPosition, collisionBoxes)) {
+    if (!this.checkCollision(newPosition, collision)) {
       this.camera.position.copy(newPosition)
     } else {
       // Try X only
       const xPos = this.camera.position.clone()
       xPos.x = newPosition.x
-      if (!this.checkCollision(xPos, collisionBoxes)) {
+      if (!this.checkCollision(xPos, collision)) {
         this.camera.position.x = newPosition.x
       } else {
         // Step-up (X): rise minimally and retry X alone, so stair treads
         // and thresholds climb without diagonal pops or bobbing.
-        this.tryStepUp('x', newPosition.x, collisionBoxes)
+        this.tryStepUp('x', newPosition.x, collision)
       }
 
       // Try Z only
       const zPos = this.camera.position.clone()
       zPos.z = newPosition.z
-      if (!this.checkCollision(zPos, collisionBoxes)) {
+      if (!this.checkCollision(zPos, collision)) {
         this.camera.position.z = newPosition.z
       } else {
         // Step-up (Z): same, axis-separated.
-        this.tryStepUp('z', newPosition.z, collisionBoxes)
+        this.tryStepUp('z', newPosition.z, collision)
       }
 
       // Try Y only
       const yPos = this.camera.position.clone()
       yPos.y = newPosition.y
-      if (!this.checkCollision(yPos, collisionBoxes)) {
+      if (!this.checkCollision(yPos, collision)) {
         this.camera.position.y = newPosition.y
         this.canJump = this.velocity.y <= 0
       } else {
@@ -349,8 +374,8 @@ export class CameraController {
     this.applyLookDirection()
   }
 
-  private checkCollision(position: THREE.Vector3, collisionBoxes: THREE.Box3[]): boolean {
-    return checkPlayerCollision(position, collisionBoxes, PLAYER_RADIUS, this.playerHeight)
+  private checkCollision(position: THREE.Vector3, collision: CollisionWorld): boolean {
+    return checkPlayerCollision(position, collision.boxes, PLAYER_RADIUS, this.playerHeight, collision.capsules)
   }
 
   // Step-up for one horizontal axis: rise by the smallest increment that
@@ -358,15 +383,15 @@ export class CameraController {
   // so climbing stairs settles onto each tread instead of bobbing a full
   // step-up every frame. Settles velocity so gravity doesn't slam the
   // player back down between treads.
-  private tryStepUp(axis: 'x' | 'z', target: number, collisionBoxes: THREE.Box3[]): void {
+  private tryStepUp(axis: 'x' | 'z', target: number, collision: CollisionWorld): void {
     for (const rise of [0.1, 0.19, PLAYER_STEP_UP]) {
       const over = this.camera.position.clone()
       over.y += rise
-      if (this.checkCollision(over, collisionBoxes)) continue
+      if (this.checkCollision(over, collision)) continue
       const stepped = over.clone()
       if (axis === 'x') stepped.x = target
       else stepped.z = target
-      if (!this.checkCollision(stepped, collisionBoxes)) {
+      if (!this.checkCollision(stepped, collision)) {
         if (axis === 'x') this.camera.position.x = target
         else this.camera.position.z = target
         this.camera.position.y = over.y

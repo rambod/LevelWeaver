@@ -6,7 +6,7 @@ import { presets, shapes, themes } from '@/core/presets'
 import { useLevelStore } from '@/stores/level'
 import { LevelScene } from '@/renderer/scene'
 import { CameraController } from '@/renderer/camera'
-import { snapshotCollisionBoxes, corridorWallBoxes } from '@/playtest/collision'
+import { snapshotCollisionBoxes, corridorWallCapsules, emptyCollisionWorld, type CollisionWorld } from '@/playtest/collision'
 import { corridorHeightFor } from '@/core/types'
 import { findSpawnRoom, spawnEyePosition } from '@/playtest/controller'
 import { exportGLB, downloadGLB } from '@/export/gltf'
@@ -29,9 +29,9 @@ let cameraController: CameraController | null = null
 let renderer: THREE.WebGLRenderer | null = null
 let animationFrameId: number | null = null
 let lastTime = 0
-// Cached collision boxes: snapshotted once per generation so the render
-// loop doesn't traverse the scene graph or clone bounding boxes per frame.
-let collisionBoxes: THREE.Box3[] = []
+// Cached collision world: snapshotted once per generation so the render
+// loop doesn't traverse the scene graph or clone volumes per frame.
+let collisionWorld: CollisionWorld = emptyCollisionWorld()
 
 // Initialize Three.js
 const initThree = () => {
@@ -48,6 +48,12 @@ const initThree = () => {
 
   scene = new LevelScene()
   cameraController = new CameraController(renderer.domElement, viewportRef.value.clientWidth, viewportRef.value.clientHeight)
+  // Esc (pointer-lock release) leaves walk mode entirely — otherwise Esc
+  // would only free the mouse while WASD stays captured (exit trap).
+  cameraController.onWalkModeExit = () => {
+    store.setWalkMode(false)
+    cameraController?.setWalkMode(false)
+  }
 
   // Handle resize
   window.addEventListener('resize', onResize)
@@ -70,7 +76,7 @@ const animate = (time: number = 0) => {
   lastTime = time
 
   if (cameraController) {
-    cameraController.update(deltaTime, collisionBoxes)
+    cameraController.update(deltaTime, collisionWorld)
   }
 
   if (renderer && scene) {
@@ -108,15 +114,15 @@ const generate = async () => {
 const syncScene = (level: GeneratedLevel) => {
     scene?.updateLevel(level)
 
-    // Cache walk-mode collision boxes once per generation.
+    // Cache the walk-mode collision world once per generation.
     scene?.scene.updateMatrixWorld(true)
     const walkMeshes: THREE.Mesh[] = []
     scene?.levelGroup.traverse(obj => {
       if (!(obj instanceof THREE.Mesh)) return
-      // Corridor ribbon WALLS are excluded: a diagonal ribbon's mesh AABB
-      // is far fatter than the wall and would seal nearby doorways. Their
-      // place is taken by exact per-segment side boxes below (lawbook §56).
-      // Corridor floors stay (thin slabs, harmless with grounded epsilon).
+      // Corridor ribbon WALLS are excluded: diagonal ribbon AABBs cover
+      // empty triangles and would seal nearby doorways. Exact capsules
+      // below take their place (lawbook §56). Corridor floors stay (thin
+      // slabs, harmless with grounded epsilon).
       const inCorridor = obj.parent?.userData?.type === 'corridor'
       if (obj.name === 'floor' || obj.name.startsWith('step') || obj.name.startsWith('landing')) {
         walkMeshes.push(obj)
@@ -124,19 +130,19 @@ const syncScene = (level: GeneratedLevel) => {
         walkMeshes.push(obj)
       }
     })
-    collisionBoxes = snapshotCollisionBoxes(walkMeshes)
-    for (const corridor of level.corridors) {
-      const pts = corridor.pathPoints && corridor.pathPoints.length > 0
-        ? corridor.pathPoints
-        : [corridor.startPos, corridor.endPos]
-      collisionBoxes.push(
-        ...corridorWallBoxes(
+    collisionWorld = {
+      boxes: snapshotCollisionBoxes(walkMeshes),
+      capsules: level.corridors.flatMap(corridor => {
+        const pts = corridor.pathPoints && corridor.pathPoints.length > 0
+          ? corridor.pathPoints
+          : [corridor.startPos, corridor.endPos]
+        return corridorWallCapsules(
           pts,
           corridor.width,
           corridor.floorIndex * level.floorHeight,
           corridorHeightFor(level.config),
-        ),
-      )
+        )
+      }),
     }
 
     // Reset camera to view the level
@@ -338,7 +344,7 @@ onUnmounted(() => {
       <main class="viewport-container" ref="viewportRef">
         <div class="viewport-overlay">
           <div class="mode-indicator" :class="{ active: walkMode }">
-            {{ walkMode ? 'WALK MODE (WASD + Mouse, Click to lock)' : 'ORBIT MODE (Drag to orbit, Scroll to zoom)' }}
+            {{ walkMode ? 'WALK MODE (WASD move · mouse look · ESC exits)' : 'ORBIT MODE (Drag to orbit, Scroll to zoom)' }}
           </div>
           <div class="viewport-controls">
             <button class="btn btn-small" @click="toggleWalkMode" :class="{ active: walkMode }">

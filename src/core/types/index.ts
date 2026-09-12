@@ -42,6 +42,20 @@ export interface Corridor {
   width: number
   floorIndex: number
   pathPoints?: Vec3[]
+  /** Pinned mouth records (lawbook §28): the router's exact wall, lateral
+   * center, and opening width per end. The wall cutter reuses these
+   * verbatim so mouth and hole agree even when mouths were spread along
+   * the wall to separate parallel corridors (§34). */
+  startDoor?: CorridorDoor
+  endDoor?: CorridorDoor
+}
+
+/** Corridor mouth on a room wall: wall side, lateral center (meters from
+ * room center along the wall), and clear opening width. */
+export interface CorridorDoor {
+  wallIndex: number
+  lateral: number
+  width: number
 }
 
 export interface Stairs {
@@ -185,6 +199,8 @@ export interface DoorOpening {
   position: Vec3
   width: number
   height: number
+  /** Room on the far side of this opening (lawbook §23 portal target). */
+  targetRoomId: string
 }
 
 export interface MaterialTheme {

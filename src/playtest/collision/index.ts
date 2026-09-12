@@ -13,24 +13,65 @@ import { SPATIAL_DEFAULTS } from '@/core/rules'
 // (0.1999999999…) freeze every horizontal move and break gates.
 export const PLAYER_GROUND_EPS = 0.02
 
+/** Everything walk mode collides against: mesh boxes (rooms, stairs,
+ * floors) plus exact corridor wall capsules. Snapshotted once per
+ * generation and reused every frame. */
+export interface CollisionWorld {
+  boxes: THREE.Box3[]
+  capsules: WallCapsule[]
+}
+
+export function emptyCollisionWorld(): CollisionWorld {
+  return { boxes: [], capsules: [] }
+}
+
+/**
+ * Corridor wall collider (lawbook §56): an axis-free capsule — straight
+ * wall centerline segment + half thickness. AABB boxes cannot represent
+ * diagonal walls (their bounds cover empty triangles and seal nearby
+ * doorways); capsules hug the true ribbon instead. Shared endpoints
+ * close the joints; the slight outer-corner overfill is conservative.
+ */
+export interface WallCapsule {
+  ax: number
+  az: number
+  bx: number
+  bz: number
+  half: number
+  yBase: number
+  yTop: number
+}
+
+export function distPointToSegment2D(  px: number, pz: number,
+  ax: number, az: number,
+  bx: number, bz: number,
+): number {
+  const dx = bx - ax
+  const dz = bz - az
+  const lenSq = dx * dx + dz * dz
+  if (lenSq < 1e-12) return Math.sqrt((px - ax) ** 2 + (pz - az) ** 2)
+  const t = Math.max(0, Math.min(1, ((px - ax) * dx + (pz - az) * dz) / lenSq))
+  return Math.sqrt((px - (ax + t * dx)) ** 2 + (pz - (az + t * dz)) ** 2)
+}
+
 // Corridor side-wall volumes, derived from the canonical path (lawbook
 // §56: clearance volumes, not render artifacts). Ribbon wall MESHES must
-// NOT be used as colliders: a diagonal ribbon's AABB is far fatter than
-// the wall and seals nearby doorways shut. Instead each straight path
-// segment contributes two thin side boxes (inner face exactly at the
-// corridor clear width). Segments extend past joints by the wall
-// thickness so turns stay closed; the small outer-corner overfill is
-// conservative (safe) for a playtest tool.
-export function corridorWallBoxes(
+// NOT be used as colliders: a diagonal ribbon's AABB covers empty
+// triangles and seals nearby doorways. Instead each straight path segment
+// contributes two wall-center capsules (inner face exactly at the
+// corridor clear width). Shared endpoints close the joints; the slight
+// outer-corner overfill is conservative (safe) for a playtest tool.
+export function corridorWallCapsules(
   points: { x: number; z: number }[],
   width: number,
   yBase: number,
   height: number,
   // Single source of truth (lawbook §7, §55).
   wallThickness = SPATIAL_DEFAULTS.wallThickness,
-): THREE.Box3[] {
-  const boxes: THREE.Box3[] = []
-  const half = width / 2
+): WallCapsule[] {
+  const capsules: WallCapsule[] = []
+  const center = width / 2 + wallThickness / 2
+  const half = wallThickness / 2
   for (let i = 0; i < points.length - 1; i++) {
     const p = points[i]
     const q = points[i + 1]
@@ -40,45 +81,28 @@ export function corridorWallBoxes(
     if (len < 1e-6) continue
     const ux = dx / len
     const uz = dz / len
-    // Left normal (-uz, ux), right normal opposite.
     for (const side of [1, -1]) {
       const nx = -uz * side
       const nz = ux * side
-      const inX = half
-      const outX = half + wallThickness
-      // Corners: inner/outer offsets at both ends, extended past the
-      // joints by wallThickness so consecutive boxes overlap.
-      const ax = p.x + nx * inX - ux * wallThickness
-      const az = p.z + nz * inX - uz * wallThickness
-      const bx = p.x + nx * outX - ux * wallThickness
-      const bz = p.z + nz * outX - uz * wallThickness
-      const cx = q.x + nx * inX + ux * wallThickness
-      const cz = q.z + nz * inX + uz * wallThickness
-      const dx2 = q.x + nx * outX + ux * wallThickness
-      const dz2 = q.z + nz * outX + uz * wallThickness
-      boxes.push(
-        new THREE.Box3(
-          new THREE.Vector3(
-            Math.min(ax, bx, cx, dx2),
-            yBase,
-            Math.min(az, bz, cz, dz2),
-          ),
-          new THREE.Vector3(
-            Math.max(ax, bx, cx, dx2),
-            yBase + height,
-            Math.max(az, bz, cz, dz2),
-          ),
-        ),
-      )
+      capsules.push({
+        ax: p.x + nx * center,
+        az: p.z + nz * center,
+        bx: q.x + nx * center,
+        bz: q.z + nz * center,
+        half,
+        yBase,
+        yTop: yBase + height,
+      })
     }
   }
-  return boxes
+  return capsules
 }
 export function checkPlayerCollision(
   position: THREE.Vector3,
   boxes: THREE.Box3[],
   playerRadius = 0.4,
   playerHeight = 1.8,
+  capsules: WallCapsule[] = [],
 ): boolean {
   const playerBottom = position.y - playerHeight
   const playerTop = position.y
@@ -92,6 +116,12 @@ export function checkPlayerCollision(
       playerTop > box.min.y &&
       playerBottom < box.max.y - PLAYER_GROUND_EPS
     ) {
+      return true
+    }
+  }
+  for (const cap of capsules) {
+    if (playerTop <= cap.yBase || playerBottom >= cap.yTop - PLAYER_GROUND_EPS) continue
+    if (distPointToSegment2D(position.x, position.z, cap.ax, cap.az, cap.bx, cap.bz) < cap.half + playerRadius) {
       return true
     }
   }

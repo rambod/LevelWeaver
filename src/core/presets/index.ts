@@ -48,7 +48,9 @@ export const presets: Record<string, Preset> = {
       roomSizeVariation: 0.3,
       largeRoomCount: 2,
     wallHeight: 3.5,
-      corridorWidth: 3.5,
+      // Lawbook §106: believable circulation — wide but within the
+      // 1.8-3.0 m FPS band, never above it.
+      corridorWidth: 3,
     },
   },
   office: {
@@ -158,7 +160,9 @@ export function getDefaultConfig(): LevelConfig {
     roomCount: 16,
     floorCount: 2,
     roomSizeVariation: 0.5,
-    corridorWidth: 3,
+    // Lawbook §106: comfortable middle of the 1.8-3.0 m FPS band
+    // (presets override per theme; hard minimum 0.80 m is enforced).
+    corridorWidth: 2.5,
     connectivity: 0.8,
     verticality: 0.5,
     deadEnds: 0.05,

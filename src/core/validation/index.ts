@@ -1,5 +1,5 @@
 import type { Room, Corridor, DoorOpening, Boundary, StairsGeometry } from '@/core/types'
-import { MIN_CLEAR_WIDTH, MIN_CLEAR_HEIGHT, SPATIAL_DEFAULTS } from '@/core/rules'
+import { MIN_CLEAR_WIDTH, MIN_CLEAR_HEIGHT, SPATIAL_DEFAULTS, segSegDist2D } from '@/core/rules'
 import { flightRectOf, landingRectOf, type StairPlan } from '@/generator/vertical'
 import { roomFootprintInBoundary } from '@/generator/boundary'
 
@@ -22,6 +22,7 @@ export type IssueCode =
   | 'PORTAL_WALL_OVERCROWDED'
   | 'PORTAL_NO_ENTRY'
   | 'PORTAL_NO_EXIT'
+  | 'PORTAL_SEALED'
   | 'CORRIDOR_TOO_NARROW'
   | 'CORRIDOR_DEGENERATE'
   | 'CORRIDOR_SHORT_SEGMENT'
@@ -59,6 +60,72 @@ export function reportOf(issues: GenerationIssue[]): ValidationReport {
     errors: issues.filter(i => i.severity === 'error'),
     warnings: issues.filter(i => i.severity === 'warning'),
   }
+}
+
+/**
+ * Lawbook §2 Order of Authority, for repair selection: physical validity
+ * outranks traversal validity outranks graph niceties. A sealed gate the
+ * player bodily cannot pass (tier 1) must never trade evenly against an
+ * abstract connectivity shortfall (tier 2) — otherwise retry keeps the
+ * locked door and drops the side room to minimize the raw count.
+ */
+export function errorTier(code: IssueCode): 1 | 2 | 3 {
+  switch (code) {
+    case 'ROOM_OVERLAP':
+    case 'ROOM_NESTED':
+    case 'ROOM_OUT_OF_BOUNDS':
+    case 'ROOM_TOO_SMALL':
+    case 'PORTAL_TOO_NARROW':
+    case 'PORTAL_TOO_LOW':
+    case 'PORTAL_CORNER_VIOLATION':
+    case 'PORTAL_SEALED':
+    case 'CORRIDOR_TOO_NARROW':
+    case 'CORRIDOR_DEGENERATE':
+    case 'STAIR_BAD_RISER':
+    case 'STAIR_BAD_TREAD':
+    case 'STAIR_TOO_NARROW':
+    case 'STAIR_NO_HEADROOM':
+    case 'STAIR_NO_ARRIVAL':
+    case 'STAIR_NO_LANDING':
+    case 'STAIR_NO_SHAFT':
+    case 'SLAB_NO_OPENING':
+    case 'NAV_NO_SPAWN':
+    case 'GEOMETRY_NONFINITE':
+    case 'GEOMETRY_EMPTY_FLOOR':
+      return 1
+    default:
+      return 2
+  }
+}
+
+export interface ErrorTiers {
+  t1: number
+  t2: number
+  t3: number
+}
+
+/** Lexicographic compare: fewer tier-1 wins, then tier-2, then tier-3. */
+export function compareTiers(a: ErrorTiers, b: ErrorTiers): number {
+  if (a.t1 !== b.t1) return a.t1 - b.t1
+  if (a.t2 !== b.t2) return a.t2 - b.t2
+  return a.t3 - b.t3
+}
+
+export function tiersOf(issues: GenerationIssue[]): ErrorTiers {
+  const t: ErrorTiers = { t1: 0, t2: 0, t3: 0 }
+  for (const i of issues) {
+    if (i.severity !== 'error') {
+      // Warnings are soft quality signals (lawbook §80): they never fail
+      // a level, but among valid candidates the cleaner map wins ties.
+      t.t3++
+      continue
+    }
+    const tier = errorTier(i.code)
+    if (tier === 1) t.t1++
+    else if (tier === 2) t.t2++
+    else t.t3++
+  }
+  return t
 }
 
 function rectOf(r: Room) {
@@ -715,6 +782,7 @@ export function validateNavigationGrid(
   doorsByRoom: Map<string, DoorOpening[]>,
   corridors: Corridor[],
   stairPlans: StairPlan[],
+  floorHeight: number,
 ): GenerationIssue[] {
   const issues: GenerationIssue[] = []
   if (rooms.length === 0) return issues
@@ -825,16 +893,30 @@ export function validateNavigationGrid(
     }
   }
   // 4. Stair volumes walkable on the host floor (+ tower shafts).
+  // Lawbook §60 step 3 + §45: cells under a LOW stair section are NOT
+  // walkable (the flight underside is solid — crossing under it clips).
+  // Open only the entry approach (bottom 1.5 m), sections whose walking
+  // surface already clears stair headroom, and the vertical-edge cells
+  // (standing ON the steps is valid). Tower shaft floors stay fully open.
+  const HEADROOM_WALK = SPATIAL_DEFAULTS.stair.minHeadroom // 2.05 m of surface height
   const verticalEdges: { f: [number, number, number]; t: [number, number, number] }[] = []
   for (const p of stairPlans) {
     const host = roomMap.get(p.hostRoomId)
     const upper = roomMap.get(p.link.upperRoomId)
     if (!host || !upper) continue
     const f = flightRectOf(p.x, p.z, p.width, p.depth, p.axis)
+    // Entry end (low end) in world coords; d = distance along ascent.
+    const ex = p.axis === 'z' ? p.x : p.x - p.dir * (p.depth / 2)
+    const ez = p.axis === 'z' ? p.z - p.dir * (p.depth / 2) : p.z
+    const dxn = p.axis === 'z' ? 0 : p.dir
+    const dzn = p.axis === 'z' ? p.dir : 0
     for (let ix = 0; ix < nx; ix++) {
       for (let iz = 0; iz < nz; iz++) {
         const c = at(ix, iz)
-        if (c.x > f.minX && c.x < f.maxX && c.z > f.minZ && c.z < f.maxZ) {
+        if (!(c.x > f.minX && c.x < f.maxX && c.z > f.minZ && c.z < f.maxZ)) continue
+        const d = Math.max(0, Math.min(p.depth, (c.x - ex) * dxn + (c.z - ez) * dzn))
+        const surface = (d / Math.max(p.depth, SPATIAL_DEFAULTS.epsilon)) * floorHeight
+        if (d <= 1.5 || surface >= HEADROOM_WALK) {
           open(host.floorIndex, ix, iz)
         }
       }
@@ -952,6 +1034,119 @@ export function validateNavigationGrid(
         objectIds: [r.id],
         message: `${r.id} is graph-connected but physically unreachable from Spawn on the navigation grid.`,
       })
+    }
+  }
+  return issues
+}
+
+/**
+ * Corridor side-wall capsules as plain data (same math as the walk-mode
+ * analytic colliders, engine-independent): two wall-center capsules per
+ * straight path segment. AABB rects cannot represent diagonal walls —
+ * their bounds cover empty triangles and fake seals.
+ */
+export interface WallCapsuleRect {
+  ax: number
+  az: number
+  bx: number
+  bz: number
+  half: number
+}
+
+export function corridorWallCapsules(
+  points: { x: number; z: number }[],
+  width: number,
+  wallThickness: number,
+): WallCapsuleRect[] {
+  const capsules: WallCapsuleRect[] = []
+  const center = width / 2 + wallThickness / 2
+  const half = wallThickness / 2
+  for (let i = 0; i < points.length - 1; i++) {
+    const p = points[i]
+    const q = points[i + 1]
+    const dx = q.x - p.x
+    const dz = q.z - p.z
+    const len = Math.sqrt(dx * dx + dz * dz)
+    if (len < 1e-6) continue
+    const ux = dx / len
+    const uz = dz / len
+    for (const side of [1, -1]) {
+      const nx = -uz * side
+      const nz = ux * side
+      capsules.push({
+        ax: p.x + nx * center,
+        az: p.z + nz * center,
+        bx: q.x + nx * center,
+        bz: q.z + nz * center,
+        half,
+      })
+    }
+  }
+  return capsules
+}
+
+/** Exact 2D segment-to-segment distance: canonical implementation lives
+ * in `@/core/rules` (re-exported here for backwards compatibility). */
+export { segSegDist2D }
+
+/**
+ * Lawbook §28/§52 runtime-faithful gate check: the player thread — the
+ * doorway centerline ±0.6 m along the normal — must stay a full body
+ * radius clear of every corridor wall volume. This is exactly what
+ * walk-mode collision samples (centerline probes), so a passing gate is
+ * a passable gate. Own-throat walls legally flank the thread (they run
+ * parallel outside it) and never come within radius — no exclusions or
+ * throat surgery needed.
+ */
+export function validatePortalSeals(
+  rooms: Room[],
+  doorsByRoom: Map<string, DoorOpening[]>,
+  corridors: Corridor[],
+): GenerationIssue[] {
+  const issues: GenerationIssue[] = []
+  const roomMap = new Map(rooms.map(r => [r.id, r]))
+  const RADIUS = 0.4 // player body radius, mirroring walk collision
+  const REACH = 0.6 // thread extent each way along the normal (probe range)
+  const wallT = SPATIAL_DEFAULTS.wallThickness
+
+  // Corridor wall capsules per floor.
+  const corrWalls = new Map<number, WallCapsuleRect[]>()
+  for (const c of corridors) {
+    const pts = c.pathPoints && c.pathPoints.length > 0 ? c.pathPoints : [c.startPos, c.endPos]
+    let list = corrWalls.get(c.floorIndex)
+    if (!list) {
+      list = []
+      corrWalls.set(c.floorIndex, list)
+    }
+    list.push(...corridorWallCapsules(pts, c.width, wallT))
+  }
+
+  for (const [roomId, doors] of doorsByRoom) {
+    const room = roomMap.get(roomId)
+    if (!room) continue
+    for (const d of doors) {
+      const n = PORTAL_NORMALS[d.wallIndex] ?? PORTAL_NORMALS[0]
+      const ax = d.position.x - n.x * REACH
+      const az = d.position.z - n.z * REACH
+      const bx = d.position.x + n.x * REACH
+      const bz = d.position.z + n.z * REACH
+      let sealed = false
+      for (const w of corrWalls.get(room.floorIndex) ?? []) {
+        // Capsule-to-thread: wall half thickness + body radius clearance.
+        if (segSegDist2D(ax, az, bx, bz, w.ax, w.az, w.bx, w.bz) < w.half + RADIUS - 1e-9) {
+          sealed = true
+          break
+        }
+      }
+      if (sealed) {
+        issues.push({
+          code: 'PORTAL_SEALED',
+          severity: 'error',
+          stage: 'doors',
+          objectIds: [roomId],
+          message: `Gate in ${roomId} wall ${d.wallIndex} is sealed by a corridor wall crossing its doorway thread.`,
+        })
+      }
     }
   }
   return issues

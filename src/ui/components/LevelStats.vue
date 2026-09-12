@@ -21,6 +21,12 @@ defineProps<{
     <div v-for="issue in (level.validation ? level.validation.errors.slice(0, 4) : [])" :key="issue.code + issue.message" class="issue">
       [{{ issue.code }}] {{ issue.message }}
     </div>
+    <div v-if="level.validation && level.validation.errors.length === 0 && level.validation.warnings.length > 0" class="info-row warnings">
+      <span>Notes:</span> <strong>{{ level.validation.warnings.length }} warning(s)</strong>
+    </div>
+    <div v-for="issue in (level.validation && level.validation.errors.length === 0 ? level.validation.warnings.slice(0, 2) : [])" :key="issue.code + issue.message" class="issue warning">
+      [{{ issue.code }}] {{ issue.message }}
+    </div>
   </div>
 </template>
 
@@ -44,9 +50,17 @@ defineProps<{
   color: #ff8888;
 }
 
+.info-row.warnings {
+  color: #ffcc66;
+}
+
 .issue {
   font-size: 0.7rem;
   color: #ff8888;
   line-height: 1.35;
+}
+
+.issue.warning {
+  color: #ffcc66;
 }
 </style>
