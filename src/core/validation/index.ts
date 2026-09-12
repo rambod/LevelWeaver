@@ -1,6 +1,7 @@
-import type { Room, Corridor, DoorOpening, Boundary, StairsGeometry } from '@/core/types'
+import type { Room, Corridor, DoorOpening, Boundary, Rect2D, StairsGeometry } from '@/core/types'
 import { AGENT_DEFAULTS, MIN_CLEAR_WIDTH, MIN_CLEAR_HEIGHT, SPATIAL_DEFAULTS, segSegDist2D } from '@/core/rules'
-import { flightRectOf, landingRectOf, type StairPlan } from '@/generator/vertical'
+import { flightRectOf, flightHighRects, landingRectOf, type StairPlan } from '@/generator/vertical'
+import type { RoomSlabHoles } from '@/generator/geometry'
 import { roomFootprintInBoundary } from '@/generator/boundary'
 
 // Single source for navigation erosion (lawbook §5, §57): the agent body
@@ -40,6 +41,7 @@ export type IssueCode =
   | 'STAIR_TOO_NARROW'
   | 'STAIR_NO_ARRIVAL'
   | 'STAIR_NO_HEADROOM'
+  | 'STAIR_ARRIVAL_WALL'
   | 'STAIR_NO_LANDING'
   | 'STAIR_NO_SHAFT'
   | 'STAIR_CLIPS_ROOM'
@@ -98,6 +100,7 @@ export function errorTier(code: IssueCode): 1 | 2 | 3 {
     case 'STAIR_TOO_NARROW':
     case 'STAIR_NO_HEADROOM':
     case 'STAIR_NO_ARRIVAL':
+    case 'STAIR_ARRIVAL_WALL':
     case 'STAIR_NO_LANDING':
     case 'STAIR_NO_SHAFT':
     case 'STAIR_CLIPS_ROOM':
@@ -914,35 +917,117 @@ export function validateStairClipping(rooms: Room[], stairPlans: StairPlan[]): G
   return issues
 }
 
-/** Lawbook §46: every stair penetration reserves and cuts its slab opening. */
+/** Lawbook §46: every stair penetration reserves and cuts its slab opening.
+ * Per-plan coverage, not mere existence: each flight's own rect must sit
+ * inside one of the room's holes. Existence checks false-passed hubs
+ * hosting several stairs (one hole present, other flights piercing
+ * intact slab around it). */
 export function validateSlabOpenings(
   rooms: Room[],
   stairPlans: StairPlan[],
-  slabHoles: Map<string, { floor?: { minX: number; maxX: number; minZ: number; maxZ: number } | null; ceiling?: { minX: number; maxX: number; minZ: number; maxZ: number } | null }>,
+  slabHoles: Map<string, RoomSlabHoles>,
 ): GenerationIssue[] {
   const issues: GenerationIssue[] = []
   const roomMap = new Map(rooms.map(r => [r.id, r]))
+  // Room-local rect covered by at least one hole (2 cm tolerance for the
+  // world→local translation rounding at hole-cut time).
+  const covered = (holes: Rect2D[] | undefined, rect: Rect2D): boolean => {
+    if (!holes) return false
+    const t = 0.02
+    return holes.some(
+      h =>
+        rect.minX >= h.minX - t && rect.maxX <= h.maxX + t &&
+        rect.minZ >= h.minZ - t && rect.maxZ <= h.maxZ + t,
+    )
+  }
   for (const p of stairPlans) {
     const id = `stairs_${p.link.lowerRoomId}_${p.link.upperRoomId}`
+    const host = roomMap.get(p.hostRoomId)
     const upper = roomMap.get(p.link.upperRoomId)
     if (!upper) continue
-    if (p.kind === 'inroom' && !slabHoles.get(p.hostRoomId)?.ceiling) {
-      issues.push({
-        code: 'SLAB_NO_OPENING',
-        severity: 'error',
-        stage: 'geometry',
-        objectIds: [id, p.hostRoomId],
-        message: `${id} rises through an intact ${p.hostRoomId} ceiling (missing stairwell hole).`,
-      })
+    const flight = flightRectOf(p.x, p.z, p.width, p.depth, p.axis)
+    if (p.kind === 'inroom' && host) {
+      const local: Rect2D = {
+        minX: flight.minX - host.position.x,
+        maxX: flight.maxX - host.position.x,
+        minZ: flight.minZ - host.position.z,
+        maxZ: flight.maxZ - host.position.z,
+      }
+      if (!covered(slabHoles.get(p.hostRoomId)?.ceiling, local)) {
+        issues.push({
+          code: 'SLAB_NO_OPENING',
+          severity: 'error',
+          stage: 'geometry',
+          objectIds: [id, p.hostRoomId],
+          message: `${id} rises through an intact ${p.hostRoomId} ceiling (its flight has no stairwell hole).`,
+        })
+      }
     }
-    if (!slabHoles.get(upper.id)?.floor) {
+    const overlap: Rect2D = {
+      minX: Math.max(flight.minX, upper.position.x - upper.width / 2) - upper.position.x,
+      maxX: Math.min(flight.maxX, upper.position.x + upper.width / 2) - upper.position.x,
+      minZ: Math.max(flight.minZ, upper.position.z - upper.depth / 2) - upper.position.z,
+      maxZ: Math.min(flight.maxZ, upper.position.z + upper.depth / 2) - upper.position.z,
+    }
+    if (!covered(slabHoles.get(upper.id)?.floor, overlap)) {
       issues.push({
         code: 'SLAB_NO_OPENING',
         severity: 'error',
         stage: 'geometry',
         objectIds: [id, upper.id],
-        message: `${id} arrives through an intact ${upper.id} floor (missing stairwell hole).`,
+        message: `${id} arrives through an intact ${upper.id} floor (its arrival has no stairwell hole).`,
       })
+    }
+  }
+  return issues
+}
+
+/**
+ * Lawbook §45 arrival wall-band tripwire (mirrors the planner's
+ * checkUpperArrival high-zone rule with identical shapes): the HIGH part
+ * of a flight must not cross the upper room's boundary walls. Below, the
+ * flight ducks under the wall bottom legally; up high the climber's head
+ * is inside the wall band and no step-up clears a full-height wall.
+ * Independent fence — a shipped violation means reservation bypass.
+ */
+export function validateStairArrivalWalls(rooms: Room[], stairPlans: StairPlan[]): GenerationIssue[] {
+  const issues: GenerationIssue[] = []
+  const roomMap = new Map(rooms.map(r => [r.id, r]))
+  const overlaps = (
+    a: { minX: number; maxX: number; minZ: number; maxZ: number },
+    b: { minX: number; maxX: number; minZ: number; maxZ: number },
+    pad: number,
+  ): boolean =>
+    a.minX < b.maxX + pad && a.maxX > b.minX - pad && a.minZ < b.maxZ + pad && a.maxZ > b.minZ - pad
+  for (const p of stairPlans) {
+    const id = `stairs_${p.link.lowerRoomId}_${p.link.upperRoomId}`
+    const upper = roomMap.get(p.link.upperRoomId)
+    if (!upper) continue
+    const wallT = SPATIAL_DEFAULTS.wallThickness
+    const bands = [
+      { minX: upper.position.x - upper.width / 2, maxX: upper.position.x + upper.width / 2, minZ: upper.position.z + upper.depth / 2 - wallT, maxZ: upper.position.z + upper.depth / 2 },
+      { minX: upper.position.x - upper.width / 2, maxX: upper.position.x + upper.width / 2, minZ: upper.position.z - upper.depth / 2, maxZ: upper.position.z - upper.depth / 2 + wallT },
+      { minX: upper.position.x - upper.width / 2, maxX: upper.position.x - upper.width / 2 + wallT, minZ: upper.position.z - upper.depth / 2, maxZ: upper.position.z + upper.depth / 2 },
+      { minX: upper.position.x + upper.width / 2 - wallT, maxX: upper.position.x + upper.width / 2, minZ: upper.position.z - upper.depth / 2, maxZ: upper.position.z + upper.depth / 2 },
+    ]
+    for (const high of flightHighRects(p)) {
+      let hit = false
+      for (const band of bands) {
+        if (overlaps(high, band, 0.05)) {
+          hit = true
+          break
+        }
+      }
+      if (hit) {
+        issues.push({
+          code: 'STAIR_ARRIVAL_WALL',
+          severity: 'error',
+          stage: 'stairs',
+          objectIds: [id, upper.id],
+          message: `${id} high flight crosses ${upper.id}'s boundary wall below its top — the arrival traps heads in solid wall.`,
+        })
+        break
+      }
     }
   }
   return issues
@@ -1205,7 +1290,7 @@ export function validateNavigationGrid(
     const landing = landingRectOf({
       x: p.x, z: p.z, width: p.width, depth: p.depth,
       axis: p.axis, dir: p.dir, switchback: p.switchback,
-      stepCount: p.stepCount, stepDepth: p.stepDepth,
+      stepCount: p.stepCount, stepDepth: p.stepDepth, stepHeight: p.stepHeight,
     })
     const fx = Math.floor((p.x - minX) / CELL)
     const fz = Math.floor((p.z - minZ) / CELL)
@@ -1395,6 +1480,12 @@ export function validatePortalSeals(
   rooms: Room[],
   doorsByRoom: Map<string, DoorOpening[]>,
   corridors: Corridor[],
+  // Tower shaft walls seal gates exactly like corridor walls (walk-mode
+  // collides with both), but towers plan AFTER corridors — a shaft parked
+  // across a gate thread is invisible without this. Shaft walls run full
+  // height (ground to parapet), so they threaten both the host floor and
+  // the arrival floor above.
+  stairPlans: StairPlan[] = [],
 ): GenerationIssue[] {
   const issues: GenerationIssue[] = []
   const roomMap = new Map(rooms.map(r => [r.id, r]))
@@ -1413,6 +1504,51 @@ export function validatePortalSeals(
     }
     list.push(...corridorWallCapsules(pts, c.width, wallT))
   }
+  // Tower shaft walls: two sides + far end, on host AND arrival floors.
+  const towerWalls = new Map<number, WallCapsuleRect[]>()
+  const pushTower = (floor: number, w: WallCapsuleRect): void => {
+    let list = towerWalls.get(floor)
+    if (!list) {
+      list = []
+      towerWalls.set(floor, list)
+    }
+    list.push(w)
+  }
+  const tHalf = wallT / 2
+  for (const p of stairPlans) {
+    if (!p.towerRect) continue
+    const host = roomMap.get(p.hostRoomId)
+    const upper = roomMap.get(p.link.upperRoomId)
+    if (!host || !upper) continue
+    const t = p.towerRect
+    const sideA = p.axis === 'x'
+      ? { ax: t.minX, az: t.minZ + tHalf, bx: t.maxX, bz: t.minZ + tHalf }
+      : { ax: t.minX + tHalf, az: t.minZ, bx: t.minX + tHalf, bz: t.maxZ }
+    const sideB = p.axis === 'x'
+      ? { ax: t.minX, az: t.maxZ - tHalf, bx: t.maxX, bz: t.maxZ - tHalf }
+      : { ax: t.maxX - tHalf, az: t.minZ, bx: t.maxX - tHalf, bz: t.maxZ }
+    // Far end (near end is the open mouth): +dir side of the rect.
+    const far = p.axis === 'x'
+      ? (p.dir > 0
+        ? { ax: t.maxX - tHalf, az: t.minZ, bx: t.maxX - tHalf, bz: t.maxZ }
+        : { ax: t.minX + tHalf, az: t.minZ, bx: t.minX + tHalf, bz: t.maxZ })
+      : (p.dir > 0
+        ? { ax: t.minX, az: t.maxZ - tHalf, bx: t.maxX, bz: t.maxZ - tHalf }
+        : { ax: t.minX, az: t.minZ + tHalf, bx: t.maxX, bz: t.minZ + tHalf })
+    for (const s of [sideA, sideB, far]) {
+      const cap: WallCapsuleRect = { ...s, half: tHalf }
+      pushTower(host.floorIndex, cap)
+      pushTower(upper.floorIndex, cap)
+    }
+  }
+
+  const threadBlocked = (ax: number, az: number, bx: number, bz: number, walls: WallCapsuleRect[]): boolean => {
+    for (const w of walls) {
+      // Capsule-to-thread: wall half thickness + body radius clearance.
+      if (segSegDist2D(ax, az, bx, bz, w.ax, w.az, w.bx, w.bz) < w.half + RADIUS - 1e-9) return true
+    }
+    return false
+  }
 
   for (const [roomId, doors] of doorsByRoom) {
     const room = roomMap.get(roomId)
@@ -1423,21 +1559,17 @@ export function validatePortalSeals(
       const az = d.position.z - n.z * REACH
       const bx = d.position.x + n.x * REACH
       const bz = d.position.z + n.z * REACH
-      let sealed = false
-      for (const w of corrWalls.get(room.floorIndex) ?? []) {
-        // Capsule-to-thread: wall half thickness + body radius clearance.
-        if (segSegDist2D(ax, az, bx, bz, w.ax, w.az, w.bx, w.bz) < w.half + RADIUS - 1e-9) {
-          sealed = true
-          break
-        }
-      }
-      if (sealed) {
+      const byCorridor = threadBlocked(ax, az, bx, bz, corrWalls.get(room.floorIndex) ?? [])
+      const byTower = !byCorridor && threadBlocked(ax, az, bx, bz, towerWalls.get(room.floorIndex) ?? [])
+      if (byCorridor || byTower) {
         issues.push({
           code: 'PORTAL_SEALED',
           severity: 'error',
           stage: 'doors',
           objectIds: [roomId],
-          message: `Gate in ${roomId} wall ${d.wallIndex} is sealed by a corridor wall crossing its doorway thread.`,
+          message: byTower
+            ? `Gate in ${roomId} wall ${d.wallIndex} is sealed by a stair-tower wall crossing its doorway thread.`
+            : `Gate in ${roomId} wall ${d.wallIndex} is sealed by a corridor wall crossing its doorway thread.`,
         })
       }
     }

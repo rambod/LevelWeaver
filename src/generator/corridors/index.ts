@@ -893,7 +893,19 @@ interface GridNode {
   /** Insertion sequence: heap tie-break so equal-f pops earliest-first,
    * exactly matching the old linear min-scan's first-min-wins order. */
   seq: number
+  /** Step direction taken from the parent (0,0 at the start). */
+  dx: number
+  dz: number
 }
+
+// Extra g-cost for changing direction mid-route. Pure Euclidean step
+// costs make every 1 m staircase as cheap as a straight diagonal, so open
+// ground routes came out as 45° zigzags with a joint (and wall miter)
+// every meter. A small turn penalty (20% of an axis step) spends joints
+// only where obstacles force them; the heuristic stays admissible (turns
+// only add true cost), determinism is untouched, and obstacle avoidance
+// still dominates (a real detour costs whole steps).
+const TURN_COST = 0.2
 
 /**
  * Minimal binary heap for A* (lawbook §94-95: validation cost bounded).
@@ -1020,6 +1032,8 @@ function findPathAStar(
     f: heuristic(start, end),
     parent: null,
     seq: seq++,
+    dx: 0,
+    dz: 0,
   }
 
   const endNodeKey = `${Math.round(end.x / cellSize)},${Math.round(end.z / cellSize)}`
@@ -1083,7 +1097,8 @@ function findPathAStar(
       // Check bounds (door zones exempt so paths can leave the stubs)
       if (blocked(worldX, worldZ)) continue
 
-      const tentativeG = current.g + dir.cost
+      const tentativeG = current.g + dir.cost +
+        ((current.dx === 0 && current.dz === 0) || (current.dx === dir.dx && current.dz === dir.dz) ? 0 : TURN_COST)
       const existing = openSet.get(neighborKey)
 
       if (!existing || tentativeG < existing.g) {
@@ -1094,6 +1109,8 @@ function findPathAStar(
           f: tentativeG + heuristic({ x: worldX, y: 0, z: worldZ }, end),
           parent: current,
           seq: seq++,
+          dx: dir.dx,
+          dz: dir.dz,
         }
         openSet.set(neighborKey, neighbor)
         openHeap.push(neighbor)

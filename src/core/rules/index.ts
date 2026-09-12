@@ -11,7 +11,7 @@ import type { LevelConfig } from '@/core/types'
 // produce a different level. The version travels with every generated
 // level so stale regression seeds are detectable instead of silently
 // "passing" against new geometry.
-export const GENERATOR_VERSION = '0.1.1'
+export const GENERATOR_VERSION = '0.1.2'
 
 export const EPSILON = 0.0001
 

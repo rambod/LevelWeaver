@@ -1,5 +1,5 @@
 import * as THREE from 'three'
-import { checkPlayerCollision, type CollisionWorld } from '@/playtest/collision'
+import { checkPlayerCollision, engagedBoxes, PLAYER_GROUND_EPS, type CollisionWorld } from '@/playtest/collision'
 import {
   PLAYER_HEIGHT,
   PLAYER_RADIUS,
@@ -234,6 +234,11 @@ export class CameraController {
       case 'KeyA': this.moveLeft = true; break
       case 'KeyD': this.moveRight = true; break
       case 'Space':
+        // preventDefault is load-bearing here: without it, Space also
+        // activates whatever UI button still holds focus (e.g. the Walk
+        // button just clicked), which instantly toggles walk mode back
+        // off — "Space jumps out of walk mode". It also scrolls the page.
+        event.preventDefault()
         if (this.canJump) {
           this.velocity.y = PLAYER_JUMP_VELOCITY
           this.canJump = false
@@ -258,6 +263,13 @@ export class CameraController {
   public setWalkMode(enabled: boolean): void {
     this.walkMode = enabled
     if (enabled) {
+      // Drop focus from any UI control (Walk button, sliders): focused
+      // buttons fire on Space/Enter, which would instantly exit walk mode
+      // or re-trigger actions mid-playtest. Belt and suspenders with the
+      // Space preventDefault in onKeyDown.
+      if (document.activeElement instanceof HTMLElement) {
+        document.activeElement.blur()
+      }
       // Seed first-person orientation from the current camera direction
       // so the view doesn't snap when entering walk mode.
       const dir = new THREE.Vector3()
@@ -336,7 +348,7 @@ export class CameraController {
       } else {
         // Step-up (X): rise minimally and retry X alone, so stair treads
         // and thresholds climb without diagonal pops or bobbing.
-        this.tryStepUp('x', newPosition.x, collision)
+        this.tryStepUp('x', newPosition.x, newPosition, collision)
       }
 
       // Try Z only
@@ -346,7 +358,7 @@ export class CameraController {
         this.camera.position.z = newPosition.z
       } else {
         // Step-up (Z): same, axis-separated.
-        this.tryStepUp('z', newPosition.z, collision)
+        this.tryStepUp('z', newPosition.z, newPosition, collision)
       }
 
       // Try Y only
@@ -383,15 +395,39 @@ export class CameraController {
   // so climbing stairs settles onto each tread instead of bobbing a full
   // step-up every frame. Settles velocity so gravity doesn't slam the
   // player back down between treads.
-  private tryStepUp(axis: 'x' | 'z', target: number, collision: CollisionWorld): void {
+  //
+  // Convergent partial acceptance: an 0.8 m body on 0.28 m treads always
+  // overlaps TWO risers at once (the target tread 0.17 up plus the next
+  // at 0.34 — notably every switchback turn entry, which mounts one tread
+  // while the next intrudes). All-or-nothing rising deadlocks there (0.34
+  // > max rise). So a rise that escapes ≥1 destination blocker while
+  // leaving at most one more normal rise outstanding (residual ≤ 0.75,
+  // see below) is ALSO accepted: the next frames finish it, exactly like
+  // consecutive treads. Reference frame is the axis destination (not the
+  // current pos — standing atop a landing engages nothing, so
+  // current-relative "clearance" can never fire when entering boxes from
+  // open floor). There is deliberately NO risen-in-place veto: rising
+  // under a slab and stepping out from under it is ordinary walking out,
+  // and the residual bound already rejects anything still towering after
+  // the move (walls, ceilings, slabs stay engaged with huge residuals).
+  // Corridor capsules veto outright too, so walls stay unmountable.
+  private tryStepUp(axis: 'x' | 'z', target: number, newPosition: THREE.Vector3, collision: CollisionWorld): void {
+    const stepDbg = (globalThis as unknown as { process?: { env?: Record<string, string | undefined> } })
+      .process?.env?.LW_STEP_DEBUG === '1'
+    const dest = this.camera.position.clone()
+    if (axis === 'x') dest.x = target
+    else dest.z = target
+    dest.y = newPosition.y
+    const destEngaged = engagedBoxes(dest, collision.boxes, PLAYER_RADIUS, this.playerHeight)
+    if (stepDbg) console.log(`[stepup ${axis}] pos=(${this.camera.position.x.toFixed(2)},${this.camera.position.y.toFixed(2)},${this.camera.position.z.toFixed(2)}) tgt=${target.toFixed(2)} destEng=${destEngaged.length}`)
     for (const rise of [0.1, 0.19, PLAYER_STEP_UP]) {
       const over = this.camera.position.clone()
       over.y += rise
-      if (this.checkCollision(over, collision)) continue
       const stepped = over.clone()
       if (axis === 'x') stepped.x = target
       else stepped.z = target
       if (!this.checkCollision(stepped, collision)) {
+        if (stepDbg) console.log(`  rise ${rise}: ACCEPT full`)
         if (axis === 'x') this.camera.position.x = target
         else this.camera.position.z = target
         this.camera.position.y = over.y
@@ -399,7 +435,42 @@ export class CameraController {
         this.canJump = true
         return
       }
+      // Partial: escaped ≥1 destination blocker, remainder within reach.
+      // The remainder bound (0.75) is the load-bearing constant: a turn
+      // diagonal can engage half a dozen treads at once (tops up to ~0.7
+      // above feet), and each accepted frame must still converge, so the
+      // bound has to swallow a tread stack. It stays far below every
+      // head-bump hazard (nearest real one: upper flight over lower at
+      // ≥0.82 residual — walking under stairs stays blocked), while
+      // single tall boxes can never pass at all (nothing disengages, so
+      // `cleared` stays empty no matter the bound). Foot-level mounting
+      // is automatic: a cleared box is always within one rise above the
+      // old feet, so every accept climbs exactly stair geometry.
+      const after = engagedBoxes(stepped, collision.boxes, PLAYER_RADIUS, this.playerHeight)
+      let cleared = false
+      for (const b of destEngaged) {
+        if (!after.includes(b)) cleared = true
+      }
+      if (!cleared) {
+        if (stepDbg) console.log(`  rise ${rise}: no-cleared after=${after.length} dest=${destEngaged.length}`)
+        continue
+      }
+      let residual = 0
+      for (const b of after) {
+        residual = Math.max(residual, b.max.y - PLAYER_GROUND_EPS - (over.y - this.playerHeight))
+      }
+      if (residual > 0.75) {
+        if (stepDbg) console.log(`  rise ${rise}: residual ${residual.toFixed(3)}`)
+        continue
+      }
+      if (axis === 'x') this.camera.position.x = target
+      else this.camera.position.z = target
+      this.camera.position.y = over.y
+      this.velocity.y = 0
+      this.canJump = true
+      return
     }
+    if (stepDbg) console.log(`  [${axis}] no rise worked`)
   }
 
   private updateOrbitMode(): void {

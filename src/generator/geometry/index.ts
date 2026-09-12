@@ -14,8 +14,12 @@ const CEILING_THICKNESS = 0.2
 
 
 export interface RoomSlabHoles {
-  floor?: Rect2D | null
-  ceiling?: Rect2D | null
+  /** Floor holes (stair arrivals). A LIST: hubs often host several
+   * stairs, and every arrival needs its own opening — a single slot
+   * silently dropped all but the last (flights piercing intact slabs). */
+  floor: Rect2D[]
+  /** Ceiling holes (in-room flights rising through). Same list rule. */
+  ceiling: Rect2D[]
 }
 
 export function generateRoomGeometry(
@@ -50,44 +54,66 @@ function generateSingleRoomGeometry(room: Room, doors: DoorOpening[], holes?: Ro
     id: room.id,
     type: room.type,
     floorIndex: room.floorIndex,
-    floor: createSlabWithHole(width, depth, y + FLOOR_THICKNESS, FLOOR_THICKNESS, holes?.floor ?? null, 1),
+    floor: createSlabWithHoles(width, depth, y + FLOOR_THICKNESS, FLOOR_THICKNESS, holes?.floor ?? [], 1),
     walls: createWallMeshes(halfW, halfD, height, y, WALL_THICKNESS, localDoors),
-    ceiling: createSlabWithHole(width, depth, y + height, CEILING_THICKNESS, holes?.ceiling ?? null, 2),
+    ceiling: createSlabWithHoles(width, depth, y + height, CEILING_THICKNESS, holes?.ceiling ?? [], 2),
     doorOpenings: doors,
   }
 }
 
-// Solid slab with an optional axis-aligned rectangular hole (stairwells).
-// The hole is in room-local coordinates (room centered at origin).
-function createSlabWithHole(
+// Solid slab minus zero or more axis-aligned rectangular holes
+// (stairwells). Holes are room-local (room centered at origin). Each hole
+// is subtracted from every surviving part in turn, so overlapping holes
+// merge into correct L-shaped remainders instead of double-cutting.
+function createSlabWithHoles(
   width: number,
   depth: number,
   yTop: number,
   thickness: number,
-  hole: Rect2D | null,
+  holes: Rect2D[],
   materialIndex: number
 ): MeshData {
   const yCenter = yTop - thickness / 2
-  if (!hole) {
+  // Working set of solid rects (local XZ center + size).
+  let parts: { cx: number; cz: number; w: number; d: number }[] = [
+    { cx: 0, cz: 0, w: width, d: depth },
+  ]
+  for (const hole of holes) {
+    const hx0 = Math.max(-width / 2, hole.minX)
+    const hx1 = Math.min(width / 2, hole.maxX)
+    const hz0 = Math.max(-depth / 2, hole.minZ)
+    const hz1 = Math.min(depth / 2, hole.maxZ)
+    if (hx1 - hx0 <= 0.01 || hz1 - hz0 <= 0.01) continue // hole misses this slab
+    const next: typeof parts = []
+    for (const p of parts) {
+      const px0 = p.cx - p.w / 2
+      const px1 = p.cx + p.w / 2
+      const pz0 = p.cz - p.d / 2
+      const pz1 = p.cz + p.d / 2
+      const ix0 = Math.max(px0, hx0)
+      const ix1 = Math.min(px1, hx1)
+      const iz0 = Math.max(pz0, hz0)
+      const iz1 = Math.min(pz1, hz1)
+      if (ix1 - ix0 <= 0.01 || iz1 - iz0 <= 0.01) {
+        next.push(p) // untouched by this hole
+        continue
+      }
+      // Left / right strips (full part depth).
+      if (ix0 - px0 > 0.05) next.push({ cx: (px0 + ix0) / 2, cz: p.cz, w: ix0 - px0, d: p.d })
+      if (px1 - ix1 > 0.05) next.push({ cx: (ix1 + px1) / 2, cz: p.cz, w: px1 - ix1, d: p.d })
+      // Front / back strips (between hole X edges).
+      if (iz0 - pz0 > 0.05) next.push({ cx: (ix0 + ix1) / 2, cz: (pz0 + iz0) / 2, w: ix1 - ix0, d: iz0 - pz0 })
+      if (pz1 - iz1 > 0.05) next.push({ cx: (ix0 + ix1) / 2, cz: (iz1 + pz1) / 2, w: ix1 - ix0, d: pz1 - iz1 })
+    }
+    parts = next
+  }
+  if (parts.length === 1 && holes.length === 0) {
     return createBoxMesh(0, yCenter, 0, width, thickness, depth, materialIndex)
   }
-  const hx0 = Math.max(-width / 2, hole.minX)
-  const hx1 = Math.min(width / 2, hole.maxX)
-  const hz0 = Math.max(-depth / 2, hole.minZ)
-  const hz1 = Math.min(depth / 2, hole.maxZ)
-  const parts: MeshData[] = []
-  const push = (cx: number, cz: number, w: number, d: number) => {
-    if (w > 0.05 && d > 0.05) {
-      parts.push(createBoxMesh(cx, yCenter, cz, w, thickness, d, materialIndex))
-    }
-  }
-  // Left / right of the hole (full depth).
-  push((-width / 2 + hx0) / 2, 0, hx0 + width / 2, depth)
-  push((hx1 + width / 2) / 2, 0, width / 2 - hx1, depth)
-  // Front / back of the hole (between its X edges).
-  push((hx0 + hx1) / 2, (-depth / 2 + hz0) / 2, hx1 - hx0, hz0 + depth / 2)
-  push((hx0 + hx1) / 2, (hz1 + depth / 2) / 2, hx1 - hx0, depth / 2 - hz1)
-  return combineMeshes(parts, materialIndex)
+  return combineMeshes(
+    parts.map(p => createBoxMesh(p.cx, yCenter, p.cz, p.w, thickness, p.d, materialIndex)),
+    materialIndex,
+  )
 }
 
 
@@ -527,6 +553,46 @@ function buildCorridorGeometry(corridor: Corridor, points: Vec3[], wallHeight: n
   }
 
   const flat: FlatPoint[] = clean.map(p => ({ x: p.x, z: p.z }))
+  // Seam overlap (lawbook §52-53): ribbon ends meet room walls in a
+  // zero-overlap butt joint — coplanar touch plus float error reads as a
+  // see-through slit around gates and tower mouths. Extend both ends
+  // 0.15 m INTO the rooms (past the door plane): walls bury into room-
+  // wall solid beside the hole, slabs overlap under room slabs (4 mm
+  // below, never coplanar). Validator capsules use pathPoints, and the
+  // intrusion exemption covers 0.7 m past every door, so checks agree.
+  const SEAM_OVERLAP = WALL_THICKNESS / 2
+  if (flat.length >= 2) {
+    const d0x = flat[1].x - flat[0].x
+    const d0z = flat[1].z - flat[0].z
+    const l0 = Math.sqrt(d0x * d0x + d0z * d0z)
+    if (l0 > 1e-6) {
+      flat[0] = { x: flat[0].x - (d0x / l0) * SEAM_OVERLAP, z: flat[0].z - (d0z / l0) * SEAM_OVERLAP }
+    }
+    const n = flat.length
+    const d1x = flat[n - 1].x - flat[n - 2].x
+    const d1z = flat[n - 1].z - flat[n - 2].z
+    const l1 = Math.sqrt(d1x * d1x + d1z * d1z)
+    if (l1 > 1e-6) {
+      flat[n - 1] = { x: flat[n - 1].x + (d1x / l1) * SEAM_OVERLAP, z: flat[n - 1].z + (d1z / l1) * SEAM_OVERLAP }
+    }
+  }
+  // Collinear micro-merge: A* grid staircases leave near-straight joints
+  // every meter (zigzag accordion walls). Merge joints straighter than 3
+  // degrees — the chord cuts the corner by under 1.5 cm, deep inside the
+  // verifier's 5 cm slack, so approved clearance survives verbatim.
+  for (let i = flat.length - 2; i >= 1; i--) {
+    const ax = flat[i].x - flat[i - 1].x
+    const az = flat[i].z - flat[i - 1].z
+    const bx = flat[i + 1].x - flat[i].x
+    const bz = flat[i + 1].z - flat[i].z
+    const la = Math.sqrt(ax * ax + az * az)
+    const lb = Math.sqrt(bx * bx + bz * bz)
+    if (la < 1e-6 || lb < 1e-6) continue
+    const cosA = (ax * bx + az * bz) / (la * lb)
+    if (cosA > Math.cos((3 * Math.PI) / 180)) {
+      flat.splice(i, 1)
+    }
+  }
   const miters = computeMiters(flat)
   const arc = arclengths(flat)
   const halfSlab = width / 2 + WALL_THICKNESS + 0.02

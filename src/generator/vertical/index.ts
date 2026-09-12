@@ -4,6 +4,16 @@ import { SPATIAL_DEFAULTS, stairMathFor } from '@/core/rules'
 import { createBoxMesh, createOrientedBox } from '@/core/meshdata'
 import { isPointInBoundary } from '@/generator/boundary'
 
+// Corridor capsule for clearance tests (mirrors the router's obstacle
+// capsules and walk-mode colliders: segment + clearance radius).
+export interface CorridorCapsule {
+  ax: number
+  az: number
+  bx: number
+  bz: number
+  halfWidth: number
+}
+
 // Vertical circulation (pipeline stage: "Add stairs or vertical connectors").
 //
 // Stairs always live INSIDE the lower linked room (never floating at
@@ -21,8 +31,10 @@ import { isPointInBoundary } from '@/generator/boundary'
 const STAIR_TREAD = SPATIAL_DEFAULTS.stair.minTread // 0.28 m: most compact legal tread
 /** Single straight flight width: lawbook default 1.20 m + comfort margin. */
 const STAIR_WIDTH_STRAIGHT = 1.4
-/** Folded switchback total width (two ~1.1 m flights side by side). */
-const STAIR_WIDTH_SWITCHBACK = 2.2
+/** Folded switchback total width (two 1.2 m flights side by side: exactly
+ * the lawbook design default, so no STAIR_TOO_NARROW warnings and real
+ * elbow room for the 0.8 m agent). */
+const STAIR_WIDTH_SWITCHBACK = 2.4
 const LANDING_DEPTH = SPATIAL_DEFAULTS.stair.landingDepth // 1.2 m
 const FLOOR_THICKNESS = 0.2
 
@@ -68,18 +80,88 @@ export interface StairPlan {
 export interface StairPlanContext {
   /** Upper-floor corridor slab footprints the arrival hole must avoid. */
   corridorSlabsByFloor: Map<number, Rect2D[]>
+  /** Exact corridor capsules per floor (centerlines + side walls + gate
+   * approach volumes, each with its clearance radius). Tower shafts —
+   * the only stair geometry standing in open space — must clear these
+   * with body margin: rect slabs alone miss corridor walls (0.3 out)
+   * and gate threads (0.8+ out), parking shafts across walkways and
+   * sealing gates after their corridors shipped. In-room flights need
+   * no such check (rooms never overlap, so a flight cannot touch a
+   * foreign ribbon; gates are guarded by walk zones instead). */
+  corridorCapsulesByFloor?: Map<number, CorridorCapsule[]>
   /** Map boundary for tower placement. */
   boundary: Boundary
   /** Corridor links per room (for critical-first ordering). */
   corridorDegree: Map<string, number>
   /** Floor spacing (from wall height). Defaults to FLOOR_HEIGHT. */
   floorHeight?: number
+  /** Gate clear width/height (from settings): tower shaft mouths cut with
+   * these dimensions, so later links route around real walk zones. */
+  gateWidth?: number
+  gateHeight?: number
   /** Suppress per-link omission warnings (layout retry probes). */
   quiet?: boolean
 }
 
 function rectsOverlap(a: Rect2D, b: Rect2D, pad = 0): boolean {
   return a.minX < b.maxX + pad && a.maxX > b.minX - pad && a.minZ < b.maxZ + pad && a.maxZ > b.minZ - pad
+}
+
+// Exact capsule-vs-rect overlap (no AABB inflation of diagonal segments:
+// their bounds cover empty triangles and fake collisions). True when the
+// segment pierces the rect, an endpoint sits inside the radius-expanded
+// rect, or a rect corner sits within the radius of the segment.
+function capsuleRectOverlap(
+  ax: number, az: number, bx: number, bz: number, radius: number,
+  rect: Rect2D,
+): boolean {
+  const ex = { minX: rect.minX - radius, maxX: rect.maxX + radius, minZ: rect.minZ - radius, maxZ: rect.maxZ + radius }
+  const inside = (px: number, pz: number): boolean =>
+    px > ex.minX && px < ex.maxX && pz > ex.minZ && pz < ex.maxZ
+  if (inside(ax, az) || inside(bx, bz)) return true
+  const corners: [number, number][] = [
+    [rect.minX, rect.minZ], [rect.maxX, rect.minZ],
+    [rect.maxX, rect.maxZ], [rect.minX, rect.maxZ],
+  ]
+  for (const [cx, cz] of corners) {
+    if (pointSegDist(cx, cz, ax, az, bx, bz) < radius) return true
+  }
+  const edges: [number, number, number, number][] = [
+    [rect.minX, rect.minZ, rect.maxX, rect.minZ],
+    [rect.maxX, rect.minZ, rect.maxX, rect.maxZ],
+    [rect.maxX, rect.maxZ, rect.minX, rect.maxZ],
+    [rect.minX, rect.maxZ, rect.minX, rect.minZ],
+  ]
+  for (const [ex0, ez0, ex1, ez1] of edges) {
+    if (segmentsCross(ax, az, bx, bz, ex0, ez0, ex1, ez1)) return true
+  }
+  return false
+}
+
+function pointSegDist(
+  px: number, pz: number,
+  ax: number, az: number,
+  bx: number, bz: number,
+): number {
+  const dx = bx - ax
+  const dz = bz - az
+  const lenSq = dx * dx + dz * dz
+  if (lenSq < 1e-12) return Math.sqrt((px - ax) ** 2 + (pz - az) ** 2)
+  const t = Math.max(0, Math.min(1, ((px - ax) * dx + (pz - az) * dz) / lenSq))
+  return Math.sqrt((px - (ax + t * dx)) ** 2 + (pz - (az + t * dz)) ** 2)
+}
+
+function segmentsCross(
+  ax: number, az: number, bx: number, bz: number,
+  cx: number, cz: number, dx: number, dz: number,
+): boolean {
+  const orient = (px: number, pz: number, qx: number, qz: number, rx: number, rz: number): number =>
+    (qx - px) * (rz - pz) - (qz - pz) * (rx - px)
+  const o1 = orient(ax, az, bx, bz, cx, cz)
+  const o2 = orient(ax, az, bx, bz, dx, dz)
+  const o3 = orient(cx, cz, dx, dz, ax, az)
+  const o4 = orient(cx, cz, dx, dz, bx, bz)
+  return o1 * o2 < 0 && o3 * o4 < 0
 }
 
 function pointRectDist(px: number, pz: number, r: Rect2D): number {
@@ -347,6 +429,7 @@ export function planStairs(
     roomMap,
     doorsByRoom,
     slabsByFloor,
+    corridorCapsulesByFloor: context?.corridorCapsulesByFloor ?? new Map<number, CorridorCapsule[]>(),
     boundary: context?.boundary,
     footprints,
     floorHoles,
@@ -355,6 +438,8 @@ export function planStairs(
     stepHeight,
     stepDepth,
     run,
+    gateWidth: context?.gateWidth ?? SPATIAL_DEFAULTS.doorClearWidth,
+    gateHeight: context?.gateHeight ?? SPATIAL_DEFAULTS.doorClearHeight,
     reasons: new Map<string, number>(),
     atFloor,
   }
@@ -438,6 +523,7 @@ interface StairPlanner {
   roomMap: Map<string, Room>
   doorsByRoom: Map<string, DoorOpening[]>
   slabsByFloor: Map<number, Rect2D[]>
+  corridorCapsulesByFloor: Map<number, CorridorCapsule[]>
   boundary: Boundary | undefined
   footprints: Map<number, Rect2D[]>
   floorHoles: Map<number, Rect2D[]>
@@ -447,6 +533,8 @@ interface StairPlanner {
   stepHeight: number
   stepDepth: number
   run: number
+  gateWidth: number
+  gateHeight: number
   /** Rejection census: why candidates fail (debuggability, lawbook §85). */
   reasons: Map<string, number>
   atFloor: (map: Map<number, Rect2D[]>, floor: number) => Rect2D[]
@@ -468,13 +556,17 @@ function topReasons(st: StairPlanner, before: Map<string, number>): string {
 
 /**
  * Folded switchback footprint: two half-runs side by side + turn landing.
- * Total width fits two legal flights; depth is roughly half a straight run.
+ * Depth covers the A run, the turn landing, AND the B0 tread overhang:
+ * B's bottom tread centers exactly on the footprint edge (runA + LD from
+ * entry) with its 0.16 m tread nose past it — absorbed by the 0.25 m
+ * host insets, but the reservation must name it or validators fence
+ * ghosts. Total width fits two legal flights.
  */
 function switchbackDims(stepCount: number, stepDepth: number): { width: number; depth: number } {
   const nA = Math.ceil(stepCount / 2)
   return {
     width: STAIR_WIDTH_SWITCHBACK,
-    depth: (nA - 1) * stepDepth + stepDepth * 1.15 / 2 + LANDING_DEPTH,
+    depth: nA * stepDepth + LANDING_DEPTH,
   }
 }
 
@@ -489,7 +581,7 @@ export function flightRectOf(x: number, z: number, width: number, depth: number,
 // Top-landing rect (world) for arrival checks: straight flights land at
 // the +dir end, switchbacks fold back and land near the -dir end on the
 // return flight (computed from the step math, not guessed).
-export function landingRectOf(plan: Pick<StairPlan, 'x' | 'z' | 'width' | 'depth' | 'axis' | 'dir' | 'switchback' | 'stepCount' | 'stepDepth'>): Rect2D {
+export function landingRectOf(plan: Pick<StairPlan, 'x' | 'z' | 'width' | 'depth' | 'axis' | 'dir' | 'switchback' | 'stepCount' | 'stepDepth' | 'stepHeight'>): Rect2D {
   if (!plan.switchback) {
     const topSign = plan.dir > 0 ? 1 : -1
     const landLen = LANDING_DEPTH
@@ -525,6 +617,26 @@ function recordPlan(st: StairPlanner, plan: StairPlan): void {
   if (upper) {
     const arrival = rectIntersection(placed, roomRect(upper))
     if (arrival) st.atFloor(st.floorHoles, upper.floorIndex).push(arrival)
+  }
+  // Tower shaft mouths join the door map IMMEDIATELY (not post-hoc):
+  // later links' doorway checks (stairBlocksDoor, entry zones, parapet
+  // rules) must see tower mouths, or they will park flights across them
+  // and seal the shaft. Same record the old mergeTowerDoors wrote, at the
+  // moment it becomes knowable. Deterministic (link order is fixed).
+  // Width is one flight width (entry half), NOT the gate setting: the
+  // mouth serves flight A only (see tryTowerPlan), and a full-setting
+  // hole would reintroduce the jamb-clip the aligned door just fixed.
+  if (plan.kind === 'tower' && plan.towerDoor) {
+    const list = st.doorsByRoom.get(plan.hostRoomId) ?? []
+    list.push({
+      roomId: plan.hostRoomId,
+      wallIndex: plan.towerDoor.wallIndex,
+      position: { x: plan.towerDoor.x, y: host.position.y + 0.1, z: plan.towerDoor.z },
+      width: plan.width / 2,
+      height: st.gateHeight,
+      targetRoomId: plan.link.upperRoomId,
+    })
+    st.doorsByRoom.set(plan.hostRoomId, list)
   }
 }
 
@@ -699,8 +811,8 @@ function tryInRoomPlan(
         // straddle the upper room's walls (stuck landing), nor sit under a
         // slab (checked above for the flight; rechecked for the exit here).
         {
-          const landing = landingRectOf({ x: cx, z: cz, width, depth, axis, dir, switchback, stepCount: st.stepCount, stepDepth: st.stepDepth })
-          if (!checkUpperArrival(rect, landing, upper, upperSlabs, st)) {
+          const landing = landingRectOf({ x: cx, z: cz, width, depth, axis, dir, switchback, stepCount: st.stepCount, stepDepth: st.stepDepth, stepHeight: st.stepHeight })
+          if (!checkUpperArrival({ x: cx, z: cz, width, depth, axis, dir, switchback, stepCount: st.stepCount, stepDepth: st.stepDepth, stepHeight: st.stepHeight }, rect, landing, upper, upperSlabs, st)) {
             noteRejection(st, 'no-arrival-overlap')
             continue
           }
@@ -796,7 +908,6 @@ function tryTowerPlan(
   })
 
   const doors = st.doorsByRoom.get(host.id) ?? []
-  const hostSlabs = st.slabsByFloor.get(hostFloor) ?? []
   const upperSlabs = st.slabsByFloor.get(upperFloor) ?? []
 
   let best: StairPlan | null = null
@@ -852,15 +963,24 @@ function tryTowerPlan(
         continue
       }
 
-      // c. Clear of host-floor corridor slabs.
-      for (const s of hostSlabs) {
-        if (rectsOverlap(rect, s, 0.3)) {
-          blocked = true
-          break
+      // c. Clear of corridor ribbons, walls, and gate threads on the
+      // host floor — exact capsule test (subsumes the old slab-rect
+      // check: capsules cover the same slabs plus side walls and gate
+      // approach volumes, which rects miss). A shaft inside a capsule
+      // seals gates or squeezes walkways below body clearance. Capsule
+      // radii already reserve ribbon + walls + margin; the tower adds
+      // its own wall half (0.15) so shaft faces never touch them.
+      {
+        const caps = st.corridorCapsulesByFloor.get(hostFloor) ?? []
+        for (const cap of caps) {
+          if (capsuleRectOverlap(cap.ax, cap.az, cap.bx, cap.bz, cap.halfWidth + 0.15, rect)) {
+            blocked = true
+            break
+          }
         }
       }
       if (blocked) {
-        noteRejection(st, 'tower-hits-corridor')
+        noteRejection(st, 'tower-hits-corridor-capsule')
         continue
       }
 
@@ -924,6 +1044,37 @@ function tryTowerPlan(
         continue
       }
 
+      // g2. The tower's own mouth must open onto open room — not onto an
+      // earlier in-room flight (links plan in critical order; an inroom
+      // flight parked across this shaft's future doorway would seal it,
+      // and the shaft rect itself (outside the wall) cannot see that).
+      // Door geometry mirrors the aligned mouth cut at selection time.
+      {
+        const flightW = width / 2
+        const doorLat = wallC + c - flightW / 2 + 0.05
+        const doorPos = side.axis === 'x'
+          ? { x: wallPlane, z: doorLat }
+          : { x: doorLat, z: wallPlane }
+        const zone = doorWalkZone({
+          roomId: host.id,
+          wallIndex: side.wallIndex,
+          position: { x: doorPos.x, y: 0, z: doorPos.z },
+          width: flightW,
+          height: st.gateHeight,
+          targetRoomId: link.upperRoomId,
+        })
+        for (const f of st.atFloor(st.footprints, hostFloor)) {
+          if (rectsOverlap(zone, f, 0)) {
+            blocked = true
+            break
+          }
+        }
+      }
+      if (blocked) {
+        noteRejection(st, 'tower-door-blocked-by-stair')
+        continue
+      }
+
       // h. Folded flight inside the tower + upper arrival rules.
       const flightX = side.axis === 'x' ? wallPlane + side.sign * (0.3 + depth / 2) : wallC + c
       const flightZ = side.axis === 'x' ? wallC + c : wallPlane + side.sign * (0.3 + depth / 2)
@@ -932,8 +1083,8 @@ function tryTowerPlan(
         noteRejection(st, 'tower-flight-outside')
         continue
       }
-      const landing = landingRectOf({ x: flightX, z: flightZ, width, depth, axis: side.axis, dir: side.sign, switchback: true, stepCount: st.stepCount, stepDepth: st.stepDepth })
-      if (!checkUpperArrival(flight, landing, upper, upperSlabs, st)) {
+      const landing = landingRectOf({ x: flightX, z: flightZ, width, depth, axis: side.axis, dir: side.sign, switchback: true, stepCount: st.stepCount, stepDepth: st.stepDepth, stepHeight: st.stepHeight })
+      if (!checkUpperArrival({ x: flightX, z: flightZ, width, depth, axis: side.axis, dir: side.sign, switchback: true, stepCount: st.stepCount, stepDepth: st.stepDepth, stepHeight: st.stepHeight }, flight, landing, upper, upperSlabs, st)) {
         noteRejection(st, 'tower-no-arrival-overlap')
         continue
       }
@@ -980,10 +1131,14 @@ function tryTowerPlan(
       const score = facing + Math.min(towerClear, 4) + Math.min(hostDoorClear, 3)
       if (score > bestScore) {
         bestScore = score
-        // Door center on the shared wall (mouth matches the shaft).
+        // Door center sits on FLIGHT A's centerline (entry half), nudged
+        // 5 cm toward middle so the hole edge never lands exactly coplanar
+        // with the shaft's inner wall face (vertical slit line).
+        const flightW = width / 2
+        const doorLat = wallC + c - flightW / 2 + 0.05
         const doorPos = side.axis === 'x'
-          ? { x: wallPlane, z: wallC + c }
-          : { x: wallC + c, z: wallPlane }
+          ? { x: wallPlane, z: doorLat }
+          : { x: doorLat, z: wallPlane }
         best = {
           link,
           hostRoomId: host.id,
@@ -1024,6 +1179,7 @@ function flightInsideTower(flight: Rect2D, tower: Rect2D): boolean {
 // FORBIDDEN). V0.1 has no roof-deck feature, so roof arrivals are
 // rejected and the planner tries the next candidate instead.
 function checkUpperArrival(
+  plan: Pick<StairPlan, 'x' | 'z' | 'width' | 'depth' | 'axis' | 'dir' | 'switchback' | 'stepCount' | 'stepDepth' | 'stepHeight'>,
   flight: Rect2D,
   landing: Rect2D,
   upper: Room,
@@ -1045,7 +1201,93 @@ function checkUpperArrival(
   for (const h of st.atFloor(st.floorHoles, upper.floorIndex)) {
     if (rectsOverlap(overlap, h, 0)) return false
   }
+  // Arrival wall-band rule (§45-46 headroom at the boundary): the HIGH
+  // part of the flight (walking surface within headroom of the upper
+  // floor) must not cross the upper room's boundary walls. Below, the
+  // flight ducks under the wall bottom with full headroom (legal); up
+  // high, the climber's head and chest are inside the wall band and no
+  // step-up can ever clear a full-height wall — every such arrival is an
+  // impassable stair (bot-proven: residual 3.9 = tall wall). Reject so
+  // the planner seats the arrival deeper inside (or fails honestly).
+  const wallT = SPATIAL_DEFAULTS.wallThickness
+  const bands: Rect2D[] = [
+    { minX: upper.position.x - upper.width / 2, maxX: upper.position.x + upper.width / 2, minZ: upper.position.z + upper.depth / 2 - wallT, maxZ: upper.position.z + upper.depth / 2 },
+    { minX: upper.position.x - upper.width / 2, maxX: upper.position.x + upper.width / 2, minZ: upper.position.z - upper.depth / 2, maxZ: upper.position.z - upper.depth / 2 + wallT },
+    { minX: upper.position.x - upper.width / 2, maxX: upper.position.x - upper.width / 2 + wallT, minZ: upper.position.z - upper.depth / 2, maxZ: upper.position.z + upper.depth / 2 },
+    { minX: upper.position.x + upper.width / 2 - wallT, maxX: upper.position.x + upper.width / 2, minZ: upper.position.z - upper.depth / 2, maxZ: upper.position.z + upper.depth / 2 },
+  ]
+  for (const high of flightHighRects(plan)) {
+    for (const band of bands) {
+      if (rectsOverlap(high, band, 0.05)) {
+        noteRejection(st, 'arrival-near-upper-wall')
+        return false
+      }
+    }
+  }
   return true
+}
+
+/**
+ * Plan-space rects of a flight's HIGH zone (lawbook §45): every part
+ * whose walking surface sits within headroom below the upper floor —
+ * i.e. everywhere the climber's head is above the upper wall bottom, so
+ * a boundary wall there is a guaranteed block. Switchbacks: the B run
+ * (full rise, top 1.2 m of it near the top) + the arrival deck + the
+ * A-top tread when short floor heights push it into the head zone
+ * (nB risers < headroom: A-top surface above upperBase - headroom).
+ * Straight flights: the top 3.0 m of run (≈ top 1.86 m of rise at legal
+ * slopes — covers the head zone with margin). Shared with the arrival
+ * validator so planner and fence never disagree on the shape.
+ */
+export function flightHighRects(
+  plan: Pick<StairPlan, 'x' | 'z' | 'width' | 'depth' | 'axis' | 'dir' | 'switchback' | 'stepCount' | 'stepDepth' | 'stepHeight'>,
+): Rect2D[] {
+  // Centered canonical frame, EXACTLY like createSwitchbackStairsMesh:
+  // footprint canon [-depth/2, +depth/2], entry at -depth/2. dir mirrors
+  // to world (axis z: world z = plan.z + dir*canon, x = plan.x + across).
+  const halfW = plan.width / 2
+  const e0 = -plan.depth / 2
+  const toWorld = (canon: number, across: number): { x: number; z: number } =>
+    plan.axis === 'z'
+      ? { x: plan.x + across, z: plan.z + plan.dir * canon }
+      : { x: plan.x + plan.dir * canon, z: plan.z + across };
+  const rectOf = (canon0: number, canon1: number, across0: number, across1: number): Rect2D => {
+    const p0 = toWorld(canon0, across0)
+    const p1 = toWorld(canon1, across1)
+    // Axis-aligned by construction (axis run + perpendicular across).
+    return {
+      minX: Math.min(p0.x, p1.x),
+      maxX: Math.max(p0.x, p1.x),
+      minZ: Math.min(p0.z, p1.z),
+      maxZ: Math.max(p0.z, p1.z),
+    }
+  }
+  if (!plan.switchback) {
+    // Straight: top 3.0 m of the run (≈ top 1.86 m of rise at legal
+    // slopes — covers the head zone with margin), full flight width.
+    return [rectOf(plan.depth / 2 - 3.0, plan.depth / 2, -halfW, halfW)]
+  }
+  const nA = Math.ceil(plan.stepCount / 2)
+  const nB = plan.stepCount - nA
+  const runA = nA * plan.stepDepth
+  const out: Rect2D[] = []
+  // B run: every B tread incl. overhangs (bottom B0 at landing level is
+  // already head-high; tops reach the upper floor). B across half only.
+  const bLo = e0 + runA + LANDING_DEPTH - (nB - 1) * plan.stepDepth - plan.stepDepth * 0.575
+  const bHi = e0 + runA + LANDING_DEPTH + plan.stepDepth * 0.575
+  out.push(rectOf(bLo, bHi, 0, halfW))
+  // Arrival deck (full width, top-tread level, entry-side of B-top).
+  const topC = e0 + runA + LANDING_DEPTH - (nB - 1) * plan.stepDepth
+  out.push(rectOf(e0 - 0.05, topC + plan.stepDepth * 0.575, -halfW, halfW))
+  // A-top tread, but ONLY when short floor heights push it into the head
+  // zone (B run rises less than headroom: nB risers < 2.05 m of rise, so
+  // A-top surface sits above upperBase - headroom and its wall crossings
+  // trap heads too; tall floors duck under legally and stay allowed).
+  if (nB * plan.stepHeight < SPATIAL_DEFAULTS.stair.minHeadroom) {
+    const aTopC = e0 + (nA - 1) * plan.stepDepth
+    out.push(rectOf(aTopC - plan.stepDepth * 0.575, aTopC + plan.stepDepth * 0.575, -halfW, 0))
+  }
+  return out
 }
 
 export function buildStairsGeometry(plans: StairPlan[], rooms: Room[], floorHeight: number): StairsGeometry[] {
@@ -1141,23 +1383,36 @@ function createStairTower(
   const yMid = (yDown + yTop) / 2
   const yH = yTop - yDown
 
-  const floor = createBoxMesh(cx, FLOOR_THICKNESS / 2 - 0.004, cz, wX, FLOOR_THICKNESS, wZ, 1)
   const walls: MeshData[] = []
 
   // Outward unit (host -> far end) in world XZ.
   const ox = axis === 'x' ? dir : 0
   const oz = axis === 'z' ? dir : 0
 
+  // Seam overlap (lawbook §52, like corridor ribbons): shaft walls butt
+  // against the host wall outer face with zero overlap — a coplanar slit
+  // around the shaft mouth. Side walls and floor run SEAM past the wall
+  // plane INTO the host (beside the door hole, which is narrower than the
+  // shaft), burying the joint in solid; the far end stays exact (length
+  // grows by SEAM while the center shifts SEAM/2 inward, so far faces do
+  // not move). Floor overlap hides under the host slab (4 mm below it).
+  const SEAM = SPATIAL_DEFAULTS.wallThickness / 2
+
+  // Tower floor, extended inward (hidden under the host slab).
+  const floor = axis === 'x'
+    ? createBoxMesh(cx - ox * (SEAM / 2), FLOOR_THICKNESS / 2 - 0.004, cz, wX + SEAM, FLOOR_THICKNESS, wZ, 1)
+    : createBoxMesh(cx, FLOOR_THICKNESS / 2 - 0.004, cz - oz * (SEAM / 2), wX, FLOOR_THICKNESS, wZ + SEAM, 1)
+
   if (axis === 'x') {
-    // Side walls along X at both Z edges (inset inward).
+    // Side walls along X at both Z edges (inset inward), extended inward.
     for (const s of [-1, 1]) {
-      walls.push(createBoxMesh(cx, yMid, cz + s * (wZ / 2 - t / 2), wX, yH, t, 0))
+      walls.push(createBoxMesh(cx - ox * (SEAM / 2), yMid, cz + s * (wZ / 2 - t / 2), wX + SEAM, yH, t, 0))
     }
     // Far end wall (near end stays open toward the host door).
     walls.push(createBoxMesh(cx + ox * (wX / 2 - t / 2), yMid, cz, t, yH, wZ - 2 * t, 0))
   } else {
     for (const s of [-1, 1]) {
-      walls.push(createBoxMesh(cx + s * (wX / 2 - t / 2), yMid, cz, t, yH, wZ, 0))
+      walls.push(createBoxMesh(cx + s * (wX / 2 - t / 2), yMid, cz - oz * (SEAM / 2), t, yH, wZ + SEAM, 0))
     }
     walls.push(createBoxMesh(cx, yMid, cz + oz * (wZ / 2 - t / 2), wX - 2 * t, yH, t, 0))
   }
@@ -1330,6 +1585,11 @@ function createSwitchbackStairsMesh(
   const e0 = -depth / 2 // entry end (canonical frame; mirrored by dir below)
   const runA = nA * stepDepth
   const M = (alongCanon: number) => dir * alongCanon
+  const nB = stepCount - nA
+  // Top-tread center (canonical): flight B folds back from the landing and
+  // ends mid-footprint by design — the arrival DECK below bridges it to
+  // the footprint edge so the exit is walkable (never void, never lip).
+  const topC = e0 + runA + LANDING_DEPTH - (nB - 1) * stepDepth
 
   // Flight A (low): entry end ascending toward +canonical-along.
   for (let i = 0; i < nA; i++) {
@@ -1343,13 +1603,14 @@ function createSwitchbackStairsMesh(
   }
 
   // Turn landing (full width) at A's top, flush with its top tread.
+  // Extended 0.15 toward A: A's last tread otherwise ends 0.12 short of
+  // the landing, leaving a see-through slit at walking height.
   const landY = baseY + nA * stepHeight
-  const landC = M(e0 + runA + LANDING_DEPTH / 2)
-  landing.push(putBox(landC, landY - FLOOR_THICKNESS / 2, 0, LANDING_DEPTH, FLOOR_THICKNESS, width, 1))
+  const landC = M(e0 + runA + LANDING_DEPTH / 2 - 0.075)
+  landing.push(putBox(landC, landY - FLOOR_THICKNESS / 2, 0, LANDING_DEPTH + 0.15, FLOOR_THICKNESS, width, 1))
 
   // Flight B: back along -canonical-along from the landing to full height.
   // No riser on its top tread (0.2m lip to the upper floor, step-up-able).
-  const nB = stepCount - nA
   for (let j = 0; j < nB; j++) {
     const y = landY + j * stepHeight
     const along = M(e0 + runA + LANDING_DEPTH - j * stepDepth)
@@ -1359,13 +1620,34 @@ function createSwitchbackStairsMesh(
     }
   }
 
-  // Outer stringers following each flight.
+  // Arrival deck: flight B's top tread ends ~1.5 m inside the footprint
+  // (folded runs can't reach the edge — the landing's own length stands
+  // in the way), so without a deck the exit path is open air over a 4 m
+  // drop and the stair is decorative. The deck bridges top tread to
+  // footprint edge at tread level (+3 mm anti-flicker), 0.2 below the
+  // upper floor (step-up lip, like straight stair landings). Headroom
+  // underneath is safe by construction: the deck sits over flight A's
+  // LOWEST treads only (headroom there exceeds 2.6 m; proven in the
+  // design note — never extend this deck past B's top toward +canon).
+  // Walkable (lands in the `landing` array → walk collision + validator).
+  {
+    const totalHeight = stepCount * stepHeight
+    const deckTop = baseY + totalHeight + 0.003
+    const deckStart = e0 - 0.05
+    const deckEnd = topC + stepDepth * 0.575
+    const deckC = M((deckStart + deckEnd) / 2)
+    landing.push(putBox(deckC, deckTop - FLOOR_THICKNESS / 2, 0, deckEnd - deckStart, FLOOR_THICKNESS, width, 1))
+  }
+
+  // Outer stringers following each flight. NO middle beams: the earlier
+  // middle pair floated in the open well (one inside B's treads as a
+  // stripe, one hovering over flight A) and read as mystery slopes.
+  // Flights this narrow (1.2 m) cannot host a center divider either —
+  // the well stays honestly open.
   const beamW = 0.3
   const beamH = 0.3
   putBeam(M(e0), baseY, -flightW - beamW / 2, M(e0 + runA), landY, -flightW - beamW / 2, beamH, beamW)
-  putBeam(M(e0), baseY, beamW / 2, M(e0 + runA), landY, beamW / 2, beamH, beamW)
-  putBeam(M(e0 + runA + LANDING_DEPTH), landY, -beamW / 2, M(e0), landY + nB * stepHeight, -beamW / 2, beamH, beamW)
-  putBeam(M(e0 + runA + LANDING_DEPTH), landY, flightW + beamW / 2, M(e0), landY + nB * stepHeight, flightW + beamW / 2, beamH, beamW)
+  putBeam(M(e0 + runA + LANDING_DEPTH), landY, flightW + beamW / 2, M(topC + 0.1), landY + nB * stepHeight, flightW + beamW / 2, beamH, beamW)
 
   return { steps, risers, stringers, landing }
 }

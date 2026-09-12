@@ -1,4 +1,4 @@
-import type { LevelConfig, Room, Corridor, Boundary, DoorOpening, StairsGeometry } from '@/core/types'
+import type { LevelConfig, Room, Corridor, Boundary, DoorOpening, Rect2D, StairsGeometry } from '@/core/types'
 import { floorHeightFor, corridorHeightFor } from '@/core/types'
 import { SeededRandom, hashString } from '@/core/random'
 import { GENERATOR_VERSION, circulationGap, gateWidthFor, validateConfigFeasibility, SPATIAL_DEFAULTS } from '@/core/rules'
@@ -27,6 +27,7 @@ import {
   validateRoomAspects,
   validateRoomPlacement,
   validateSlabOpenings,
+  validateStairArrivalWalls,
   validateStairClipping,
   validateStairHeadroom,
   validateStairs,
@@ -281,6 +282,7 @@ function finishLayout(
 
   // Stage 7b: stairs with reserved slab holes.
   const corridorSlabs = collectCorridorSlabs(corridors)
+  const corridorCapsules = collectCorridorCapsules(corridors, rooms, doorOpenings)
   const corridorDegree = new Map<string, number>()
   for (const corridor of corridors) {
     corridorDegree.set(corridor.startRoomId, (corridorDegree.get(corridor.startRoomId) ?? 0) + 1)
@@ -289,12 +291,14 @@ function finishLayout(
   const quiet = true
   const stairPlans = planStairs(rooms, doorOpenings, {
     corridorSlabsByFloor: corridorSlabs,
+    corridorCapsulesByFloor: corridorCapsules,
     boundary,
     corridorDegree,
     floorHeight,
+    gateWidth: config.doorWidth,
+    gateHeight: config.doorHeight,
     quiet,
   })
-  mergeTowerDoors(rooms, doorOpenings, stairPlans, config)
   const slabHoles = computeSlabHoles(rooms, stairPlans)
 
   // Attempt score: layout-dependent hard errors — realized graph
@@ -305,9 +309,10 @@ function finishLayout(
   const attemptIssues: GenerationIssue[] = [
     ...validateRealizedConnectivity(rooms, corridors, stairPlans, config.floorCount),
     ...validatePortalSampling(rooms, doorOpenings, corridors, stairPlans),
-    ...validatePortalSeals(rooms, doorOpenings, corridors),
+    ...validatePortalSeals(rooms, doorOpenings, corridors, stairPlans),
     ...validateStairHeadroom(rooms, stairPlans, corridors),
     ...validateStairClipping(rooms, stairPlans),
+    ...validateStairArrivalWalls(rooms, stairPlans),
     ...validateCorridors(corridors, corridorHeightFor(config)),
     ...validateCorridorIntrusions(rooms, corridors),
     ...validateNavigationGrid(rooms, doorOpenings, corridors, stairPlans, floorHeight),
@@ -430,12 +435,13 @@ function pruneMonsterLinks(rooms: Room[]): void {
   issues.push(...validateDoors(rooms, doorOpenings))
   issues.push(...validatePortalCapacity(rooms, doorOpenings, config.doorWidth))
   issues.push(...validatePortalSampling(rooms, doorOpenings, corridors, stairPlans))
-  issues.push(...validatePortalSeals(rooms, doorOpenings, corridors))
+  issues.push(...validatePortalSeals(rooms, doorOpenings, corridors, stairPlans))
   issues.push(...validateCorridors(corridors, corridorHeight))
   issues.push(...validateCorridorIntrusions(rooms, corridors))
   issues.push(...validateStairs(stairPlans))
   issues.push(...validateStairHeadroom(rooms, stairPlans, corridors))
   issues.push(...validateStairClipping(rooms, stairPlans))
+  issues.push(...validateStairArrivalWalls(rooms, stairPlans))
   issues.push(...validateLinkLengths(rooms))
   issues.push(...validateSlabOpenings(rooms, stairPlans, slabHoles))
   issues.push(...validateStairsGeometry(stairs))
@@ -490,30 +496,86 @@ function collectCorridorSlabs(corridors: Corridor[]): Map<number, { minX: number
   return slabs
 }
 
-// Tower shaft mouths: door openings cut in the host wall where the shaft
-// attaches (mouth matches the shaft, like corridor mouths match corridors).
-// Gate dimensions come from settings so the player always fits.
-function mergeTowerDoors(
+// Corridor wall capsules per floor for stair planning (lawbook §56):
+// the exact centerline capsules the router reserves (ribbon + walls +
+// door approach volumes), so tower shafts keep body clearance from
+// corridor walls AND gate threads — rect slabs alone miss both (walls
+// stick out 0.3, threads stick out 0.8+). Same math as walk-mode
+// colliders and the seal validator: a site clear here is clear there.
+function collectCorridorCapsules(
+  corridors: Corridor[],
   rooms: Room[],
   doorOpenings: Map<string, DoorOpening[]>,
-  stairPlans: ReturnType<typeof planStairs>,
-  config: LevelConfig,
-): void {
-  const roomMap = new Map(rooms.map(r => [r.id, r]))
-  for (const plan of stairPlans) {
-    if (plan.kind !== 'tower' || !plan.towerDoor) continue
-    const host = roomMap.get(plan.hostRoomId)
-    const list = doorOpenings.get(plan.hostRoomId) ?? []
-    list.push({
-      roomId: plan.hostRoomId,
-      wallIndex: plan.towerDoor.wallIndex,
-      position: { x: plan.towerDoor.x, y: (host?.position.y ?? 0) + 0.1, z: plan.towerDoor.z },
-      width: config.doorWidth,
-      height: config.doorHeight,
-      targetRoomId: plan.link.upperRoomId,
-    })
-    doorOpenings.set(plan.hostRoomId, list)
+): Map<number, { ax: number; az: number; bx: number; bz: number; halfWidth: number }[]> {
+  const WALL_NORMALS = [
+    { x: 0, z: -1 }, { x: 1, z: 0 }, { x: 0, z: 1 }, { x: -1, z: 0 },
+  ]
+  const out = new Map<number, { ax: number; az: number; bx: number; bz: number; halfWidth: number }[]>()
+  const atFloor = (floor: number) => {
+    let list = out.get(floor)
+    if (!list) {
+      list = []
+      out.set(floor, list)
+    }
+    return list
   }
+  const wallT = SPATIAL_DEFAULTS.wallThickness
+  const corridorWidthOf = new Map<string, number>()
+  for (const c of corridors) {
+    corridorWidthOf.set([c.startRoomId, c.endRoomId].sort().join('|'), c.width)
+  }
+  for (const c of corridors) {
+    const pts = c.pathPoints && c.pathPoints.length > 0 ? c.pathPoints : [c.startPos, c.endPos]
+    const list = atFloor(c.floorIndex)
+    const halfWidth = c.width / 2 + 0.8
+    for (let i = 0; i < pts.length - 1; i++) {
+      const dx = pts[i + 1].x - pts[i].x
+      const dz = pts[i + 1].z - pts[i].z
+      if (dx * dx + dz * dz < 1e-8) continue
+      list.push({ ax: pts[i].x, az: pts[i].z, bx: pts[i + 1].x, bz: pts[i + 1].z, halfWidth })
+    }
+    // Side-wall capsules (exact ribbon walls): shaft sites must clear
+    // the walls themselves, not just the generous centerline margin.
+    const center = c.width / 2 + wallT / 2
+    for (let i = 0; i < pts.length - 1; i++) {
+      const dx = pts[i + 1].x - pts[i].x
+      const dz = pts[i + 1].z - pts[i].z
+      const len = Math.sqrt(dx * dx + dz * dz)
+      if (len < 1e-6) continue
+      const ux = dx / len
+      const uz = dz / len
+      for (const side of [1, -1]) {
+        const nx = -uz * side
+        const nz = ux * side
+        list.push({
+          ax: pts[i].x + nx * center, az: pts[i].z + nz * center,
+          bx: pts[i + 1].x + nx * center, bz: pts[i + 1].z + nz * center,
+          halfWidth: wallT / 2,
+        })
+      }
+    }
+  }
+  // Door approach volumes (gate thread ±0.8 m + ribbon + seal margin):
+  // shafts park in the apron outside gates, across threads the slab
+  // rects never cover. Width follows the corridor that owns the gate
+  // (pinned mouth record), falling back to the gate width.
+  const roomMap = new Map(rooms.map(r => [r.id, r]))
+  for (const [roomId, doors] of doorOpenings) {
+    const room = roomMap.get(roomId)
+    if (!room) continue
+    const list = atFloor(room.floorIndex)
+    for (const d of doors) {
+      const n = WALL_NORMALS[d.wallIndex] ?? WALL_NORMALS[0]
+      const cw = corridorWidthOf.get([roomId, d.targetRoomId].sort().join('|')) ?? d.width
+      const halfWidth = cw / 2 + wallT + 0.55
+      list.push({
+        ax: d.position.x - n.x * 0.8, az: d.position.z - n.z * 0.8,
+        bx: d.position.x + n.x * 0.8, bz: d.position.z + n.z * 0.8,
+        halfWidth,
+      })
+    }
+  }
+  return out
 }
 
 // Stairwell holes: in-room stairs pierce the host ceiling above the flight;
@@ -536,14 +598,27 @@ function computeSlabHoles(
   const overlaps = (a: ReturnType<typeof roomRect>, b: ReturnType<typeof roomRect>) =>
     a.minX < b.maxX && a.maxX > b.minX && a.minZ < b.maxZ && a.maxZ > b.minZ
 
-  const put = (roomId: string, patch: RoomSlabHoles) => {
-    holes.set(roomId, { ...holes.get(roomId), ...patch })
+  const put = (roomId: string, patch: { floor?: Rect2D; ceiling?: Rect2D }) => {
+    let entry = holes.get(roomId)
+    if (!entry) {
+      entry = { floor: [], ceiling: [] }
+      holes.set(roomId, entry)
+    }
+    // APPEND, never overwrite: one hub routinely hosts several stairs and
+    // every flight needs its own opening (overwrite dropped all but the
+    // last, leaving flights to pierce intact slabs).
+    if (patch.floor) entry.floor.push(patch.floor)
+    if (patch.ceiling) entry.ceiling.push(patch.ceiling)
   }
 
   for (const plan of stairPlans) {
     const lower = roomMap.get(plan.link.lowerRoomId)!
     const upper = roomMap.get(plan.link.upperRoomId)!
     if (!lower || !upper) continue
+    if (process.env.LW_HOLE_DEBUG === '1') {
+      console.log(`[hole] plan ${plan.link.lowerRoomId}->${plan.link.upperRoomId} kind=${plan.kind} x=${plan.x.toFixed(2)} z=${plan.z.toFixed(2)} w=${plan.width} d=${plan.depth} axis=${plan.axis}`)
+      console.log(`[hole]   lower @(${lower.position.x.toFixed(2)},${lower.position.z.toFixed(2)}) upper @(${upper.position.x.toFixed(2)},${upper.position.z.toFixed(2)}) ${upper.width.toFixed(1)}x${upper.depth.toFixed(1)}`)
+    }
 
     const halfW = (plan.axis === 'z' ? plan.width : plan.depth) / 2
     const halfD = (plan.axis === 'z' ? plan.depth : plan.width) / 2
@@ -575,6 +650,9 @@ function computeSlabHoles(
           maxZ: Math.min(world.maxZ, upper.position.z + upper.depth / 2) - upper.position.z,
         },
       })
+      if (process.env.LW_HOLE_DEBUG === '1') console.log(`[hole]   floor hole cut in ${upper.id}`)
+    } else if (process.env.LW_HOLE_DEBUG === '1') {
+      console.log(`[hole]   NO overlap: world [${world.minX.toFixed(1)},${world.maxX.toFixed(1)}]x[${world.minZ.toFixed(1)},${world.maxZ.toFixed(1)}] vs upper [${roomRect(upper).minX.toFixed(1)},${roomRect(upper).maxX.toFixed(1)}]x[${roomRect(upper).minZ.toFixed(1)},${roomRect(upper).maxZ.toFixed(1)}]`)
     }
   }
 

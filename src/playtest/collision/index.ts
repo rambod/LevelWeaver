@@ -128,6 +128,33 @@ export function checkPlayerCollision(
   return false
 }
 
+// Boxes engaged by a body column (the exact box half of the predicate
+// above, factored out for step-up analysis). Identity-stable: same array,
+// same refs, so set differences across two probes are meaningful.
+export function engagedBoxes(
+  position: THREE.Vector3,
+  boxes: THREE.Box3[],
+  playerRadius = 0.4,
+  playerHeight = 1.8,
+): THREE.Box3[] {
+  const playerBottom = position.y - playerHeight
+  const playerTop = position.y
+  const out: THREE.Box3[] = []
+  for (const box of boxes) {
+    if (
+      position.x > box.min.x - playerRadius &&
+      position.x < box.max.x + playerRadius &&
+      position.z > box.min.z - playerRadius &&
+      position.z < box.max.z + playerRadius &&
+      playerTop > box.min.y &&
+      playerBottom < box.max.y - PLAYER_GROUND_EPS
+    ) {
+      out.push(box)
+    }
+  }
+  return out
+}
+
 // Snapshot world-space boxes for a set of meshes. Call once per level
 // generation (not per frame) and reuse the result in the walk loop.
 export function snapshotCollisionBoxes(meshes: THREE.Mesh[]): THREE.Box3[] {
