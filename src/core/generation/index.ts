@@ -578,6 +578,15 @@ function collectCorridorCapsules(
   return out
 }
 
+// Browser-safe env check: `process` does not exist in Vite browser builds,
+// so a bare `process.env.X` throws `ReferenceError: process is not defined`
+// and breaks level generation. Read through globalThis instead (no @types/node needed).
+function isHoleDebug(): boolean {
+  return (
+    (globalThis as unknown as { process?: { env?: Record<string, string | undefined> } })
+      .process?.env?.LW_HOLE_DEBUG === '1'
+  )
+}
 // Stairwell holes: in-room stairs pierce the host ceiling above the flight;
 // tower stairs stand outside (host ceiling stays intact). The upper room
 // gets a floor hole where the flight overlaps it, so the landing genuinely
@@ -615,7 +624,7 @@ function computeSlabHoles(
     const lower = roomMap.get(plan.link.lowerRoomId)!
     const upper = roomMap.get(plan.link.upperRoomId)!
     if (!lower || !upper) continue
-    if (process.env.LW_HOLE_DEBUG === '1') {
+    if (isHoleDebug()) {
       console.log(`[hole] plan ${plan.link.lowerRoomId}->${plan.link.upperRoomId} kind=${plan.kind} x=${plan.x.toFixed(2)} z=${plan.z.toFixed(2)} w=${plan.width} d=${plan.depth} axis=${plan.axis}`)
       console.log(`[hole]   lower @(${lower.position.x.toFixed(2)},${lower.position.z.toFixed(2)}) upper @(${upper.position.x.toFixed(2)},${upper.position.z.toFixed(2)}) ${upper.width.toFixed(1)}x${upper.depth.toFixed(1)}`)
     }
@@ -650,8 +659,8 @@ function computeSlabHoles(
           maxZ: Math.min(world.maxZ, upper.position.z + upper.depth / 2) - upper.position.z,
         },
       })
-      if (process.env.LW_HOLE_DEBUG === '1') console.log(`[hole]   floor hole cut in ${upper.id}`)
-    } else if (process.env.LW_HOLE_DEBUG === '1') {
+      if (isHoleDebug()) console.log(`[hole]   floor hole cut in ${upper.id}`)
+    } else if (isHoleDebug()) {
       console.log(`[hole]   NO overlap: world [${world.minX.toFixed(1)},${world.maxX.toFixed(1)}]x[${world.minZ.toFixed(1)},${world.maxZ.toFixed(1)}] vs upper [${roomRect(upper).minX.toFixed(1)},${roomRect(upper).maxX.toFixed(1)}]x[${roomRect(upper).minZ.toFixed(1)},${roomRect(upper).maxZ.toFixed(1)}]`)
     }
   }
