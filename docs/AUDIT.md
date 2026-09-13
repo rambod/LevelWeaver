@@ -43,7 +43,7 @@ runtime dependency was introduced.
 | Export theme/filename could disagree with the displayed artifact | Keep theme changes in the artifact's configuration; capture the artifact for asynchronous export and use its seed for the filename. Include seed, units, generator version and configuration in GLB scene extras. |
 | Temporary export geometries and materials were never disposed | Release resources on both exporter success and failure. |
 | Blob URLs were revoked immediately after clicking an unattached link | Attach the download link, remove it after clicking, and defer URL release. Automated regression verifies the lifetime; browser download completion remains unverified. |
-| Regenerate, Random Seed and preset selection bypassed generation error handling | Route all actions through one UI wrapper and consistent store failure state. Failed generation preserves the prior artifact. Successful scene replacement exits walk mode. |
+| Regenerate, Random Seed and preset selection bypassed generation error handling | Route all actions through one UI wrapper and consistent store failure state. Rejected configurations preserve the prior artifact with an alert; diagnostic candidates (`ok: false`) replace the preview with visible validation errors and cannot export. Successful scene replacement exits walk mode. |
 | Vite/esbuild dependency advisories | Updated Vite from 5.4.21 to 6.4.3 and retained compatible Vue plugin 5.2.4. `npm audit` reports zero vulnerabilities. |
 
 The Vite update uses the nearest patched major supported by the existing plugin.
@@ -97,3 +97,27 @@ the application was exploited.
 Stricter input/portal checks and corrected winding intentionally change acceptance
 and some geometry/layout results. Seeds must be reproduced with the same generator
 version; **0.1.3 and 0.1.4 are not interchangeable**.
+
+## Follow-up review (2026-09-13, generator version unchanged: **0.1.4**)
+
+Re-checked this audit against the implementation. `npm test` (13 passing),
+`npm run test:seeds` (32 passing), `npm audit` (zero vulnerabilities), and the
+Vite bundle size (~721 kB / ~202 kB gzip) all still match this document, and the
+DPLAN reference link resolves. Four corrections were made; none changes
+generation output or validation acceptance, so `GENERATOR_VERSION` stays 0.1.4:
+
+- `npm run build` typechecking had regressed: `tests/regressions.test.ts` passed
+  an `Error` where `@types/three` declares the exporter error callback as
+  `ErrorEvent` (the Three.js runtime rejects with `Error`). The test now casts,
+  and `exportGLB` preserves a rejection `.message` before falling back to
+  `String(error)`. Full `npm run build` passes again.
+- Form bounds were narrower than the lawbook §0 envelope they claimed to
+  expose: Rooms minimum 4 (runtime: 2), Dead Ends maximum 0.5 (runtime: 1.0),
+  Seed maximum 999999 (runtime: u32), Corridor/Gate minimum 1.0 m (runtime:
+  0.80 m agent minimum). Widened to the envelope; envelope endpoints are now
+  asserted in the existing configuration regression test (still 13 tests).
+- Failure wording distinguished: rejected configurations preserve the prior
+  artifact; diagnostic candidates (`ok: false`) replace the preview with
+  visible errors and cannot export (lawbook §0 contract and the table above).
+- `README.md` project map now lists all `src/core` modules and the actual
+  `src/generator` stage directories.

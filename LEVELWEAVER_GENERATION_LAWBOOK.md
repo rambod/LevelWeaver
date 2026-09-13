@@ -52,8 +52,11 @@ not waive physical, traversal, or export requirements.
   normals and UVs, consistent attribute lengths, valid triangle indices, and
   triangle winding consistent with surface normals.
   Empty optional cut fragments are permitted; playable floors cannot be empty.
-- Editable parameters are pending inputs. Failed generation preserves the previous
-  artifact. Export names and metadata use that artifact's seed/config/version.
+- Editable parameters are pending inputs. A configuration rejected before spatial
+  work throws a descriptive error and preserves the previous artifact. A bounded
+  search that exhausts its repairs may instead return a diagnostic candidate
+  (`ok: false`) for inspection with visible failure status; it cannot export.
+  Export names and metadata use that artifact's seed/config/version.
   Theme changes are material-only and must remain consistent in preview/export.
 - `src/core/rules` owns runtime dimensions; `src/core/presets` owns product defaults.
   For example, runtime walls are 0.30 m and default floor spacing is wall height

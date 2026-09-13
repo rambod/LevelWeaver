@@ -49,9 +49,9 @@ not produced another map.
 
 | Location | Responsibility |
 | --- | --- |
-| `src/core/types`, `rules`, `random` | Canonical data, limits, dimensions, seeded RNG |
+| `src/core/types`, `rules`, `presets`, `random`, `levelGraph`, `meshdata` | Canonical data, limits, defaults, seeded RNG, graph helpers, mesh types |
 | `src/core/generation` | Generation orchestration and bounded retries |
-| `src/generator` | Boundary, topology, room placement, corridors, stairs, geometry |
+| `src/generator` | Boundary, topology, rooms, placement, corridors, vertical (stairs), geometry |
 | `src/core/validation` | Structured geometry and traversal findings |
 | `src/renderer` | Three.js preview and resource ownership |
 | `src/playtest` | Movement and collision |

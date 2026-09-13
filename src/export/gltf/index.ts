@@ -145,7 +145,13 @@ export async function exportGLB(level: GeneratedLevel): Promise<Blob> {
             }
           },
           (error) => {
-            reject(error instanceof Error ? error : new Error(String(error)))
+            // @types/three declares this callback as ErrorEvent, but the
+            // runtime rejects with an Error. Preserve the original error
+            // when possible; fall back to its message before String().
+            if (error instanceof Error) reject(error)
+            else if (error && typeof (error as ErrorEvent).message === 'string' && (error as ErrorEvent).message)
+              reject(new Error((error as ErrorEvent).message))
+            else reject(new Error(String(error)))
           },
           { binary: true },
         )

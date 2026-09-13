@@ -39,6 +39,18 @@ test('configuration enforces counts, ranges, enums and bounded workloads', () =>
     assert.ok(validateConfigFeasibility({ ...base, ...fields } as LevelConfig).length, JSON.stringify(fields))
   }
   assert.deepEqual(validateConfigFeasibility(base), [])
+  // Lawbook §0 envelope endpoints the UI exposes must stay accepted:
+  // minimum room count (with largeRoomCount refitted), full dead-end
+  // range, agent-minimum corridor/gate widths, and u32 seed maximum.
+  for (const fields of [
+    { roomCount: 2, largeRoomCount: 0 },
+    { deadEnds: 1 },
+    { corridorWidth: 0.8, doorWidth: 0.8 },
+    { doorWidth: 0.8 },
+    { seed: 4294967295 },
+  ]) {
+    assert.deepEqual(validateConfigFeasibility({ ...base, ...fields } as LevelConfig), [], JSON.stringify(fields))
+  }
 })
 
 test('stair math rejects non-finite treads and preserves legal rise', () => {
@@ -167,7 +179,11 @@ test('export releases temporary resources on success and failure', async (t) => 
       }))
       materials = seen.size
       for (const m of seen) m.addEventListener('dispose', () => disposedMaterials++)
-      if (fail) error(new Error('simulated exporter failure'))
+      // The runtime rejects with an Error, but @types/three declares the
+      // exporter error callback as (error: ErrorEvent) => void. Cast keeps
+      // the runtime value (so `instanceof Error` still matches) while
+      // satisfying `npm run build` typechecking.
+      if (fail) error(new Error('simulated exporter failure') as unknown as ErrorEvent)
       else done(new ArrayBuffer(4))
     }
     const patch = t.mock.method(GLTFExporter.prototype, 'parse', parse)
