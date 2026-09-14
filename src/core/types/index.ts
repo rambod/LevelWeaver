@@ -31,6 +31,13 @@ export interface Room {
   floorIndex: number
   materialTheme: string
   connections: string[]
+  /**
+   * True for junction-plaza rooms inserted where two corridors cross
+   * (lawbook §34-35: explicit shared endpoints instead of blind
+   * pass-throughs). Junctions are ordinary traversable rooms; the flag
+   * only distinguishes them from requested roomCount in statistics.
+   */
+  junction?: boolean
 }
 
 export interface Corridor {

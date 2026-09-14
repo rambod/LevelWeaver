@@ -12,7 +12,15 @@ for (const preset of Object.keys(presets)) {
       const level = generateLevel(config)
       assert.deepEqual(config, original, 'generation must not mutate inputs')
       assert.deepEqual(generateLevel(config), level)
-      assert.equal(level.rooms.length, config.roomCount)
+      // Requested rooms plus explicitly-tagged junction plazas (§34-35):
+      // junctions join two former pairs (4 trunk links); subdivision hops
+      // may add more links through the plaza, never fewer.
+      const requested = level.rooms.filter(r => !r.junction)
+      const junctions = level.rooms.filter(r => r.junction)
+      assert.equal(requested.length, config.roomCount)
+      for (const j of junctions) {
+        assert.ok(j.connections.length >= 4, `${j.id} joins two pairs`)
+      }
       assert.deepEqual(validateExportModel(level), [])
       assert.equal(level.ok, level.validation.errors.length === 0)
       assert.equal(level.ok, true, 'known-good seed must remain valid')

@@ -1,6 +1,6 @@
 # Documentation and code audit
 
-Date: 2026-09-13. Generator version after fixes: **0.1.6**.
+Date: 2026-09-13. Generator version after fixes: **0.1.7**.
 
 ## Scope and method
 
@@ -261,3 +261,59 @@ planar routing without junction objects (seals/crossings in the dozens);
 ring-band monsters and miter-joint wall spikes are unmodeled by the
 capsule math; in-room stair arrivals avoid but cannot cut corridor slabs;
 full vertical-before-circulation co-design stays future work.
+
+## Open-gaps pass (2026-09-13, generator version **0.1.6 → 0.1.7**)
+
+Closed the remaining structural gaps that measurements could pin to a
+mechanism, with a router foul-provenance census (temporary, removed
+afterwards) guiding each fix. Outputs change only on previously-failing
+seeds — every repair is gated so clean layouts never change — but the
+version still bumps per `AGENTS.md`.
+
+Topology:
+
+- Ring/cross intent chords that span infeasible voids (courtyard hole,
+  inter-arm corners) are born unroutable. Tree, extras, and same-floor
+  merges now prefer hole-clear pairs (chord sampled against the boundary
+  shape) with unfiltered fallback, so connectivity guarantees hold.
+  Chords of convex shapes never leave the shape: identical pools and RNG
+  streams there, provably zero churn. Two of three ring-dense failures
+  fixed at the source.
+
+Junctions (lawbook §34-35, the crossing fix):
+
+- `findCorridorCrossings` (shared with the validator, identical verdicts)
+  also reports the first proper X-crossing point; near-miss brushes stay
+  errors but are not junction candidates.
+- `planJunctions` converts up to 3 crossing pairs per layout into explicit
+  plaza rooms (sized for one gate per wall, checked against boundary,
+  rooms, and tower shafts): blind intent edges are removed, all four ends
+  rewired through the plaza, and only the stubs re-route — kept corridors
+  stay byte-identical via prebuilt seeding (paths, mouths, doors).
+  Removed pairs are forbidden from resurrecting as subdivision hops, and
+  hop search prefers plazas (validator-skipped shared endpoints).
+- Best-of-two adoption: the repair only lands on strictly better tiers.
+  The third ring-dense failure now resolves through a live plaza; the
+  32-case matrix is untouched (no crossings there).
+
+Stairs:
+
+- Tower planning now mirrors the seal validator in both directions:
+  shaft walls vs every gate thread (validator-exact segments), and the
+  shaft mouth thread vs exact corridor wall volumes. Capsule avoidance
+  alone missed the 0.6-1.15 m thread band; walk-zone checks alone missed
+  corridor walls. Proven gap closed by construction, not by tuning.
+
+Verification: `npm test` **22/22** (2 new: white-box plaza conversion
+plus the ring/40448 integration pin), `npm run build` green,
+`npm run test:seeds` **32/32** (junction-aware room count), `npm audit`
+clean, 130-generation sweep 127/130 (97.7%) with zero nondeterminism.
+Residual failures are dense-map corridor fouls (60-room, warehouse-class
+singles) that fail honestly with named codes. Seeds reproduce only on the
+same version; 0.1.6 ≠ 0.1.7 outputs on previously-failing seeds.
+
+Still open (no measured mechanism, architectural): junction absorption of
+third ribbons through a plaza spot (vetoed, stays reported), miter-joint
+wall spikes beyond capsule math, in-room arrivals vs corridor slabs, full
+vertical-first co-design, and systematic 100-room single-floor
+over-constraint without junctions at that density.

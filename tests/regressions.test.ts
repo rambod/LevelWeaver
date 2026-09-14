@@ -4,7 +4,7 @@ import * as THREE from 'three'
 import { GLTFExporter } from 'three/examples/jsm/exporters/GLTFExporter.js'
 import { getDefaultConfig, pickWeightedRoomType, presets } from '../src/core/presets'
 import { validateConfigFeasibility, stairMathFor } from '../src/core/rules'
-import { validateExportModel, validateDoors, validateNavigationGrid } from '../src/core/validation'
+import { validateExportModel, validateDoors, validateNavigationGrid, findCorridorCrossings } from '../src/core/validation'
 import { LevelScene } from '../src/renderer/scene'
 import { exportGLB, levelFilename, downloadGLB } from '../src/export/gltf'
 import { useLevelStore } from '../src/stores/level'
@@ -16,7 +16,7 @@ import { generateCorridors } from '../src/generator/corridors'
 import { generateTopology, topUpDegrees } from '../src/generator/topology'
 import { assignRoomSizes } from '../src/generator/rooms'
 import { planStairs, towerMouthWidthFor } from '../src/generator/vertical'
-import { omittedStairIssues } from '../src/core/generation'
+import { omittedStairIssues, planJunctions, generateLevel } from '../src/core/generation'
 import { SeededRandom } from '../src/core/random'
 
 test('configuration rejects non-finite numbers before spatial arithmetic', () => {
@@ -452,4 +452,65 @@ test('narrow-but-legal corridors stay reachable on the navigation grid', () => {
   // Negative control: without the corridor the far room is unreachable.
   const stranded = validateNavigationGrid(rooms, new Map(), [], [], 4)
   assert.ok(stranded.some(i => i.code === 'NAV_UNREACHABLE_ROOM' && i.objectIds.includes('b')))
+})
+
+test('junction repair converts crossings into shared plazas', () => {
+  // Lawbook §34-35. Hand-built X-crossing (deterministic, no seed): two
+  // straight corridors crossing at the origin with clear surroundings.
+  const mkRoom = (id: string, x: number, z: number, conns: string[]): Room => ({
+    id, type: 'standard', position: { x, y: 0, z }, width: 6, depth: 6,
+    height: 3.5, floorIndex: 0, materialTheme: 'greybox', connections: conns,
+  })
+  const rooms = [
+    mkRoom('a', -10, 0, ['b']), mkRoom('b', 10, 0, ['a']),
+    mkRoom('c', 0, -10, ['d']), mkRoom('d', 0, 10, ['c']),
+  ]
+  const mkCorr = (id: string, s: string, e: string, x1: number, z1: number, x2: number, z2: number): Corridor => ({
+    id, startRoomId: s, endRoomId: e,
+    startPos: { x: x1, y: 0, z: z1 }, endPos: { x: x2, y: 0, z: z2 },
+    width: 2, floorIndex: 0,
+    pathPoints: [{ x: x1, y: 0, z: z1 }, { x: x2, y: 0, z: z2 }],
+  })
+  const corridors = [
+    mkCorr('corridor_a_b', 'a', 'b', -7, 0, 7, 0),
+    mkCorr('corridor_c_d', 'c', 'd', 0, -7, 0, 7),
+  ]
+  assert.equal(findCorridorCrossings(corridors).length, 1)
+  const config = { ...getDefaultConfig(), roomCount: 4, floorCount: 1 }
+  const boundary = { shape: 'square' as const, width: 60, depth: 60, center: { x: 0, y: 0 } }
+  const out = planJunctions(rooms, corridors, config, boundary, 4, [])
+  assert.ok(out, 'placeable X-crossing must junction')
+  assert.equal(out.rooms.length, 5)
+  const j = out.rooms.find(r => r.junction)!
+  assert.equal(j.type, 'connector')
+  assert.equal(j.connections.length, 4)
+  const byId = new Map(out.rooms.map(r => [r.id, r]))
+  assert.ok(!byId.get('a')!.connections.includes('b'), 'blind intent removed')
+  assert.ok(!byId.get('c')!.connections.includes('d'), 'blind intent removed')
+  for (const e of ['a', 'b', 'c', 'd']) {
+    assert.ok(byId.get(e)!.connections.includes(j.id), `${e} joins the plaza`)
+  }
+  // Every remaining crossing shares the plaza (recorded junction): the
+  // validator honors shared endpoints without code changes.
+  for (const x of findCorridorCrossings(out.corridors)) {
+    const shared =
+      x.a.startRoomId === j.id || x.a.endRoomId === j.id ||
+      x.b.startRoomId === j.id || x.b.endRoomId === j.id
+    assert.ok(shared, `${x.a.id} x ${x.b.id} shares the plaza`)
+  }
+})
+
+test('ring crossing seed resolves through a junction plaza', () => {
+  // Full generation regression (config + seed recorded): ring/40448
+  // failed with a lone CORRIDOR_CROSSING before junction repair.
+  // (~2-3 s: ring band routing is expensive.)
+  const config = {
+    ...getDefaultConfig(),
+    roomCount: 24, floorCount: 2, area: 6000, shape: 'ring' as const,
+    largeRoomCount: 2, seed: 40448,
+  }
+  const level = generateLevel(config)
+  assert.equal(level.ok, true)
+  assert.ok(level.rooms.some(r => r.junction), 'plaza recorded')
+  assert.ok(!level.validation.errors.some(i => i.code === 'CORRIDOR_CROSSING'))
 })

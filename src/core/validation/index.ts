@@ -511,6 +511,84 @@ export function validateCorridors(corridors: Corridor[], corridorClearHeight?: n
  * grid middle with fouls for subdivision — the retry loop and the final
  * gate must see those fouls as hard errors, never as silent geometry.
  */
+/** Proper segment intersection point (world XZ), or null for parallel /
+misses / endpoint-only touches. Interior X-crossings only: shared mouth
+regions and T-touches are not junction candidates. */
+export function segIntersectionPoint(
+  ax: number, az: number, bx: number, bz: number,
+  cx: number, cz: number, dx: number, dz: number,
+): { x: number; z: number } | null {
+  const d1x = bx - ax
+  const d1z = bz - az
+  const d2x = dx - cx
+  const d2z = dz - cz
+  const denom = d1x * d2z - d1z * d2x
+  if (Math.abs(denom) < 1e-12) return null
+  const t = ((cx - ax) * d2z - (cz - az) * d2x) / denom
+  const u = ((cx - ax) * d1z - (cz - az) * d1x) / denom
+  if (t <= 1e-6 || t >= 1 - 1e-6 || u <= 1e-6 || u >= 1 - 1e-6) return null
+  return { x: ax + t * d1x, z: az + t * d1z }
+}
+
+export interface CorridorCrossing {
+  a: Corridor
+  b: Corridor
+  /**
+   * First proper X-crossing point, or null for near-miss/parallel brushes
+   * (still validator errors, but not junction candidates).
+   */
+  point: { x: number; z: number } | null
+}
+
+/**
+ * Lawbook §35: same-floor corridor pairs whose volumes intersect without
+ * a shared endpoint room. Shared endpoints ARE the recorded junction
+ * representation, so those pairs never report. One entry per validator
+ * finding, deterministic pair order — the validator below maps these
+ * 1:1 to CORRIDOR_CROSSING issues, and junction repair consumes the
+ * entries with a proper crossing point.
+ */
+export function findCorridorCrossings(corridors: Corridor[]): CorridorCrossing[] {
+  const out: CorridorCrossing[] = []
+  for (let i = 0; i < corridors.length; i++) {
+    for (let j = i + 1; j < corridors.length; j++) {
+      const a = corridors[i]
+      const b = corridors[j]
+      if (a.floorIndex !== b.floorIndex) continue
+      const sharesEndpoint =
+        a.startRoomId === b.startRoomId || a.startRoomId === b.endRoomId ||
+        a.endRoomId === b.startRoomId || a.endRoomId === b.endRoomId
+      if (sharesEndpoint) continue
+      const pa = a.pathPoints && a.pathPoints.length > 0 ? a.pathPoints : [a.startPos, a.endPos]
+      const pb = b.pathPoints && b.pathPoints.length > 0 ? b.pathPoints : [b.startPos, b.endPos]
+      // Deep volume intersection only (lawbook §35): one centerline
+      // inside the other's wall face. Threshold stays LOOSER than the
+      // router's own capsule separation so routing-clean parallels never
+      // trip here — only true crossings / deep overlaps fail.
+      const deepOverlap = Math.min(a.width, b.width) / 2 + SPATIAL_DEFAULTS.wallThickness
+      let crossed = false
+      let point: { x: number; z: number } | null = null
+      for (let ia = 0; ia < pa.length - 1 && !point; ia++) {
+        for (let ib = 0; ib < pb.length - 1 && !point; ib++) {
+          const d = segSegDist2D(
+            pa[ia].x, pa[ia].z, pa[ia + 1].x, pa[ia + 1].z,
+            pb[ib].x, pb[ib].z, pb[ib + 1].x, pb[ib + 1].z,
+          )
+          if (d < deepOverlap) {
+            crossed = true
+            point = segIntersectionPoint(
+              pa[ia].x, pa[ia].z, pa[ia + 1].x, pa[ia + 1].z,
+              pb[ib].x, pb[ib].z, pb[ib + 1].x, pb[ib + 1].z,
+            )
+          }
+        }
+      }
+      if (crossed) out.push({ a, b, point })
+    }
+  }
+  return out
+}
+
 export function validateCorridorIntrusions(rooms: Room[], corridors: Corridor[]): GenerationIssue[] {
   const issues: GenerationIssue[] = []
   const roomMap = new Map(rooms.map(r => [r.id, r]))
@@ -577,42 +655,14 @@ export function validateCorridorIntrusions(rooms: Room[], corridors: Corridor[])
   // Junctions are explicit shared endpoints; any other volume crossing is
   // either a topological junction that was never recorded or a reroute
   // failure. Both are hard errors.
-  for (let i = 0; i < corridors.length; i++) {
-    for (let j = i + 1; j < corridors.length; j++) {
-      const a = corridors[i]
-      const b = corridors[j]
-      if (a.floorIndex !== b.floorIndex) continue
-      const sharesEndpoint =
-        a.startRoomId === b.startRoomId || a.startRoomId === b.endRoomId ||
-        a.endRoomId === b.startRoomId || a.endRoomId === b.endRoomId
-      if (sharesEndpoint) continue
-      const pa = a.pathPoints && a.pathPoints.length > 0 ? a.pathPoints : [a.startPos, a.endPos]
-      const pb = b.pathPoints && b.pathPoints.length > 0 ? b.pathPoints : [b.startPos, b.endPos]
-      let crossed = false
-      // Deep volume intersection only (lawbook §35): one centerline
-      // inside the other's wall face. Threshold stays LOOSER than the
-      // router's own capsule separation so routing-clean parallels never
-      // trip here — only true crossings / deep overlaps fail.
-      const deepOverlap = Math.min(a.width, b.width) / 2 + SPATIAL_DEFAULTS.wallThickness
-      for (let ia = 0; ia < pa.length - 1 && !crossed; ia++) {
-        for (let ib = 0; ib < pb.length - 1 && !crossed; ib++) {
-          const d = segSegDist2D(
-            pa[ia].x, pa[ia].z, pa[ia + 1].x, pa[ia + 1].z,
-            pb[ib].x, pb[ib].z, pb[ib + 1].x, pb[ib + 1].z,
-          )
-          if (d < deepOverlap) crossed = true
-        }
-      }
-      if (crossed) {
-        issues.push({
-          code: 'CORRIDOR_CROSSING',
-          severity: 'error',
-          stage: 'corridors',
-          objectIds: [a.id, b.id],
-          message: `${a.id} crosses ${b.id} on floor ${a.floorIndex} without a recorded junction (lawbook §35).`,
-        })
-      }
-    }
+  for (const { a, b } of findCorridorCrossings(corridors)) {
+    issues.push({
+      code: 'CORRIDOR_CROSSING',
+      severity: 'error',
+      stage: 'corridors',
+      objectIds: [a.id, b.id],
+      message: `${a.id} crosses ${b.id} on floor ${a.floorIndex} without a recorded junction (lawbook §35).`,
+    })
   }
   // Silence unused-var warnings for the shared map (kept for symmetry
   // with the router's verifier, which needs it for door-exempt checks).

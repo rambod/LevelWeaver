@@ -163,6 +163,16 @@ export function generateCorridors(
   // Shaft walls run full height, so each rect blocks routing on every
   // floor up to the arrival floor. Default empty = legacy routing.
   reservedTowers: TowerReservation[] = [],
+  // Junction repair (lawbook §34-35): removed blind pass-throughs, as
+  // sorted pair keys, that must never reappear — not directly, not as
+  // subdivision hops. Their connectivity lives on through the plaza
+  // stubs instead. Default empty = legacy routing.
+  forbiddenPairs: Set<string> = new Set(),
+  // Prebuilt corridors (junction repair): already-shipped geometry that
+  // stays verbatim. Their pairs, obstacles, door volumes, and mouth
+  // claims seed the routing state; only the remaining intent pairs route.
+  // Default empty = legacy routing.
+  prebuilt: Corridor[] = [],
 ): Corridor[] {
   const corridors: Corridor[] = []
   const roomMap = new Map(rooms.map(r => [r.id, r]))
@@ -292,6 +302,36 @@ export function generateCorridors(
   // Keys that actually produced a corridor (dedupes halves against direct
   // pairs and against each other).
   const realized = new Set<string>()
+  // Register a shipped corridor into routing state (obstacles, door
+  // volumes, mouth claims) so later routes avoid and spread from it.
+  const register = (corridor: Corridor): void => {
+    realized.add(pairKey(corridor.startRoomId, corridor.endRoomId))
+    addCorridorObstacles(corridorObstacles, corridor)
+    // Reserve both door approach volumes for later routes (§56).
+    claimDoorVolume(corridor)
+    // Claim both mouths (with their exact centers/widths) so later
+    // corridors on the same walls spread apart instead of stacking.
+    if (corridor.startDoor) {
+      claimsOf(corridor.startRoomId).push({
+        wallIndex: corridor.startDoor.wallIndex,
+        center: corridor.startDoor.lateral,
+        half: corridor.startDoor.width / 2,
+      })
+    }
+    if (corridor.endDoor) {
+      claimsOf(corridor.endRoomId).push({
+        wallIndex: corridor.endDoor.wallIndex,
+        center: corridor.endDoor.lateral,
+        half: corridor.endDoor.width / 2,
+      })
+    }
+  }
+  // Prebuilt geometry seeds the state before any new routing: kept
+  // corridors steer and spread the stubs exactly as if just shipped.
+  for (const corridor of prebuilt) {
+    register(corridor)
+    corridors.push(corridor)
+  }
   for (const pair of pairs) {
     routePair(pair.a, pair.b, 0, new Set<string>())
   }
@@ -307,6 +347,10 @@ export function generateCorridors(
   function routePair(a: Room, b: Room, depth: number, banned: Set<string>): void {
     const key = pairKey(a.id, b.id)
     if (realized.has(key)) return
+    // Junction-removed edges stay removed: their rooms join through the
+    // plaza stubs instead. Skipped before any subdivision so hops cannot
+    // resurrect the same geometry under a different pair.
+    if (forbiddenPairs.has(key)) return
     const dist = Math.sqrt(
       (a.position.x - b.position.x) ** 2 + (a.position.z - b.position.z) ** 2
     )
@@ -343,29 +387,11 @@ export function generateCorridors(
         return
       }
     }
+    if (!built || !built.corridor) return
     if (built && built.corridor) {
       const corridor = built.corridor
       corridors.push(corridor)
-      realized.add(key)
-      addCorridorObstacles(corridorObstacles, corridor)
-      // Reserve both door approach volumes for later routes (§56).
-      claimDoorVolume(corridor)
-      // Claim both mouths (with their exact centers/widths) so later
-      // corridors on the same walls spread apart instead of stacking.
-      if (corridor.startDoor) {
-        claimsOf(corridor.startRoomId).push({
-          wallIndex: corridor.startDoor.wallIndex,
-          center: corridor.startDoor.lateral,
-          half: corridor.startDoor.width / 2,
-        })
-      }
-      if (corridor.endDoor) {
-        claimsOf(corridor.endRoomId).push({
-          wallIndex: corridor.endDoor.wallIndex,
-          center: corridor.endDoor.lateral,
-          half: corridor.endDoor.width / 2,
-        })
-      }
+      register(corridor)
     }
   }
 }
@@ -375,12 +401,18 @@ function pairKey(aId: string, bId: string): string {
 }
 
 // Same-floor room (not an endpoint, not banned) near the link's midpoint
-// that a long link can hop through. Nearest to the midpoint wins.
+// that a long link can hop through. Junction plazas win ties by design
+// (lawbook §34): hops through a plaza share its endpoints, so the
+// crossing validator skips them by construction — while hops through
+// ordinary rooms can re-create the very edge a junction just removed.
+// Rooms arrays without junctions behave exactly as before.
 function findMidpointRoom(a: Room, b: Room, rooms: Room[], banned: Set<string>): Room | null {
   const midX = (a.position.x + b.position.x) / 2
   const midZ = (a.position.z + b.position.z) / 2
   let best: Room | null = null
+  let bestJunction = 1
   let bestScore = Infinity
+  let bestId = ''
   for (const r of rooms) {
     if (r.id === a.id || r.id === b.id) continue
     if (banned.has(r.id)) continue
@@ -388,9 +420,15 @@ function findMidpointRoom(a: Room, b: Room, rooms: Room[], banned: Set<string>):
     const toSeg = distPointToSegment(r.position.x, r.position.z, a.position.x, a.position.z, b.position.x, b.position.z)
     if (toSeg > 12) continue
     const toMid = Math.sqrt((r.position.x - midX) ** 2 + (r.position.z - midZ) ** 2)
-    if (toMid < bestScore || (toMid === bestScore && best !== null && r.id < best.id)) {
+    const junction = r.junction ? 0 : 1
+    if (
+      junction < bestJunction ||
+      (junction === bestJunction && (toMid < bestScore || (toMid === bestScore && (best === null || r.id < bestId))))
+    ) {
       best = r
+      bestJunction = junction
       bestScore = toMid
+      bestId = r.id
     }
   }
   return best

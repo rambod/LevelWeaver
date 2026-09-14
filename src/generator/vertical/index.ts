@@ -1,6 +1,6 @@
 import type { Room, MeshData, StairsGeometry, VerticalLink, DoorOpening, Rect2D, Boundary } from '@/core/types'
 import { FLOOR_HEIGHT } from '@/core/types'
-import { SPATIAL_DEFAULTS, stairMathFor, AGENT_DEFAULTS } from '@/core/rules'
+import { SPATIAL_DEFAULTS, stairMathFor, AGENT_DEFAULTS, segSegDist2D } from '@/core/rules'
 import { createBoxMesh, createOrientedBox } from '@/core/meshdata'
 import { isPointInBoundary } from '@/generator/boundary'
 
@@ -37,6 +37,12 @@ const STAIR_WIDTH_STRAIGHT = 1.4
 const STAIR_WIDTH_SWITCHBACK = 2.4
 const LANDING_DEPTH = SPATIAL_DEFAULTS.stair.landingDepth // 1.2 m
 const FLOOR_THICKNESS = 0.2
+
+// Wall outward normals by wall index (shared convention with the
+// corridor router and the seal validator).
+const WALL_NORMALS = [
+  { x: 0, z: -1 }, { x: 1, z: 0 }, { x: 0, z: 1 }, { x: -1, z: 0 },
+]
 
 // Habitability clearances (meters). The shaft gap keeps two stairwells
 // from nesting into each other; 0.8 m still exceeds the agent diameter.
@@ -1220,6 +1226,83 @@ function tryTowerPlan(
         }
         if (parapetBlocked) {
           noteRejection(st, 'tower-parapet-blocks-door')
+          continue
+        }
+      }
+
+      // h2. Gate-thread sealing in both directions (lawbook §52/§61,
+      // mirror of validatePortalSeals): the shaft stands full height and
+      // plans after corridors, so (T1) its walls vs every gate thread and
+      // (T2) its mouth thread vs corridor wall volumes are invisible to
+      // all earlier checks. Thresholds match the validator exactly
+      // (0.15 wall half + 0.40 walk-collision body radius). The shaft's
+      // own mouth span is exempt (it opens into the shaft by design).
+      {
+        const SEAL_BODY = 0.4
+        const tHalf = SPATIAL_DEFAULTS.wallThickness / 2
+        const doorLat = wallC + c + mouthOff
+        const mouthPos = side.axis === 'x'
+          ? { x: wallPlane, z: doorLat }
+          : { x: doorLat, z: wallPlane }
+        // T1 walls: the validator's exact shaft-wall construction.
+        const towerWalls = side.axis === 'x'
+          ? [
+            { ax: rect.minX, az: rect.minZ + tHalf, bx: rect.maxX, bz: rect.minZ + tHalf },
+            { ax: rect.minX, az: rect.maxZ - tHalf, bx: rect.maxX, bz: rect.maxZ - tHalf },
+            side.sign > 0
+              ? { ax: rect.maxX - tHalf, az: rect.minZ, bx: rect.maxX - tHalf, bz: rect.maxZ }
+              : { ax: rect.minX + tHalf, az: rect.minZ, bx: rect.minX + tHalf, bz: rect.maxZ },
+          ]
+          : [
+            { ax: rect.minX + tHalf, az: rect.minZ, bx: rect.minX + tHalf, bz: rect.maxZ },
+            { ax: rect.maxX - tHalf, az: rect.minZ, bx: rect.maxX - tHalf, bz: rect.maxZ },
+            side.sign > 0
+              ? { ax: rect.minX, az: rect.maxZ - tHalf, bx: rect.maxX, bz: rect.maxZ - tHalf }
+              : { ax: rect.minX, az: rect.minZ + tHalf, bx: rect.maxX, bz: rect.minZ + tHalf },
+          ]
+        let sealed = false
+        for (const [, ds] of st.doorsByRoom) {
+          if (sealed) break
+          for (const d of ds) {
+            // Own-wall mouth span: g/g2 own this wall, not the seal test.
+            if (d.wallIndex === side.wallIndex && d.roomId === host.id) {
+              const lat = side.axis === 'x' ? d.position.z : d.position.x
+              if (Math.abs(lat - (wallC + c)) < TOWER_WIDTH / 2 + mouthW) continue
+            }
+            const n = WALL_NORMALS[d.wallIndex] ?? WALL_NORMALS[0]
+            const tax = d.position.x - n.x * 0.6
+            const taz = d.position.z - n.z * 0.6
+            const tbx = d.position.x + n.x * 0.6
+            const tbz = d.position.z + n.z * 0.6
+            for (const w of towerWalls) {
+              if (segSegDist2D(tax, taz, tbx, tbz, w.ax, w.az, w.bx, w.bz) < tHalf + SEAL_BODY - 1e-9) {
+                sealed = true
+                break
+              }
+            }
+            if (sealed) break
+          }
+        }
+        // T2: the shaft mouth thread vs exact corridor wall volumes
+        // (side-wall capsules only — fat centerline/door capsules already
+        // contain their clearance and would double-count it).
+        if (!sealed) {
+          const n0 = WALL_NORMALS[side.wallIndex] ?? WALL_NORMALS[0]
+          const max = mouthPos.x - n0.x * 0.6
+          const maz = mouthPos.z - n0.z * 0.6
+          const mbx = mouthPos.x + n0.x * 0.6
+          const mbz = mouthPos.z + n0.z * 0.6
+          const caps = st.corridorCapsulesByFloor.get(hostFloor) ?? []
+          for (const cap of caps) {
+            if (cap.halfWidth > 0.3) continue
+            if (segSegDist2D(max, maz, mbx, mbz, cap.ax, cap.az, cap.bx, cap.bz) < cap.halfWidth + SEAL_BODY - 1e-9) {
+              sealed = true
+              break
+            }
+          }
+        }
+        if (sealed) {
+          noteRejection(st, 'tower-seals-thread')
           continue
         }
       }

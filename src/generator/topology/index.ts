@@ -254,7 +254,7 @@ function lowerRoomBonus(type: RoomType): number {
 function buildConnections(
   nodes: Map<string, TopologyNode>,
   config: LevelConfig,
-  _boundary: Boundary,
+  boundary: Boundary,
   random: SeededRandom
 ): void {
   const nodeArray = Array.from(nodes.values())
@@ -284,7 +284,11 @@ function buildConnections(
 
     if (candidates.length > 0) {
       const near = candidates.filter(n => distance(node.position, n.position) <= TREE_LINK_MAX)
-      const target = pickNear(node, near.length > 0 ? near : candidates, random)
+      const pool = near.length > 0 ? near : candidates
+      // Prefer hole-clear intent on non-convex shapes (see chordInShape):
+      // identical pools for convex shapes, so their streams never change.
+      const clear = pool.filter(n => chordInShape(node, n, boundary))
+      const target = pickNear(node, clear.length > 0 ? clear : pool, random)
       addConnection(nodes, node.id, target.id)
     }
   }
@@ -310,7 +314,9 @@ function buildConnections(
     const pool = near.length > 0 ? near : candidates
     // Mostly near, occasionally far (keeps long alternate routes possible
     // without letting them dominate).
-    const b = random.nextBool(0.85) ? pickNear(a, pool, random) : random.pick(pool)
+    const shortlist = pool.filter(n => chordInShape(a, n, boundary))
+    const usePool = shortlist.length > 0 ? shortlist : pool
+    const b = random.nextBool(0.85) ? pickNear(a, usePool, random) : random.pick(usePool)
     // Capacity guard (lawbook §100): loop edges are optional, so skip pairs
     // whose walls cannot host another gate — the funnel fallback would seal
     // them. Tree and guarantee links stay exempt (connectivity beats looks).
@@ -338,7 +344,29 @@ function buildConnections(
   // in the layout attempt): wall capacity needs real footprints and the
   // short-link cap needs real positions, and post-placement repair cannot
   // distort placement.
-  ensureSameFloorLink(nodes)
+  ensureSameFloorLink(nodes, boundary)
+}
+
+// Lawbook §64: the shape is a feasible region, not decoration. On ring/
+// cross maps, straight intent chords can span infeasible voids (courtyard
+// hole, inter-arm corners) that no corridor can ever cross — such intent
+// is born unroutable (50 m monsters, band detours that seal gates).
+// Chords of convex shapes (AABB/disc) never leave the shape, so this
+// filter is a no-op there: identical pools, identical RNG streams.
+function chordInShape(
+  a: TopologyNode,
+  b: TopologyNode,
+  boundary: Boundary,
+): boolean {
+  for (const t of [0.25, 0.5, 0.75]) {
+    if (!isPointInBoundary({
+      x: a.position.x + (b.position.x - a.position.x) * t,
+      z: a.position.z + (b.position.z - a.position.z) * t,
+    }, boundary, 0)) {
+      return false
+    }
+  }
+  return true
 }
 
 function addConnection(nodes: Map<string, TopologyNode>, aId: string, bId: string): void {
@@ -658,7 +686,7 @@ function nearestOnFloors(
   return best
 }
 
-function ensureSameFloorLink(nodes: Map<string, TopologyNode>): void {
+function ensureSameFloorLink(nodes: Map<string, TopologyNode>, boundary: Boundary): void {
   // Lawbook §10 (applied per floor): every room on a multi-room floor must
   // reach every other room on that floor via same-floor links. One link
   // per room is NOT enough — two separate pairs would each satisfy a
@@ -672,11 +700,16 @@ function ensureSameFloorLink(nodes: Map<string, TopologyNode>): void {
       const components = sameFloorComponents(nodes, floor)
       if (components.length <= 1) break
       // Nearest room pair across the first two components (ids break ties).
+      // Prefer hole-clear merges on non-convex shapes; any merge keeps the
+      // guarantee.
       const a = [...components[0]].sort()
       const b = [...components[1]].sort()
       let bestA = a[0]
       let bestB = b[0]
       let bestDist = Infinity
+      let clearA = ''
+      let clearB = ''
+      let clearDist = Infinity
       for (const idA of a) {
         for (const idB of b) {
           const d = distance(nodes.get(idA)!.position, nodes.get(idB)!.position)
@@ -687,9 +720,21 @@ function ensureSameFloorLink(nodes: Map<string, TopologyNode>): void {
             bestA = idA
             bestB = idB
           }
+          if (chordInShape(nodes.get(idA)!, nodes.get(idB)!, boundary)) {
+            const clearKey = clearA + '|' + clearB
+            if (clearA === '' || d < clearDist || (d === clearDist && key < clearKey)) {
+              clearDist = d
+              clearA = idA
+              clearB = idB
+            }
+          }
         }
       }
-      addConnection(nodes, bestA, bestB)
+      if (clearA !== '') {
+        addConnection(nodes, clearA, clearB)
+      } else {
+        addConnection(nodes, bestA, bestB)
+      }
     }
   }
 }

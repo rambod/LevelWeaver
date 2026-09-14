@@ -3,7 +3,7 @@ import { floorHeightFor, corridorHeightFor } from '@/core/types'
 import { SeededRandom, hashString } from '@/core/random'
 import { GENERATOR_VERSION, circulationGap, gateWidthFor, validateConfigFeasibility, SPATIAL_DEFAULTS } from '@/core/rules'
 import { buildLevelGraph, validateLevelGraph } from '@/core/levelGraph'
-import { generateBoundary } from '@/generator/boundary'
+import { generateBoundary, roomFootprintInBoundary } from '@/generator/boundary'
 import { generateTopology, topUpDegrees } from '@/generator/topology'
 import { assignRoomSizes, placeRooms, resolveOverlaps } from '@/generator/rooms'
 import { generateCorridors } from '@/generator/corridors'
@@ -12,6 +12,7 @@ import type { RoomSlabHoles } from '@/generator/geometry'
 import { planStairs, buildStairsGeometry, rewriteVerticalLinks, type StairPlan, type TowerReservation } from '@/generator/vertical'
 import {
   compareTiers,
+  findCorridorCrossings,
   reportOf,
   tiersOf,
   validateCorridorIntrusions,
@@ -277,7 +278,7 @@ function runLayoutAttempt(
 // openings, stairs, slab holes, and attempt scoring. Pure for
 // (roomsBase, corridors): the alt-mouth variant rebuilds from the same
 // base, so neither variant pollutes the other with hop edges.
-function finishLayout(
+function finishTailLayout(
   roomsBase: Room[],
   corridors: Corridor[],
   boundary: Boundary,
@@ -346,6 +347,29 @@ function finishLayout(
     ...validateLinkLengths(rooms),
   ]
   return { roomsBase, rooms, corridors, doorOpenings, stairPlans, slabHoles, tiers: tiersOf(attemptIssues), issues: attemptIssues, towerReservations }
+}
+
+// Junction repair wrapper (lawbook §34-35, §70): after the normal tail,
+// convert blind corridor pass-throughs into explicit junction plazas and
+// keep the strictly better variant. Layouts without proper X-crossings
+// return byte-identical results (repair never triggers), so passing seeds
+// cannot change output — only failing ones can improve.
+function finishLayout(
+  roomsBase: Room[],
+  corridors: Corridor[],
+  boundary: Boundary,
+  config: LevelConfig,
+  floorHeight: number,
+  towerReservations: TowerReservation[] = [],
+): LayoutResult {
+  const base = finishTailLayout(roomsBase, corridors, boundary, config, floorHeight, towerReservations)
+  const repaired = planJunctions(base.rooms, base.corridors, config, boundary, floorHeight, towerReservations)
+  if (!repaired) return base
+  // The repaired tail runs on the augmented pool (junctions + rewired
+  // intent), so doors, stairs, geometry, and any later variant rebuild
+  // all see the plazas. Best-of-two: adopt only strictly-better tiers.
+  const fixed = finishTailLayout(repaired.rooms, repaired.corridors, boundary, config, floorHeight, towerReservations)
+  return compareTiers(fixed.tiers, base.tiers) < 0 ? fixed : base
 }
 
 // Distance from point P to segment AB (2D). Local helper so the prune
@@ -611,6 +635,133 @@ export function omittedStairIssues(
     })
   }
   return issues
+}
+
+function rectsOverlapPad(a: Rect2D, b: Rect2D, pad: number): boolean {
+  return a.minX < b.maxX + pad && a.maxX > b.minX - pad && a.minZ < b.maxZ + pad && a.maxZ > b.minZ - pad
+}
+
+function roomRectOf(r: Room): Rect2D {
+  return {
+    minX: r.position.x - r.width / 2,
+    maxX: r.position.x + r.width / 2,
+    minZ: r.position.z - r.depth / 2,
+    maxZ: r.position.z + r.depth / 2,
+  }
+}
+
+/**
+ * Lawbook §34-35 junction repair: convert blind corridor pass-throughs
+ * into explicit junction plazas (small connector rooms at the crossing,
+ * all four ends rewired through them, corridors re-routed). Junction
+ * stubs share the plaza as an endpoint, which IS the recorded-junction
+ * representation the crossing validator honors — no validator change.
+ * Bounded (max 3 pairs, one round, near-miss brushes skipped); returns
+ * null when nothing placeable so clean layouts never change.
+ */
+export function planJunctions(
+  rooms: Room[],
+  corridors: Corridor[],
+  config: LevelConfig,
+  boundary: Boundary,
+  floorHeight: number,
+  towerReservations: TowerReservation[],
+): { rooms: Room[]; corridors: Corridor[] } | null {
+  const MAX_JUNCTIONS = 3
+  const crossings = findCorridorCrossings(corridors).filter(c => c.point).slice(0, MAX_JUNCTIONS)
+  if (crossings.length === 0) return null
+  // One gate per wall plus corner margins and slack: four stubs usually
+  // land on four different walls.
+  const side = Math.max(3, config.doorWidth + 2 * SPATIAL_DEFAULTS.doorCornerMargin + 0.5)
+  const pool = rooms.map(r => ({ ...r, connections: [...r.connections] }))
+  const byId = new Map(pool.map(r => [r.id, r]))
+  const placed: Rect2D[] = []
+  const consumed = new Set<string>()
+  const unlink = (a: string, b: string): void => {
+    const ra = byId.get(a)
+    const rb = byId.get(b)
+    if (ra) ra.connections = ra.connections.filter(c => c !== b)
+    if (rb) rb.connections = rb.connections.filter(c => c !== a)
+  }
+  let made = 0
+  const forbidden = new Set<string>()
+  const pairKeyOf = (a: string, b: string): string => [a, b].sort().join('-')
+  for (const { a, b, point } of crossings) {
+    if (!point) continue
+    if (consumed.has(a.id) || consumed.has(b.id)) continue
+    if (made >= MAX_JUNCTIONS) break
+    const floor = a.floorIndex
+    const rect: Rect2D = {
+      minX: point.x - side / 2, maxX: point.x + side / 2,
+      minZ: point.z - side / 2, maxZ: point.z + side / 2,
+    }
+    if (!roomFootprintInBoundary(point, side, side, boundary, 0.5)) continue
+    // Plazas avoid rooms, tower shafts, and each other (cheap rect
+    // checks). Kept corridor ribbons are NOT pre-checked: a ribbon
+    // through the spot reads as an intrusion downstream, and best-of-two
+    // adoption rejects the repair — while near-misses stay repairable.
+    let blocked = false
+    for (const r of pool) {
+      if (rectsOverlapPad(rect, roomRectOf(r), 0.5)) {
+        blocked = true
+        break
+      }
+    }
+    if (!blocked) {
+      for (const t of towerReservations) {
+        if (rectsOverlapPad(rect, t.rect, 0.5)) {
+          blocked = true
+          break
+        }
+      }
+    }
+    if (!blocked) {
+      for (const p of placed) {
+        if (rectsOverlapPad(rect, p, side)) {
+          blocked = true
+          break
+        }
+      }
+    }
+    if (blocked) continue
+    // Rewire: drop the blind pass-throughs, join all four ends at J.
+    const id = `junction_${made}`
+    const ends = [a.startRoomId, a.endRoomId, b.startRoomId, b.endRoomId]
+    if (ends.some(e => !byId.has(e))) continue
+    // Forbid the removed pairs everywhere, including as subdivision hops:
+    // their connectivity now runs A-J-B through the plaza stubs.
+    forbidden.add(pairKeyOf(a.startRoomId, a.endRoomId))
+    forbidden.add(pairKeyOf(b.startRoomId, b.endRoomId))
+    unlink(a.startRoomId, a.endRoomId)
+    unlink(b.startRoomId, b.endRoomId)
+    const junction: Room = {
+      id,
+      type: 'connector',
+      position: { x: point.x, y: floor * floorHeight, z: point.z },
+      width: side,
+      depth: side,
+      height: config.wallHeight,
+      floorIndex: floor,
+      materialTheme: config.theme,
+      connections: [...ends],
+      junction: true,
+    }
+    for (const e of ends) byId.get(e)!.connections.push(id)
+    pool.push(junction)
+    byId.set(id, junction)
+    placed.push(rect)
+    consumed.add(a.id)
+    consumed.add(b.id)
+    made++
+  }
+  if (made === 0) return null
+  // Surgical re-route: shipped corridors that were not repaired stay
+  // byte-identical (paths, mouths, doors); only the plaza stubs route
+  // fresh, steered around everything kept. The wrapper keeps this only
+  // when strictly better, so a bad rebuild can never hurt the attempt.
+  const kept = corridors.filter(c => !consumed.has(c.id))
+  const stubs = generateCorridors(pool, config, false, towerReservations, forbidden, kept)
+  return { rooms: pool, corridors: stubs }
 }
 
 // Corridor slab footprints per floor (world XZ): stair arrivals must not
