@@ -110,9 +110,12 @@ export function generateLevel(rawConfig: LevelConfig): GeneratedLevel {
   // Budgets scale DOWN with map size (lawbook §94): a 40-room map runs
   // ~70 corridor A* searches per attempt, so 24 full attempts hung for
   // 95 s. Large maps get fewer attempts — attempt 0 is always identical,
-  // so clean seeds reproduce bit-for-bit regardless of budget.
-  const MAX_TOPO_ATTEMPTS = config.roomCount > 30 ? 2 : 3
-  const MAX_LAYOUT_ATTEMPTS = config.roomCount > 30 ? 3 : config.roomCount > 20 ? 5 : 8
+  // so clean seeds reproduce bit-for-bit regardless of budget. Tiers above
+  // every shipped preset/matrix size (>40 rooms), so small maps are
+  // byte-identical to narrower budgets.
+  const MAX_TOPO_ATTEMPTS = config.roomCount > 80 ? 1 : config.roomCount > 30 ? 2 : 3
+  const MAX_LAYOUT_ATTEMPTS =
+    config.roomCount > 80 ? 2 : config.roomCount > 50 ? 2 : config.roomCount > 30 ? 3 : config.roomCount > 20 ? 5 : 8
   // Attempt-0 topology+sizes, computed once and shared by all attempt-0
   // layouts (regenerating per attempt would consume the RNG stream and
   // reshuffle every seed).
@@ -156,13 +159,15 @@ export function generateLevel(rawConfig: LevelConfig): GeneratedLevel {
   // Best-of-two mouth repair (lawbook §70 step 2): the attempts above all
   // use legacy facing-wall mouths. If the winning layout's only hard
   // fouls are mouth-geometry failures (sealed gates, endpoint mouth
-  // intrusions — NOT placement failures, which mouths cannot cure),
-  // rebuild the SAME placement with alternate-wall mouths and keep the
-  // strictly better variant. Legacy wins ties, so clean seeds and
+  // intrusions, crossings — NOT placement failures, which mouths cannot
+  // cure), rebuild the SAME placement with alternate-wall mouths and keep
+  // the strictly better variant. Legacy wins ties, so clean seeds and
   // non-mouth failures reproduce exactly; only sealed layouts can change,
   // and only toward fewer hard errors. One extra routing pass, only when
-  // triggered — clean generations pay nothing.
-  if (layoutNeedsMouthRepair(layout)) {
+  // triggered — clean generations pay nothing. Gated to ≤50 rooms: at
+  // scale the fouls are systematic over-constraint, not unlucky mouths,
+  // and a second full routing pass just burns main-thread seconds.
+  if (config.roomCount <= 50 && layoutNeedsMouthRepair(layout)) {
     const altCorridors = generateCorridors(layout.roomsBase, config, true, layout.towerReservations)
     const alt = finishLayout(layout.roomsBase, altCorridors, boundary, config, floorHeight, layout.towerReservations)
     if (compareTiers(alt.tiers, layout.tiers) < 0) {

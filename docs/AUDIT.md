@@ -1,6 +1,6 @@
 # Documentation and code audit
 
-Date: 2026-09-13. Generator version after fixes: **0.1.5**.
+Date: 2026-09-13. Generator version after fixes: **0.1.6**.
 
 ## Scope and method
 
@@ -209,3 +209,55 @@ Remaining gaps (honest failures by design, never silent corruption):
   co-design (in-room entries steering mouth choice) is future work.
 - Redundant vertical intents report `STAIR_NO_PLACEMENT` warnings instead
   of being removed from the graph; explicit and export-safe.
+
+## Solidity pass (2026-09-13, generator version **0.1.5 → 0.1.6**)
+
+Fresh seeds plus extreme-config fuzz (278 generations, each generated twice
+and compared: **zero nondeterminism**), focused on generation solidity —
+speed, scale behaviour, and the legal-minimum envelope. Small maps
+(≤40 rooms: every preset and seed-matrix case) are byte-identical by
+construction; every scale mitigation below is gated above them.
+`GENERATOR_VERSION` bumped (validation acceptance changed for narrow
+corridors; budgets/loops change large-map outputs).
+
+Correctness:
+
+- Narrow-but-legal corridors (0.8 m) failed navigation validation: the
+  0.1 m walkable strip rasterized to zero cells when the centerline fell
+  between cell centers, and the corner-cut guard then ate even the
+  centerline chain on diagonals. The grid now opens explicit centerline
+  cells (traversable by construction — same honesty class as door-throat
+  bridges; sub-diameter corridors stay dark) and the flood may step
+  diagonally between two centerline cells (exact by transitivity along the
+  sampled chain). The 0.8 m extreme config passes; white-box regression
+  pins both directions.
+- Navigation resolution adapts to 0.5 m past 1M cells (rooms keep ≥3 cells
+  across their smallest legal interior; links stay exact), bounding
+  validation memory/time on huge maps.
+
+Performance (measured wall-clock, same machine):
+
+- Routing queries use a uniform-grid spatial index (lawbook §95) with the
+  exact legacy predicates — verdicts identical by construction (buckets can
+  only skip entries that fail the predicate). A* and the simple fallback
+  share one query per call; the dead `isPointBlocked` helper is gone.
+- Retry budgets scale harder: >50 rooms 2×2 attempts, >80 rooms 1×2.
+  Loop extras scale 40/n past 40 rooms. Variant mouth repair runs only at
+  ≤50 rooms (at scale the fouls are systematic, not unlucky mouths).
+- 100 rooms: 189 s → 18 s. 60 rooms: 34 s → 7.5 s. Presets: unchanged
+  (~0.3 s). Routing `0.45` margin centralized as `ROUTING_MARGIN`.
+
+Verification: `npm test` **20/20** (1 new regression), `npm run build`
+passes (bundle ~729 kB / ~205 kB gzip), `npm run test:seeds` **32/32**,
+`npm audit` clean, sweep 263/278 (94.6%). Non-preset failures: 100-room
+systematic corridor fouls ×6 (fast and honest, see below), ring-dense
+singles ×3, and 6 config throws that were test-patch artifacts (gate wider
+than corridor — correctly rejected; the 2-room minimum generates in ~15 ms).
+Seeds reproduce only on the same version; 0.1.5 ≠ 0.1.6 outputs at scale
+and on narrow corridors.
+
+Remaining gaps: 100-room single-floor maps systematically over-constrain
+planar routing without junction objects (seals/crossings in the dozens);
+ring-band monsters and miter-joint wall spikes are unmodeled by the
+capsule math; in-room stair arrivals avoid but cannot cut corridor slabs;
+full vertical-before-circulation co-design stays future work.

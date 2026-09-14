@@ -1166,7 +1166,12 @@ export function validateNavigationGrid(
 ): GenerationIssue[] {
   const issues: GenerationIssue[] = []
   if (rooms.length === 0) return issues
-  const CELL = 0.25
+  // Lawbook §94: validation cost bounded. Huge maps (>1M cells at the
+  // 0.25 m proof resolution) validate at 0.5 m instead: rooms keep ≥3
+  // cells across their smallest legal interior, and corridors/doors/
+  // stairs keep explicit centerline links (below), so reachability stays
+  // exact while memory/time stay flat. Small maps are untouched.
+  let CELL = 0.25
   const roomMap = new Map(rooms.map(r => [r.id, r]))
 
   // Bounds over everything placeable.
@@ -1191,6 +1196,9 @@ export function validateNavigationGrid(
       grow(p.x + c.width, p.z + c.width)
     }
   }
+  if (Math.ceil(Math.max(1, maxX - minX) / CELL) * Math.ceil(Math.max(1, maxZ - minZ) / CELL) > 1000000) {
+    CELL = 0.5
+  }
   const nx = Math.max(1, Math.ceil((maxX - minX) / CELL))
   const nz = Math.max(1, Math.ceil((maxZ - minZ) / CELL))
   const floors = [...new Set(rooms.map(r => r.floorIndex))].sort((a, b) => a - b)
@@ -1199,6 +1207,14 @@ export function validateNavigationGrid(
     z: minZ + (iz + 0.5) * CELL,
   })
   const walk: boolean[][][] = floors.map(() =>
+    Array.from({ length: nx }, () => new Array<boolean>(nz).fill(false)),
+  )
+  // Centerline-link cells (see corridor loop below): cells a validated
+  // corridor centerline passes through. The flood may step diagonally
+  // between two link cells without the corner-cut guard — the underlying
+  // centerline samples (CELL/2 apart) chain them, and reachability along
+  // the chain is transitive, so the exemption is exact at any resolution.
+  const link: boolean[][][] = floors.map(() =>
     Array.from({ length: nx }, () => new Array<boolean>(nz).fill(false)),
   )
   const fi = (f: number): number => floors.indexOf(f)
@@ -1242,6 +1258,13 @@ export function validateNavigationGrid(
   }
   // 2. Corridor slabs (eroded by the agent body radius: the walkable
   // strip is what the 0.3 m-radius agent can occupy, not the wall face).
+  // Plus an explicit centerline link per sample: narrow-but-legal
+  // corridors (0.8 m → 0.1 m strip) rasterize to zero strip cells when the
+  // line falls between cell centers, disconnecting what the agent fits
+  // through. The centerline is traversable by construction (geometric
+  // validators passed), so its cells open directly — same honesty class
+  // as the door-throat bridges below. Corridors below agent diameter
+  // stay dark (CORRIDOR_TOO_NARROW reports them elsewhere).
   for (const c of corridors) {
     const pts = c.pathPoints && c.pathPoints.length > 0 ? c.pathPoints : [c.startPos, c.endPos]
     const half = c.width / 2 - AGENT_BODY_RADIUS
@@ -1254,9 +1277,11 @@ export function validateNavigationGrid(
       for (let s = 0; s <= steps; s++) {
         const cx = a.x + ((b.x - a.x) * s) / steps
         const cz = a.z + ((b.z - a.z) * s) / steps
-        const r = Math.ceil(half / CELL) + 1
         const gx = Math.floor((cx - minX) / CELL)
         const gz = Math.floor((cz - minZ) / CELL)
+        open(c.floorIndex, gx, gz)
+        if (gx >= 0 && gz >= 0 && gx < nx && gz < nz) link[fi(c.floorIndex)][gx][gz] = true
+        const r = Math.ceil(half / CELL) + 1
         for (let ix = gx - r; ix <= gx + r; ix++) {
           for (let iz = gz - r; iz <= gz + r; iz++) {
             if (ix < 0 || iz < 0 || ix >= nx || iz >= nz) continue
@@ -1395,14 +1420,15 @@ export function validateNavigationGrid(
         ([ff, xx, zz]) => [fi(ff), xx, zz] as [number, number, number],
       ),
     ]
-    // Diagonals with corner-cut guard.
+    // Diagonals with corner-cut guard (link-to-link centerline steps are
+    // exempt: chained by construction, see above).
     const diagonals: [number, number][] = [[1, 1], [1, -1], [-1, 1], [-1, -1]]
     for (const [ax, az] of diagonals) {
       const jx = ix + ax
       const jz = iz + az
       if (jx < 0 || jz < 0 || jx >= nx || jz >= nz) continue
       if (!walk[f][jx][jz] || reached[f][jx][jz]) continue
-      if (!walk[f][ix + ax][iz] && !walk[f][ix][iz + az]) continue
+      if (!walk[f][ix + ax][iz] && !walk[f][ix][iz + az] && !(link[f][ix][iz] && link[f][jx][jz])) continue
       next.push([f, jx, jz])
     }
     for (const [nf, nx2, nz2] of next) {

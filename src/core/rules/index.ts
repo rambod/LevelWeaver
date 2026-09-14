@@ -12,7 +12,7 @@ import { presets, shapes, themes } from '@/core/presets'
 // produce a different level. The version travels with every generated
 // level so stale regression seeds are detectable instead of silently
 // "passing" against new geometry.
-export const GENERATOR_VERSION = '0.1.5'
+export const GENERATOR_VERSION = '0.1.6'
 
 // Bound browser workloads before allocating grids or entering search loops.
 export const CONFIG_LIMITS = {

@@ -4,7 +4,7 @@ import * as THREE from 'three'
 import { GLTFExporter } from 'three/examples/jsm/exporters/GLTFExporter.js'
 import { getDefaultConfig, pickWeightedRoomType, presets } from '../src/core/presets'
 import { validateConfigFeasibility, stairMathFor } from '../src/core/rules'
-import { validateExportModel, validateDoors } from '../src/core/validation'
+import { validateExportModel, validateDoors, validateNavigationGrid } from '../src/core/validation'
 import { LevelScene } from '../src/renderer/scene'
 import { exportGLB, levelFilename, downloadGLB } from '../src/export/gltf'
 import { useLevelStore } from '../src/stores/level'
@@ -425,4 +425,31 @@ test('tower reservations steer corridor routing around shafts', () => {
     [{ key: 't', rect: { minX: 8, maxX: 12, minZ: -2, maxZ: 2 }, upperFloor: 0 }])
   const pairs = steered.map(c => [c.startRoomId, c.endRoomId].sort().join('-')).sort()
   assert.deepEqual(pairs, ['room_a-room_m', 'room_b-room_m'])
+})
+
+test('narrow-but-legal corridors stay reachable on the navigation grid', () => {
+  // Lawbook §5/§59: a 0.8 m corridor admits the agent, so the validator
+  // must not lose its 0.1 m walkable strip between 0.25 m cell centers.
+  // Hand-built pair (deterministic, no seed): spawn + standard joined by a
+  // straight 0.8 m corridor with throats on both gates.
+  const mkRoom = (id: string, type: Room['type'], x: number): Room => ({
+    id, type, position: { x, y: 0, z: 0 }, width: 6, depth: 6,
+    height: 3.5, floorIndex: 0, materialTheme: 'greybox',
+    connections: [id === 'a' ? 'b' : 'a'],
+  })
+  const rooms = [mkRoom('a', 'spawn', 0), mkRoom('b', 'standard', 10)]
+  const corridors: Corridor[] = [{
+    id: 'corridor_a_b', startRoomId: 'a', endRoomId: 'b',
+    startPos: { x: 3, y: 0, z: 0 }, endPos: { x: 7, y: 0, z: 0 },
+    width: 0.8, floorIndex: 0,
+    pathPoints: [{ x: 3, y: 0, z: 0 }, { x: 7, y: 0, z: 0 }],
+  }]
+  const doors = new Map<string, DoorOpening[]>([
+    ['a', [{ roomId: 'a', wallIndex: 1, position: { x: 3, y: 0, z: 0 }, width: 0.8, height: 2.4, targetRoomId: 'b' }]],
+    ['b', [{ roomId: 'b', wallIndex: 3, position: { x: 7, y: 0, z: 0 }, width: 0.8, height: 2.4, targetRoomId: 'a' }]],
+  ])
+  assert.deepEqual(validateNavigationGrid(rooms, doors, corridors, [], 4), [])
+  // Negative control: without the corridor the far room is unreachable.
+  const stranded = validateNavigationGrid(rooms, new Map(), [], [], 4)
+  assert.ok(stranded.some(i => i.code === 'NAV_UNREACHABLE_ROOM' && i.objectIds.includes('b')))
 })

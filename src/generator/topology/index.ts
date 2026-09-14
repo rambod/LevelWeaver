@@ -291,8 +291,13 @@ function buildConnections(
 
   // Add extra connections for loops/alternate paths (near-biased too, and
   // capped: long alternates are allowed only when short ones run out).
+  // Loop density scales down past 40 rooms (lawbook §94): each optional
+  // loop is routing time plus a crossing/seal risk, and large maps already
+  // drown in backbone edges. At n ≤ 40 the scale is exactly 1, so small
+  // maps (every preset and seed-matrix case) are untouched.
   const EXTRA_LINK_MAX = 40
-  const extraConnections = Math.round(targetConnections * connectivity)
+  const loopScale = nodeArray.length > 40 ? 40 / nodeArray.length : 1
+  const extraConnections = Math.round(targetConnections * connectivity * loopScale)
   for (let i = 0; i < extraConnections; i++) {
     const a = random.pick(nodeArray)
     const inRange = (n: TopologyNode) =>

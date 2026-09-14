@@ -36,6 +36,88 @@ function distPointToSegment(
   return Math.sqrt((px - (ax + t * dx)) ** 2 + (pz - (az + t * dz)) ** 2)
 }
 
+// Uniform-grid point query over routing obstacles (lawbook §95: spatial
+// indexing as maps grow). A* and the simple fallback probe thousands of
+// sample points per route; linear scans over every room bound and every
+// built capsule segment collapse past ~40 rooms. Buckets hold the same
+// entries the scans would test and every candidate still runs its exact
+// predicate, so verdicts are identical — only entries that always passed
+// are skipped. Built per routing call (capsules grow with every shipped
+// corridor); the build itself is linear and negligible next to the cells.
+const QUERY_CELL = 4
+
+function queryCellKey(floorIndex: number, cx: number, cz: number): string {
+  return `${floorIndex}:${cx}:${cz}`
+}
+
+function queryCellsFor(
+  floorIndex: number, minX: number, minZ: number, maxX: number, maxZ: number,
+): string[] {
+  const keys: string[] = []
+  const x0 = Math.floor(minX / QUERY_CELL)
+  const x1 = Math.floor(maxX / QUERY_CELL)
+  const z0 = Math.floor(minZ / QUERY_CELL)
+  const z1 = Math.floor(maxZ / QUERY_CELL)
+  for (let cx = x0; cx <= x1; cx++) {
+    for (let cz = z0; cz <= z1; cz++) {
+      keys.push(queryCellKey(floorIndex, cx, cz))
+    }
+  }
+  return keys
+}
+
+function makePointQuery(
+  roomBounds: Obstacle[],
+  capsules: CorridorCapsule[],
+  floorIndex: number,
+): (x: number, z: number) => boolean {
+  const roomsByCell = new Map<string, Obstacle[]>()
+  const capsByCell = new Map<string, CorridorCapsule[]>()
+  const put = <T>(map: Map<string, T[]>, key: string, value: T): void => {
+    let list = map.get(key)
+    if (!list) {
+      list = []
+      map.set(key, list)
+    }
+    list.push(value)
+  }
+  for (const b of roomBounds) {
+    if (b.floorIndex !== floorIndex) continue
+    for (const key of queryCellsFor(floorIndex, b.minX, b.minZ, b.maxX, b.maxZ)) {
+      put(roomsByCell, key, b)
+    }
+  }
+  for (const c of capsules) {
+    if (c.floorIndex !== floorIndex) continue
+    // Axis-expanded bbox containment: |dx|,|dz| ≤ dist, so every point
+    // within halfWidth of the segment sits inside the expanded bbox and
+    // lands in a bucket holding this capsule. Correct for any cell size.
+    const e = c.halfWidth
+    const cells = queryCellsFor(
+      floorIndex,
+      Math.min(c.ax, c.bx) - e, Math.min(c.az, c.bz) - e,
+      Math.max(c.ax, c.bx) + e, Math.max(c.az, c.bz) + e,
+    )
+    for (const key of cells) put(capsByCell, key, c)
+  }
+  return (x: number, z: number): boolean => {
+    const key = queryCellKey(floorIndex, Math.floor(x / QUERY_CELL), Math.floor(z / QUERY_CELL))
+    const rooms = roomsByCell.get(key)
+    if (rooms) {
+      for (const b of rooms) {
+        if (x >= b.minX && x <= b.maxX && z >= b.minZ && z <= b.maxZ) return true
+      }
+    }
+    const caps = capsByCell.get(key)
+    if (caps) {
+      for (const c of caps) {
+        if (distPointToSegment(x, z, c.ax, c.az, c.bx, c.bz) < c.halfWidth) return true
+      }
+    }
+    return false
+  }
+}
+
 function orientation(ax: number, az: number, bx: number, bz: number, cx: number, cz: number): number {
   return (bx - ax) * (cz - az) - (bz - az) * (cx - ax)
 }
@@ -1035,18 +1117,14 @@ function findPathAStar(
   // All same-floor bounds stay obstacles, INCLUDING the endpoint rooms:
   // only the exit cones at the doors are walkable, so the routed middle
   // can't cut through the rooms it connects — nor slide along their
-  // walls inside an overbroad disk exemption.
-  const floorRooms = roomBounds.filter(b => b.floorIndex === floorIndex)
-  const floorCaps = capsules.filter(b => b.floorIndex === floorIndex)
+  // walls inside an overbroad disk exemption. The spatial query tests the
+  // same predicates as the old linear scans (identical verdicts).
+  const pointBlocked = makePointQuery(roomBounds, capsules, floorIndex)
   const inDoorZone = (x: number, z: number): boolean =>
     inExitCone(x, z, coneA) || inExitCone(x, z, coneB)
   const blocked = (x: number, z: number): boolean => {
     if (inDoorZone(x, z)) return false
-    if (isPointBlocked({ x, y: 0, z }, floorRooms)) return true
-    for (const cap of floorCaps) {
-      if (distPointToSegment(x, z, cap.ax, cap.az, cap.bx, cap.bz) < cap.halfWidth) return true
-    }
-    return false
+    return pointBlocked(x, z)
   }
 
   // Check if start or end are inside obstacles (shouldn't happen but safety).
@@ -1157,22 +1235,12 @@ function findPathAStar(
     }
   }
 
-  // A* failed, try simplified approach
-  return findPathSimple(start, end, floorRooms, floorCaps, coneA, coneB)
+  // A* failed, try simplified approach (shares the identical query).
+  return findPathSimple(start, end, pointBlocked, coneA, coneB)
 }
 
 function heuristic(a: Vec3, b: Vec3): number {
   return Math.sqrt((a.x - b.x) ** 2 + (a.z - b.z) ** 2)
-}
-
-function isPointBlocked(point: Vec3, bounds: { minX: number; maxX: number; minZ: number; maxZ: number }[]): boolean {
-  for (const b of bounds) {
-    if (point.x >= b.minX && point.x <= b.maxX &&
-        point.z >= b.minZ && point.z <= b.maxZ) {
-      return true
-    }
-  }
-  return false
 }
 
 function reconstructPath(node: GridNode, start: Vec3, end: Vec3, cellSize: number): Vec3[] {
@@ -1314,8 +1382,7 @@ function segmentClear(
 function findPathSimple(
   start: Vec3,
   end: Vec3,
-  roomBounds: Obstacle[],
-  capsules: CorridorCapsule[],
+  pointBlocked: (x: number, z: number) => boolean,
   coneA: ExitCone,
   coneB: ExitCone
 ): Vec3[] {
@@ -1325,7 +1392,7 @@ function findPathSimple(
   // inflated endpoint bounds, degenerating to a direct line through rooms).
   // Cones (not disks) so laterally sliding candidates still fail here.
   const clear = (path: Vec3[]): boolean =>
-    simplePathClear(path, roomBounds, capsules, coneA, coneB)
+    simplePathClear(path, pointBlocked, coneA, coneB)
 
   // Try direct
   if (clear([start, end])) {
@@ -1354,8 +1421,7 @@ function findPathSimple(
 
 function simplePathClear(
   path: Vec3[],
-  roomBounds: Obstacle[],
-  capsules: CorridorCapsule[],
+  pointBlocked: (x: number, z: number) => boolean,
   coneA: ExitCone,
   coneB: ExitCone
 ): boolean {
@@ -1370,10 +1436,7 @@ function simplePathClear(
       // Exit cones at both doors are exempt.
       if (inExitCone(x, z, coneA)) continue
       if (inExitCone(x, z, coneB)) continue
-      if (isPointBlocked({ x, y: 0, z }, roomBounds)) return false
-      for (const c of capsules) {
-        if (distPointToSegment(x, z, c.ax, c.az, c.bx, c.bz) < c.halfWidth) return false
-      }
+      if (pointBlocked(x, z)) return false
     }
   }
   return true
