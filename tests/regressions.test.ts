@@ -2,16 +2,22 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import * as THREE from 'three'
 import { GLTFExporter } from 'three/examples/jsm/exporters/GLTFExporter.js'
-import { getDefaultConfig } from '../src/core/presets'
+import { getDefaultConfig, pickWeightedRoomType, presets } from '../src/core/presets'
 import { validateConfigFeasibility, stairMathFor } from '../src/core/rules'
 import { validateExportModel, validateDoors } from '../src/core/validation'
 import { LevelScene } from '../src/renderer/scene'
 import { exportGLB, levelFilename, downloadGLB } from '../src/export/gltf'
 import { useLevelStore } from '../src/stores/level'
 import { fixtureLevel } from './fixtures'
-import type { LevelConfig, MeshData, StairsGeometry } from '../src/core/types'
+import type { Corridor, DoorOpening, LevelConfig, MeshData, Room, StairsGeometry } from '../src/core/types'
 import { createBoxMesh, createOrientedBox } from '../src/core/meshdata'
 import { generateCorridorGeometry } from '../src/generator/geometry'
+import { generateCorridors } from '../src/generator/corridors'
+import { generateTopology, topUpDegrees } from '../src/generator/topology'
+import { assignRoomSizes } from '../src/generator/rooms'
+import { planStairs, towerMouthWidthFor } from '../src/generator/vertical'
+import { omittedStairIssues } from '../src/core/generation'
+import { SeededRandom } from '../src/core/random'
 
 test('configuration rejects non-finite numbers before spatial arithmetic', () => {
   const base = getDefaultConfig()
@@ -280,4 +286,143 @@ test('download keeps its Blob URL alive until the browser can consume it', t => 
     if (original) globalThis.document = original
     else Reflect.deleteProperty(globalThis, 'document')
   }
+})
+
+test('tower shaft mouths meet the requested gate width', () => {
+  // Lawbook §24 + §0 contract. Hand-built stack forces a tower: the 4x4
+  // host fits no in-room flight, open boundary leaves shaft room, and the
+  // 12x12 upper holds the arrival landing. gateWidth 1.8 (the default).
+  const rooms: Room[] = [
+    { id: 'room_0', type: 'standard', position: { x: 0, y: 0, z: 0 }, width: 4, depth: 4, height: 3.5, floorIndex: 0, materialTheme: 'greybox', connections: ['room_1'] },
+    { id: 'room_1', type: 'standard', position: { x: 2, y: 4, z: 0 }, width: 12, depth: 12, height: 3.5, floorIndex: 1, materialTheme: 'greybox', connections: ['room_0'] },
+  ]
+  const doors = new Map<string, DoorOpening[]>()
+  const plans = planStairs(rooms, doors, {
+    boundary: { shape: 'square', width: 50, depth: 50, center: { x: 0, y: 0 } },
+    corridorSlabsByFloor: new Map(),
+    corridorDegree: new Map(),
+    floorHeight: 4, gateWidth: 1.8, gateHeight: 2.4,
+  })
+  const tower = plans.find(p => p.kind === 'tower')
+  assert.ok(tower, 'tiny host with open surroundings must plan a tower shaft')
+  const mouths = doors.get('room_0') ?? []
+  assert.ok(mouths.length > 0, 'tower mouth joins the door map')
+  for (const mouth of mouths) {
+    assert.ok(mouth.width + 1e-9 >= 1.8, `tower mouth ${mouth.width} m must meet requested 1.8 m`)
+  }
+  // Helper contract: flight-width floor, requested width above, shaft cap.
+  assert.equal(towerMouthWidthFor(1.8, 1.2), 1.8)
+  assert.equal(towerMouthWidthFor(1.0, 1.2), 1.2)
+  assert.equal(towerMouthWidthFor(2.9, 1.2), null)
+  assert.equal(towerMouthWidthFor(NaN, 1.2), null)
+})
+
+test('omitted vertical links report STAIR_NO_PLACEMENT by bridge impact', () => {
+  const mkRoom = (id: string, floor: number, conns: string[]): Room => ({
+    id, type: 'standard', position: { x: 0, y: floor * 4, z: 0 }, width: 8, depth: 8,
+    height: 3.5, floorIndex: floor, materialTheme: 'greybox', connections: conns,
+  })
+  const rooms = [mkRoom('a', 0, ['b']), mkRoom('b', 1, ['a'])]
+  // No realization and no alternate path: tier-1 bridge error with link ids.
+  const errors = omittedStairIssues(rooms, [], [], false)
+  assert.equal(errors.length, 1)
+  assert.equal(errors[0].code, 'STAIR_NO_PLACEMENT')
+  assert.equal(errors[0].severity, 'error')
+  assert.deepEqual(errors[0].objectIds, ['a', 'b'])
+  // Built link: silent.
+  assert.deepEqual(omittedStairIssues(rooms, [], [{ lowerRoomId: 'a', upperRoomId: 'b' }], true), [])
+  // Alternate realized path: no error; warning only on the final report.
+  const corridor: Corridor = {
+    id: 'corridor_a_b', startRoomId: 'a', endRoomId: 'b',
+    startPos: { x: 0, y: 0, z: 0 }, endPos: { x: 0, y: 4, z: 0 }, width: 2, floorIndex: 0,
+  }
+  assert.deepEqual(omittedStairIssues(rooms, [corridor], [], false), [])
+  const warnings = omittedStairIssues(rooms, [corridor], [], true)
+  assert.equal(warnings.length, 1)
+  assert.equal(warnings[0].code, 'STAIR_NO_PLACEMENT')
+  assert.equal(warnings[0].severity, 'warning')
+})
+
+test('semantic degree repair tops up hubs and spawn without long drags', () => {
+  // Lawbook §14: hub ≥3, spawn ≥2 (non-linear). Hand-built placed rooms;
+  // far room (>24 m) must stay an honest leaf.
+  const mkRoom = (id: string, type: Room['type'], x: number, z: number, conns: string[]): Room => ({
+    id, type, position: { x, y: 0, z }, width: type === 'hub' ? 14 : 7, depth: type === 'hub' ? 14 : 7,
+    height: 3.5, floorIndex: 0, materialTheme: 'greybox', connections: conns,
+  })
+  const rooms: Room[] = [
+    mkRoom('hub0', 'hub', 0, 0, ['s0']),
+    mkRoom('s0', 'standard', 10, 0, ['hub0']),
+    mkRoom('s1', 'standard', -10, 0, []),
+    mkRoom('far', 'standard', 100, 0, []),
+    mkRoom('sp', 'spawn', 0, 20, ['s2']),
+    mkRoom('s2', 'standard', 8, 20, ['sp']),
+  ]
+  const config = { ...getDefaultConfig(), shape: 'rectangle' as const }
+  topUpDegrees(rooms, config)
+  const deg = (id: string): number => rooms.find(r => r.id === id)!.connections.length
+  assert.ok(deg('hub0') >= 3, `hub topped to trunk degree, got ${deg('hub0')}`)
+  assert.ok(deg('sp') >= 2, `spawn topped off leaf status, got ${deg('sp')}`)
+  assert.equal(deg('far'), 0, 'unreachable room stays an honest leaf')
+  // Linear maps exempt end stations by design.
+  const linear = rooms.map(r => ({ ...r, connections: [...r.connections] }))
+  const spLinear = linear.find(r => r.id === 'sp')!
+  spLinear.connections = ['s2']
+  topUpDegrees(linear, { ...config, shape: 'linear' as const })
+  assert.equal(linear.find(r => r.id === 'sp')!.connections.length, 1)
+})
+
+test('large-room quota is a deterministic reservation', () => {
+  // Warehouse asks 3 large rooms in 10: the quota must materialize (not a
+  // 30% coin flip) and reproduce bit-for-bit.
+  const config = { ...getDefaultConfig(), roomCount: 12, floorCount: 1, largeRoomCount: 3, preset: 'warehouse', seed: 5 }
+  const boundary = { shape: 'rectangle' as const, width: 70, depth: 70, center: { x: 0, y: 0 } }
+  const first = generateTopology(config, boundary, new SeededRandom(5))
+  const second = generateTopology(config, boundary, new SeededRandom(5))
+  assert.deepEqual(first.map(r => r.type), second.map(r => r.type))
+  const larges = first.slice(1, -1).filter(r => r.type === 'hub' || r.type === 'arena')
+  assert.ok(larges.length >= 3, `quota forces ≥3 large rooms, got ${larges.length}`)
+})
+
+test('preset room-type profiles differentiate the lottery', () => {
+  // Lawbook §89: same seed, different preset character. Fixed-stream
+  // distribution pins with wide margins (deterministic, not statistical).
+  const draw = (preset: string): Record<string, number> => {
+    const rng = new SeededRandom(42)
+    const counts: Record<string, number> = {}
+    for (let i = 0; i < 400; i++) {
+      const t = pickWeightedRoomType(rng, presets[preset].roomTypeWeights)
+      counts[t] = (counts[t] ?? 0) + 1
+    }
+    return counts
+  }
+  const office = draw('office')
+  assert.ok(office.hall! >= 80, `office deals halls, got ${office.hall}`)
+  assert.ok((office.arena ?? 0) <= 20, `office avoids arenas, got ${office.arena}`)
+  const dungeon = draw('dungeon')
+  assert.ok(dungeon.standard! >= 150, `dungeon deals standards, got ${dungeon.standard}`)
+  const warehouse = draw('warehouse')
+  assert.ok(warehouse.arena! >= 50, `warehouse deals arenas, got ${warehouse.arena}`)
+  assert.ok((warehouse.hall ?? 0) <= 40, `warehouse avoids halls, got ${warehouse.hall}`)
+  const horror = draw('horrorFacility')
+  assert.ok(horror.hall! >= 70, `horror deals halls, got ${horror.hall}`)
+  assert.ok((horror.arena ?? 0) <= 30, `horror avoids arenas, got ${horror.arena}`)
+})
+
+test('tower reservations steer corridor routing around shafts', () => {
+  // Lawbook §40: with a shaft reserved mid-link, the direct edge fouls and
+  // realizes as hops through the midpoint room instead of shipping through.
+  const mkRoom = (id: string, x: number, z: number, conns: string[]): Room => ({
+    id, type: 'standard', position: { x, y: 0, z }, width: 6, depth: 6,
+    height: 3.5, floorIndex: 0, materialTheme: 'greybox', connections: conns,
+  })
+  const rooms = [mkRoom('room_a', 0, 0, ['room_b']), mkRoom('room_b', 20, 0, ['room_a']), mkRoom('room_m', 10, 9, [])]
+  const config = { ...getDefaultConfig(), roomCount: 3, floorCount: 1 }
+  const plain = generateCorridors(rooms, config, false)
+  assert.equal(plain.length, 1)
+  assert.deepEqual([plain[0].startRoomId, plain[0].endRoomId].sort(), ['room_a', 'room_b'])
+  const steered = generateCorridors(rooms, config, false,
+    [{ key: 't', rect: { minX: 8, maxX: 12, minZ: -2, maxZ: 2 }, upperFloor: 0 }])
+  const pairs = steered.map(c => [c.startRoomId, c.endRoomId].sort().join('-')).sort()
+  assert.deepEqual(pairs, ['room_a-room_m', 'room_b-room_m'])
 })

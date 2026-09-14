@@ -55,6 +55,28 @@ const STAIR_WALL_INSET = 0.75
 // Attached stair tower (outdoor shaft) dimensions.
 const TOWER_WIDTH = 3.0
 const TOWER_PARAPET = 1.1
+// Shaft inner clear half-width (outer minus wall thickness): the tower
+// mouth must fit inside it (lawbook §52: no wall across the opening).
+const TOWER_INNER_HALF = TOWER_WIDTH / 2 - SPATIAL_DEFAULTS.wallThickness // 1.2 m
+// Body radius used when a mouth must cover the flight's walking line.
+const TOWER_MOUTH_BODY = 0.4
+
+/**
+ * Requested-width tower mouth (lawbook §24 + §0 contract: a shaft mouth is
+ * a doorway and must meet the requested gate width, not just the 1.2 m
+ * flight). Returns null when the gate exceeds the shaft's inner faces —
+ * such a tower can never validate, so planning must not attempt it.
+ */
+export function towerMouthWidthFor(gateWidth: number, flightW: number): number | null {
+  if (!Number.isFinite(gateWidth) || !(gateWidth > 0) || !Number.isFinite(flightW) || !(flightW > 0)) {
+    return null
+  }
+  const mouth = Math.max(flightW, gateWidth)
+  // Keep 0.05 off the shaft inner faces so the hole edge never lands
+  // coplanar with the shaft wall (vertical slit line).
+  if (mouth / 2 > TOWER_INNER_HALF - 0.05) return null
+  return mouth
+}
 
 // Max stair shafts per room: more is over-linking no room can host cleanly.
 const MAX_VERTICAL_PER_ROOM = 3
@@ -86,6 +108,17 @@ export interface StairPlan {
   towerDoor: { wallIndex: number; x: number; z: number } | null
 }
 
+/**
+ * Early tower-shaft reservation for corridor routing (lawbook §40: reserve
+ * vertical before circulation). Shaft walls run full height, so the rect
+ * blocks routing on every floor up to the arrival floor.
+ */
+export interface TowerReservation {
+  key: string
+  rect: Rect2D
+  upperFloor: number
+}
+
 export interface StairPlanContext {
   /** Upper-floor corridor slab footprints the arrival hole must avoid. */
   corridorSlabsByFloor: Map<number, Rect2D[]>
@@ -110,6 +143,13 @@ export interface StairPlanContext {
   gateHeight?: number
   /** Suppress per-link omission warnings (layout retry probes). */
   quiet?: boolean
+  /**
+   * Towers-only probe: plan just shaft sites (no in-room search) for early
+   * reservation before corridors claim open space (lawbook §40). The final
+   * pass always re-plans with real doors/capsules; probe output only
+   * reserves, never ships.
+   */
+  towersOnly?: boolean
 }
 
 function rectsOverlap(a: Rect2D, b: Rect2D, pad = 0): boolean {
@@ -449,6 +489,7 @@ export function planStairs(
     run,
     gateWidth: context?.gateWidth ?? SPATIAL_DEFAULTS.doorClearWidth,
     gateHeight: context?.gateHeight ?? SPATIAL_DEFAULTS.doorClearHeight,
+    towersOnly: context?.towersOnly ?? false,
     reasons: new Map<string, number>(),
     atFloor,
   }
@@ -500,13 +541,14 @@ export function planStairs(
     // rooms). In very small/narrow rooms none fits: the link is reported
     // explicitly (no stairs) instead of built broken.
     const before = new Map(st.reasons)
-    const plan =
-      tryTowerPlan(link, st, switchDims) ??
-      tryInRoomPlan(link, st, straightDims, false) ??
-      tryInRoomPlan(link, st, switchDims, true)
+    const plan = st.towersOnly
+      ? tryTowerPlan(link, st, switchDims)
+      : (tryTowerPlan(link, st, switchDims) ??
+        tryInRoomPlan(link, st, straightDims, false) ??
+        tryInRoomPlan(link, st, switchDims, true))
     if (!plan) {
       const lDims = lower ? `${lower.width.toFixed(1)}x${lower.depth.toFixed(1)}m` : '?'
-      if (!quiet) {
+      if (!quiet && !st.towersOnly) {
         console.warn(
           `[LevelWeaver] stair ${link.lowerRoomId}->${link.upperRoomId} omitted: no rule-clean placement ` +
           `(host ${lDims}; straight needs ${straightDims.width.toFixed(1)}x${straightDims.depth.toFixed(1)}m, ` +
@@ -546,6 +588,8 @@ interface StairPlanner {
   gateHeight: number
   /** Rejection census: why candidates fail (debuggability, lawbook §85). */
   reasons: Map<string, number>
+  /** Towers-only probe (see StairPlanContext): skip in-room search. */
+  towersOnly: boolean
   atFloor: (map: Map<number, Rect2D[]>, floor: number) => Rect2D[]
 }
 
@@ -634,16 +678,16 @@ function recordPlan(st: StairPlanner, plan: StairPlan): void {
   // rules) must see tower mouths, or they will park flights across them
   // and seal the shaft. Same record the old mergeTowerDoors wrote, at the
   // moment it becomes knowable. Deterministic (link order is fixed).
-  // Width is one flight width (entry half), NOT the gate setting: the
-  // mouth serves flight A only (see tryTowerPlan), and a full-setting
-  // hole would reintroduce the jamb-clip the aligned door just fixed.
+  // Width is the requested-width mouth (lawbook §24): the hole serves the
+  // gate setting, so validators judge the same width the wall cutter cuts.
   if (plan.kind === 'tower' && plan.towerDoor) {
     const list = st.doorsByRoom.get(plan.hostRoomId) ?? []
+    const mouth = towerMouthWidthFor(st.gateWidth, plan.width / 2) ?? plan.width / 2
     list.push({
       roomId: plan.hostRoomId,
       wallIndex: plan.towerDoor.wallIndex,
       position: { x: plan.towerDoor.x, y: host.position.y + 0.1, z: plan.towerDoor.z },
-      width: plan.width / 2,
+      width: mouth,
       height: st.gateHeight,
       targetRoomId: plan.link.upperRoomId,
     })
@@ -900,6 +944,33 @@ function tryTowerPlan(
   const hostFloor = host.floorIndex
   const upperFloor = upper.floorIndex
   const { width, depth } = dims
+  // Mouth contract first: a tower whose gate cannot fit the shaft is not
+  // attempted (it could never validate — lawbook §24). Falls through to
+  // in-room planning, then honest omission with STAIR_NO_PLACEMENT.
+  const flightW = width / 2 // entry-half flight (switchbacks fold two 1.2 m runs)
+  const mouthW = towerMouthWidthFor(st.gateWidth, flightW)
+  if (mouthW === null) {
+    noteRejection(st, 'tower-gate-too-wide')
+    return null
+  }
+  // Lateral mouth center that keeps the hole inside the shaft inner faces
+  // AND covering the flight-A body sweep. Flight-width mouths keep their
+  // exact legacy alignment; wider gates solve a centering both satisfy.
+  const flightC = -flightW / 2 // flight-A centerline rel. shaft center
+  let mouthOff: number
+  if (mouthW <= flightW + 1e-9) {
+    mouthOff = flightC + 0.05
+  } else {
+    const m = mouthW / 2
+    const innerLim = TOWER_INNER_HALF - 0.05
+    const lo = Math.max(flightC + TOWER_MOUTH_BODY - m, -innerLim + m)
+    const hi = Math.min(flightC - TOWER_MOUTH_BODY + m, innerLim - m)
+    if (lo > hi + 1e-9) {
+      noteRejection(st, 'tower-mouth-cannot-fit')
+      return null
+    }
+    mouthOff = lo
+  }
   // Shaft length: flight depth + stand-off at the host wall (0.4, so a
   // body on the entry tread clears the host wall by more than its
   // radius) + stand-off at the far end (0.42 past the top tread's front
@@ -1067,10 +1138,10 @@ function tryTowerPlan(
       // earlier in-room flight (links plan in critical order; an inroom
       // flight parked across this shaft's future doorway would seal it,
       // and the shaft rect itself (outside the wall) cannot see that).
-      // Door geometry mirrors the aligned mouth cut at selection time.
+      // Door geometry mirrors the aligned mouth cut at selection time
+      // (requested-width mouth, not the flight half).
       {
-        const flightW = width / 2
-        const doorLat = wallC + c - flightW / 2 + 0.05
+        const doorLat = wallC + c + mouthOff
         const doorPos = side.axis === 'x'
           ? { x: wallPlane, z: doorLat }
           : { x: doorLat, z: wallPlane }
@@ -1078,7 +1149,7 @@ function tryTowerPlan(
           roomId: host.id,
           wallIndex: side.wallIndex,
           position: { x: doorPos.x, y: 0, z: doorPos.z },
-          width: flightW,
+          width: mouthW,
           height: st.gateHeight,
           targetRoomId: link.upperRoomId,
         })
@@ -1086,6 +1157,20 @@ function tryTowerPlan(
           if (rectsOverlap(zone, f, 0)) {
             blocked = true
             break
+          }
+        }
+        // Mouth corner margins (lawbook §26): the requested-width hole
+        // must fit the host wall with real corner clearance.
+        if (!blocked) {
+          const wallLo = wallC - alongWall / 2
+          const wallHi = wallC + alongWall / 2
+          const edgeD = Math.min(
+            doorLat - mouthW / 2 - wallLo,
+            wallHi - (doorLat + mouthW / 2),
+          )
+          if (edgeD < SPATIAL_DEFAULTS.doorCornerMargin - 1e-9) {
+            noteRejection(st, 'tower-door-corner')
+            blocked = true
           }
         }
       }
@@ -1152,11 +1237,10 @@ function tryTowerPlan(
       const score = facing + Math.min(towerClear, 4) + Math.min(hostDoorClear, 3)
       if (score > bestScore) {
         bestScore = score
-        // Door center sits on FLIGHT A's centerline (entry half), nudged
-        // 5 cm toward middle so the hole edge never lands exactly coplanar
-        // with the shaft's inner wall face (vertical slit line).
-        const flightW = width / 2
-        const doorLat = wallC + c - flightW / 2 + 0.05
+        // Door center on the solved mouth offset (flight-A alignment for
+        // flight-width mouths, recentered for wider gates so the hole
+        // edge never lands coplanar with the shaft's inner wall face).
+        const doorLat = wallC + c + mouthOff
         const doorPos = side.axis === 'x'
           ? { x: wallPlane, z: doorLat }
           : { x: doorLat, z: wallPlane }

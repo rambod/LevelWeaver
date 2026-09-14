@@ -4,12 +4,12 @@ import { SeededRandom, hashString } from '@/core/random'
 import { GENERATOR_VERSION, circulationGap, gateWidthFor, validateConfigFeasibility, SPATIAL_DEFAULTS } from '@/core/rules'
 import { buildLevelGraph, validateLevelGraph } from '@/core/levelGraph'
 import { generateBoundary } from '@/generator/boundary'
-import { generateTopology } from '@/generator/topology'
+import { generateTopology, topUpDegrees } from '@/generator/topology'
 import { assignRoomSizes, placeRooms, resolveOverlaps } from '@/generator/rooms'
 import { generateCorridors } from '@/generator/corridors'
 import { generateRoomGeometry, generateCorridorGeometry } from '@/generator/geometry'
 import type { RoomSlabHoles } from '@/generator/geometry'
-import { planStairs, buildStairsGeometry, rewriteVerticalLinks, type StairPlan } from '@/generator/vertical'
+import { planStairs, buildStairsGeometry, rewriteVerticalLinks, type StairPlan, type TowerReservation } from '@/generator/vertical'
 import {
   compareTiers,
   reportOf,
@@ -163,8 +163,8 @@ export function generateLevel(rawConfig: LevelConfig): GeneratedLevel {
   // and only toward fewer hard errors. One extra routing pass, only when
   // triggered — clean generations pay nothing.
   if (layoutNeedsMouthRepair(layout)) {
-    const altCorridors = generateCorridors(layout.roomsBase, config, true)
-    const alt = finishLayout(layout.roomsBase, altCorridors, boundary, config, floorHeight)
+    const altCorridors = generateCorridors(layout.roomsBase, config, true, layout.towerReservations)
+    const alt = finishLayout(layout.roomsBase, altCorridors, boundary, config, floorHeight, layout.towerReservations)
     if (compareTiers(alt.tiers, layout.tiers) < 0) {
       layout = alt
     }
@@ -172,9 +172,11 @@ export function generateLevel(rawConfig: LevelConfig): GeneratedLevel {
 
   const { rooms, corridors, doorOpenings, stairPlans, slabHoles } = layout
 
-// A layout qualifies for mouth repair when mouths can plausibly cure it:
-// at least one sealed gate or endpoint mouth intrusion, and no broken
-// placement (overlap/nesting/out-of-bounds) that mouths cannot fix.
+// A layout qualifies for variant repair when alternate mouths can
+// plausibly cure it: sealed gates, endpoint mouth intrusions, or corridor
+// crossings (a new wall choice often routes around the other ribbon).
+// Broken placement (overlap/nesting/out-of-bounds) vetoes: mouths cannot
+// fix it, and the extra routing pass would be wasted.
 function layoutNeedsMouthRepair(layout: LayoutResult): boolean {
   let mouthFoul = false
   for (const issue of layout.issues) {
@@ -192,6 +194,7 @@ function layoutNeedsMouthRepair(layout: LayoutResult): boolean {
     if (issue.code === 'CORRIDOR_ROOM_COLLISION' && issue.message.includes('(mouth foul)')) {
       mouthFoul = true
     }
+    if (issue.code === 'CORRIDOR_CROSSING') mouthFoul = true
   }
   return mouthFoul
 }
@@ -211,6 +214,8 @@ interface LayoutResult {
   slabHoles: Map<string, RoomSlabHoles>
   tiers: ErrorTiers
   issues: GenerationIssue[]
+  /** Early tower-shaft reservations that steered corridor routing (§40). */
+  towerReservations: TowerReservation[]
 }
 
 function runLayoutAttempt(
@@ -234,6 +239,12 @@ function runLayoutAttempt(
   let roomsBase = placeRooms(roomsInput, boundary, config, placementRng)
   roomsBase = resolveOverlaps(roomsBase, boundary, circulationGap(config))
 
+  // Semantic degree repair on PLACED rooms (lawbook §14): real footprints
+  // for the §100 capacity check and real positions for the short-link cap,
+  // after placement so new edges cannot distort it. Short by construction,
+  // so corridors route them directly and stairs keep their hosts.
+  topUpDegrees(roomsBase, config)
+
   // Stage 5b: vertical links rewritten by final overlap (lawbook §49).
   rewriteVerticalLinks(roomsBase, floorHeight)
 
@@ -249,8 +260,12 @@ function runLayoutAttempt(
 
   // Stage 6-7: corridors + gate openings (shared gate rule, §28).
   // Primary pass uses legacy facing-wall mouths (V0.1.0 behavior).
-  const corridors = generateCorridors(roomsBase, config, false)
-  return finishLayout(roomsBase, corridors, boundary, config, floorHeight)
+  // Lawbook §40: tower shafts are reserved BEFORE corridors claim open
+  // space. The probe plans shafts only (no doors/corridors exist yet);
+  // the final pass below re-plans every link with real constraints.
+  const towerReservations = planTowerReservations(roomsBase, boundary, config, floorHeight)
+  const corridors = generateCorridors(roomsBase, config, false, towerReservations)
+  return finishLayout(roomsBase, corridors, boundary, config, floorHeight, towerReservations)
 }
 
 // Stages 6b-7b for a fixed placement: hop recording (§87), gate
@@ -263,6 +278,7 @@ function finishLayout(
   boundary: Boundary,
   config: LevelConfig,
   floorHeight: number,
+  towerReservations: TowerReservation[] = [],
 ): LayoutResult {
   // Hop copies: subdivision realizations join the graph explicitly on a
   // fresh copy so variant rebuilds never inherit stale hop edges.
@@ -302,12 +318,15 @@ function finishLayout(
   const slabHoles = computeSlabHoles(rooms, stairPlans)
 
   // Attempt score: layout-dependent hard errors — realized graph
-  // traversal (§10, §62), sealed gates (§61), stair headroom (§45) and
-  // stair clipping (§40/49), corridor lawfulness (§30-32/35-36), and
-  // physical grid navigation (§59-60). Size/topology-bound checks
-  // (aspects, capacity, slabs) run once at the end.
+  // traversal (§10, §62), omitted stair shafts (§49, bridge omissions
+  // only: redundant ones must not reshuffle winning layouts), sealed
+  // gates (§61), stair headroom (§45) and stair clipping (§40/49),
+  // corridor lawfulness (§30-32/35-36), and physical grid navigation
+  // (§59-60). Size/topology-bound checks (aspects, capacity, slabs) run
+  // once at the end.
   const attemptIssues: GenerationIssue[] = [
     ...validateRealizedConnectivity(rooms, corridors, stairPlans, config.floorCount),
+    ...omittedStairIssues(rooms, corridors, stairPlans.map(p => p.link), false),
     ...validatePortalSampling(rooms, doorOpenings, corridors, stairPlans),
     ...validatePortalSeals(rooms, doorOpenings, corridors, stairPlans),
     ...validateStairHeadroom(rooms, stairPlans, corridors),
@@ -321,7 +340,7 @@ function finishLayout(
     ...validateStairs(stairPlans),
     ...validateLinkLengths(rooms),
   ]
-  return { roomsBase, rooms, corridors, doorOpenings, stairPlans, slabHoles, tiers: tiersOf(attemptIssues), issues: attemptIssues }
+  return { roomsBase, rooms, corridors, doorOpenings, stairPlans, slabHoles, tiers: tiersOf(attemptIssues), issues: attemptIssues, towerReservations }
 }
 
 // Distance from point P to segment AB (2D). Local helper so the prune
@@ -430,6 +449,7 @@ function pruneMonsterLinks(rooms: Room[]): void {
     )
   }
   issues.push(...validateRealizedConnectivity(rooms, corridors, stairPlans, config.floorCount))
+  issues.push(...omittedStairIssues(rooms, corridors, stairPlans.map(p => p.link), true))
   issues.push(...validateRoomPlacement(rooms, boundary))
   issues.push(...validateRoomAspects(rooms))
   issues.push(...validateDoors(rooms, doorOpenings, config))
@@ -469,6 +489,123 @@ function pruneMonsterLinks(rooms: Room[]): void {
     validation,
     ok: validation.errors.length === 0,
   }
+}
+
+// Lawbook §40: probe tower-shaft sites BEFORE corridors are routed, so
+// open-space shafts are reserved instead of being blocked by ribbons that
+// ship first. Towers-only (in-room flights live inside rooms, which the
+// router already avoids); doors/slabs/capsules do not exist yet, so the
+// probe over-approximates — the final pass re-plans every link with real
+// constraints and may still omit. Deterministic probe, discarded output.
+function planTowerReservations(
+  roomsBase: Room[],
+  boundary: Boundary,
+  config: LevelConfig,
+  floorHeight: number,
+): TowerReservation[] {
+  const probes = planStairs(roomsBase, new Map(), {
+    boundary,
+    corridorSlabsByFloor: new Map(),
+    corridorDegree: new Map(),
+    floorHeight,
+    gateWidth: config.doorWidth,
+    gateHeight: config.doorHeight,
+    quiet: true,
+    towersOnly: true,
+  })
+  const floorOf = new Map(roomsBase.map(r => [r.id, r.floorIndex]))
+  const out: TowerReservation[] = []
+  for (const p of probes) {
+    if (!p.towerRect) continue
+    out.push({
+      key: `${p.link.lowerRoomId}|${p.link.upperRoomId}`,
+      rect: p.towerRect,
+      upperFloor: floorOf.get(p.link.upperRoomId) ?? 0,
+    })
+  }
+  return out
+}
+
+// Lawbook §49/§87: every cross-floor intent edge needs a spatial
+// realization (built stair) or an explicit finding. Omitted links used to
+// surface only as generic GRAPH_DISCONNECTED — which says where the map
+// broke, not which shaft failed. Bridge omissions (no alternate realized
+// path between the rooms) are tier-1 errors; redundant omissions (a path
+// exists via other corridors/stairs) are warnings, reported only on the
+// final candidate so they never steer attempt selection.
+export function omittedStairIssues(
+  rooms: Room[],
+  corridors: Corridor[],
+  builtLinks: { lowerRoomId: string; upperRoomId: string }[],
+  reportRedundant: boolean,
+): GenerationIssue[] {
+  const issues: GenerationIssue[] = []
+  const byId = new Map(rooms.map(r => [r.id, r]))
+  const adj = new Map<string, Set<string>>()
+  for (const r of rooms) adj.set(r.id, new Set())
+  const linkAdj = (a: string, b: string): void => {
+    adj.get(a)?.add(b)
+    adj.get(b)?.add(a)
+  }
+  for (const c of corridors) linkAdj(c.startRoomId, c.endRoomId)
+  for (const p of builtLinks) linkAdj(p.lowerRoomId, p.upperRoomId)
+  const reachable = (from: string, to: string): boolean => {
+    if (from === to) return true
+    const seen = new Set<string>([from])
+    const queue = [from]
+    while (queue.length > 0) {
+      const cur = queue.pop()!
+      for (const nb of adj.get(cur) ?? []) {
+        if (nb === to) return true
+        if (!seen.has(nb)) {
+          seen.add(nb)
+          queue.push(nb)
+        }
+      }
+    }
+    return false
+  }
+  const built = new Set(builtLinks.map(p => [p.lowerRoomId, p.upperRoomId].sort().join('|')))
+  const seenLink = new Set<string>()
+  const redundant: string[] = []
+  for (const r of rooms) {
+    for (const c of r.connections) {
+      const o = byId.get(c)
+      if (!o || Math.abs(o.floorIndex - r.floorIndex) !== 1) continue
+      const lower = r.floorIndex < o.floorIndex ? r : o
+      const upper = r.floorIndex < o.floorIndex ? o : r
+      const key = `${lower.id}|${upper.id}`
+      if (seenLink.has(key)) continue
+      seenLink.add(key)
+      if (built.has([lower.id, upper.id].sort().join('|'))) continue
+      if (reachable(lower.id, upper.id)) {
+        redundant.push(`${lower.id}->${upper.id}`)
+      } else {
+        issues.push({
+          code: 'STAIR_NO_PLACEMENT',
+          severity: 'error',
+          stage: 'stairs',
+          objectIds: [lower.id, upper.id],
+          message:
+            `Vertical link ${lower.id}->${upper.id} has no stair placement and no alternate realized path. ` +
+            `Stack the rooms with more overlap or reduce density so a shaft fits.`,
+        })
+      }
+    }
+  }
+  if (reportRedundant && redundant.length > 0) {
+    const ids = [...new Set(redundant.flatMap(s => s.split('->')))].sort()
+    issues.push({
+      code: 'STAIR_NO_PLACEMENT',
+      severity: 'warning',
+      stage: 'stairs',
+      objectIds: ids,
+      message:
+        `${redundant.length} redundant vertical link(s) omitted (an alternate realized path exists): ` +
+        `${[...redundant].sort().join(', ')}.`,
+    })
+  }
+  return issues
 }
 
 // Corridor slab footprints per floor (world XZ): stair arrivals must not

@@ -1,5 +1,6 @@
 import type { Room, Corridor, LevelConfig, Vec3 } from '@/core/types'
-import { gateWidthFor, segSegDist2D, SPATIAL_DEFAULTS } from '@/core/rules'
+import { gateWidthFor, segSegDist2D, SPATIAL_DEFAULTS, ROUTING_MARGIN } from '@/core/rules'
+import type { TowerReservation } from '@/generator/vertical'
 
 interface Obstacle {
   minX: number
@@ -76,6 +77,10 @@ export function generateCorridors(
   // mouths route foul retry through alternate walls before surrendering.
   // Default false = legacy facing-wall mouths, byte-identical to V0.1.0.
   allowAltMouths = false,
+  // Lawbook §40: early tower-shaft reservations from the vertical probe.
+  // Shaft walls run full height, so each rect blocks routing on every
+  // floor up to the arrival floor. Default empty = legacy routing.
+  reservedTowers: TowerReservation[] = [],
 ): Corridor[] {
   const corridors: Corridor[] = []
   const roomMap = new Map(rooms.map(r => [r.id, r]))
@@ -83,9 +88,9 @@ export function generateCorridors(
 
   // Room obstacles, inflated so the corridor CENTERLINE keeps enough
   // clearance for its walls AND a passing player (lawbook §33/§101:
-  // corridorWidth/2 + wallThickness + safetyMargin, where the margin
-  // covers the player body at neighboring doorways, not just slack).
-  const routePad = config.corridorWidth / 2 + SPATIAL_DEFAULTS.wallThickness + 0.45
+  // corridorWidth/2 + wallThickness + ROUTING_MARGIN, shared with the
+  // placement gap in `@/core/rules` — one formula, not two literals).
+  const routePad = config.corridorWidth / 2 + SPATIAL_DEFAULTS.wallThickness + ROUTING_MARGIN
   const roomBounds: (Obstacle & { roomId: string })[] = rooms.map(r => ({
     roomId: r.id,
     minX: r.position.x - r.width / 2 - routePad,
@@ -104,6 +109,32 @@ export function generateCorridors(
     maxZ: r.position.z + r.depth / 2,
     floorIndex: r.floorIndex,
   }))
+
+  // Reserved tower shafts as pseudo-rooms (lawbook §40): A*, smoothing and
+  // the verifier all consult roomBounds/roomRects, so shafts steer routing
+  // without touching midpoint selection (which iterates `rooms`, never
+  // these arrays) or validation (which uses real rooms). Synthetic ids can
+  // never collide with room ids (rooms are `room_N`).
+  for (const res of reservedTowers) {
+    for (let f = 0; f <= res.upperFloor; f++) {
+      roomBounds.push({
+        roomId: `tower:${res.key}`,
+        minX: res.rect.minX - routePad,
+        maxX: res.rect.maxX + routePad,
+        minZ: res.rect.minZ - routePad,
+        maxZ: res.rect.maxZ + routePad,
+        floorIndex: f,
+      })
+      roomRects.push({
+        roomId: `tower:${res.key}`,
+        minX: res.rect.minX,
+        maxX: res.rect.maxX,
+        minZ: res.rect.minZ,
+        maxZ: res.rect.maxZ,
+        floorIndex: f,
+      })
+    }
+  }
 
   interface PendingPair { a: Room; b: Room; dist: number; depth: number }
   const pairs: PendingPair[] = []
@@ -340,14 +371,22 @@ function createCorridor(
   if (!firstDoors.start || !firstDoors.end) {
     return { corridor: null, midFoul: null, mouthFoul: false, crossFoul: false }
   }
-  const banCombos: { banA: Set<number>; banB: Set<number> }[] = allowAltMouths
-    ? [
-        { banA: new Set(), banB: new Set() },
-        { banA: new Set([firstDoors.start.wallIndex]), banB: new Set() },
-        { banA: new Set(), banB: new Set([firstDoors.end.wallIndex]) },
-        { banA: new Set([firstDoors.start.wallIndex]), banB: new Set([firstDoors.end.wallIndex]) },
-      ]
-    : [{ banA: new Set(), banB: new Set() }]
+  // Alt-mouth search order: preferred mouths, facing-wall bans, then every
+  // single-wall ban per side. First fully-clean route wins, so clean edges
+  // pay exactly the legacy cost; only persistently-foul edges run deep.
+  // (Rare path: best-of-two variant pass only, §70 repair step 2.)
+  const banCombos: { banA: Set<number>; banB: Set<number> }[] = [{ banA: new Set(), banB: new Set() }]
+  if (allowAltMouths) {
+    banCombos.push(
+      { banA: new Set([firstDoors.start.wallIndex]), banB: new Set() },
+      { banA: new Set(), banB: new Set([firstDoors.end.wallIndex]) },
+      { banA: new Set([firstDoors.start.wallIndex]), banB: new Set([firstDoors.end.wallIndex]) },
+    )
+    for (let w = 0; w < 4; w++) {
+      if (w !== firstDoors.start.wallIndex) banCombos.push({ banA: new Set([w]), banB: new Set() })
+      if (w !== firstDoors.end.wallIndex) banCombos.push({ banA: new Set(), banB: new Set([w]) })
+    }
+  }
   let fallbackResult: { corridor: Corridor | null; midFoul: string | null; mouthFoul: boolean; crossFoul: boolean } | null = null
   for (const { banA, banB } of banCombos) {
     const startDoor = banA.size === 0 && banB.size === 0

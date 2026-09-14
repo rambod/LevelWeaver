@@ -101,6 +101,7 @@ export function errorTier(code: IssueCode): 1 | 2 | 3 {
     case 'STAIR_TOO_NARROW':
     case 'STAIR_NO_HEADROOM':
     case 'STAIR_NO_ARRIVAL':
+    case 'STAIR_NO_PLACEMENT':
     case 'STAIR_ARRIVAL_WALL':
     case 'STAIR_NO_LANDING':
     case 'STAIR_NO_SHAFT':

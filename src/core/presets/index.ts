@@ -1,8 +1,16 @@
-import type { LevelConfig, MapShape } from '@/core/types'
+import type { LevelConfig, MapShape, RoomType } from '@/core/types'
+import { SeededRandom } from '@/core/random'
 
 export interface Preset {
   name: string
   config: Partial<LevelConfig>
+  /**
+   * Room-type lottery multipliers (lawbook §89: presets shape topology
+   * preference, not just counts). Multiplies the base table weight per
+   * type; missing types default to 1. Pure data — the lottery lives in
+   * `@/generator/topology`, validity rules are never bypassed (§88).
+   */
+  roomTypeWeights?: Partial<Record<RoomType, number>>
 }
 
 export const presets: Record<string, Preset> = {
@@ -20,6 +28,8 @@ export const presets: Record<string, Preset> = {
     wallHeight: 3.5,
       corridorWidth: 3,
     },
+    // Open fight spaces, few closets.
+    roomTypeWeights: { arena: 2.5, hub: 2, connector: 1.5, storage: 0.4 },
   },
   dungeon: {
     name: 'Dungeon',
@@ -32,9 +42,11 @@ export const presets: Record<string, Preset> = {
       deadEnds: 0.3,
       roomSizeVariation: 0.4,
       largeRoomCount: 1,
-    wallHeight: 3.5,
+    wallHeight: 3.8,
       corridorWidth: 2.5,
     },
+    // Irregular many-small-rooms sprawl.
+    roomTypeWeights: { standard: 2, storage: 1.5, connector: 1.5, hub: 0.6 },
   },
   researchFacility: {
     name: 'Research Facility',
@@ -52,6 +64,7 @@ export const presets: Record<string, Preset> = {
       // 1.8-3.0 m FPS band, never above it.
       corridorWidth: 3,
     },
+    roomTypeWeights: { standard: 1.8, hall: 1.5, arena: 0.6 },
   },
   office: {
     name: 'Office',
@@ -64,9 +77,11 @@ export const presets: Record<string, Preset> = {
       deadEnds: 0.15,
       roomSizeVariation: 0.2,
       largeRoomCount: 1,
-    wallHeight: 3.5,
+    wallHeight: 3.2,
       corridorWidth: 2.5,
     },
+    // Low ceilings, regular bands of halls and standards.
+    roomTypeWeights: { hall: 2.5, standard: 2, storage: 1.5, arena: 0.3, hub: 0.7 },
   },
   militaryBunker: {
     name: 'Military Bunker',
@@ -82,6 +97,7 @@ export const presets: Record<string, Preset> = {
     wallHeight: 3.5,
       corridorWidth: 3,
     },
+    roomTypeWeights: { standard: 1.8, storage: 2, hall: 1.5, arena: 0.6 },
   },
   warehouse: {
     name: 'Warehouse',
@@ -94,9 +110,11 @@ export const presets: Record<string, Preset> = {
       deadEnds: 0.05,
       roomSizeVariation: 0.6,
       largeRoomCount: 3,
-    wallHeight: 3.5,
+    wallHeight: 4.2,
       corridorWidth: 4,
     },
+    // High-bay chambers, few connectors.
+    roomTypeWeights: { arena: 2.5, hub: 2, storage: 1.5, hall: 0.5, connector: 0.5 },
   },
   sciFiFacility: {
     name: 'Sci-Fi Facility',
@@ -112,6 +130,7 @@ export const presets: Record<string, Preset> = {
     wallHeight: 3.5,
       corridorWidth: 3,
     },
+    roomTypeWeights: { hub: 1.8, hall: 1.5, standard: 1.2 },
   },
   horrorFacility: {
     name: 'Horror Facility',
@@ -124,9 +143,11 @@ export const presets: Record<string, Preset> = {
       deadEnds: 0.4,
       roomSizeVariation: 0.5,
       largeRoomCount: 1,
-    wallHeight: 3.5,
+    wallHeight: 3.2,
       corridorWidth: 2.5,
     },
+    // Low ceilings, branchy halls and closets, few open chambers.
+    roomTypeWeights: { hall: 2, storage: 2, standard: 1.5, connector: 1.5, arena: 0.5, hub: 0.6 },
   },
 }
 
@@ -151,8 +172,43 @@ export const themes = [
   'laboratory',
 ]
 
-export function getDefaultConfig(): LevelConfig {
-  return {
+// Base lottery weights (lawbook §89 neutral profile): the topology table
+// draws from these, multiplied by the active preset's roomTypeWeights.
+// Spawn/exit are mandatory placements, never lottery draws.
+export const BASE_ROOM_TYPE_WEIGHTS: Record<RoomType, number> = {
+  standard: 4,
+  hall: 2,
+  hub: 1,
+  arena: 1,
+  objective: 1,
+  storage: 1,
+  connector: 1,
+  verticalConnector: 1,
+  spawn: 0,
+  exit: 0,
+}
+
+/**
+ * Seeded weighted room-type draw. Deterministic for (random state,
+ * weights); stable key order keeps streams reproducible across presets.
+ */
+export function pickWeightedRoomType(
+  random: SeededRandom,
+  weights?: Partial<Record<RoomType, number>>,
+): RoomType {
+  const entries = (Object.keys(BASE_ROOM_TYPE_WEIGHTS) as RoomType[])
+    .map(t => ({ t, w: BASE_ROOM_TYPE_WEIGHTS[t] * (weights?.[t] ?? 1) }))
+    .filter(e => e.w > 0)
+  const total = entries.reduce((s, e) => s + e.w, 0)
+  let roll = random.nextFloat(0, total)
+  for (const e of entries) {
+    roll -= e.w
+    if (roll <= 0) return e.t
+  }
+  return entries[entries.length - 1].t
+}
+
+export function getDefaultConfig(): LevelConfig {  return {
     seed: 492817,
     preset: 'fpsArena',
     shape: 'hub',

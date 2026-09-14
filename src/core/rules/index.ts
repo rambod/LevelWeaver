@@ -12,7 +12,7 @@ import { presets, shapes, themes } from '@/core/presets'
 // produce a different level. The version travels with every generated
 // level so stale regression seeds are detectable instead of silently
 // "passing" against new geometry.
-export const GENERATOR_VERSION = '0.1.4'
+export const GENERATOR_VERSION = '0.1.5'
 
 // Bound browser workloads before allocating grids or entering search loops.
 export const CONFIG_LIMITS = {
@@ -21,6 +21,11 @@ export const CONFIG_LIMITS = {
 } as const
 
 export const EPSILON = 0.0001
+
+// Routing safety margin beside a corridor ribbon (meters): covers the
+// player body at neighboring doorways, not just slack. Single source for
+// the router's obstacle inflation (§33/§101) and the placement gap below.
+export const ROUTING_MARGIN = 0.45
 
 export const AGENT_DEFAULTS = {
   height: 1.8,
@@ -189,12 +194,15 @@ export function gateWidthFor(
 
 /**
  * Lawbook §22: wall-to-wall circulation gap between same-floor rooms.
- * Corridor width plus wall slabs plus slack — floored at 3.5 m so even
- * the narrowest corridors keep turn clearance near mouths (a 1.5 m
- * corridor in a 2.5 m gap cannot turn without sealing gates).
+ * Exactly twice the router's per-side clearance (corridor half-width +
+ * wall slab + routing margin), floored at 3.5 m so even the narrowest
+ * corridors keep turn clearance near mouths (a 1.5 m corridor in a 2.5 m
+ * gap cannot turn without sealing gates). Placement, density
+ * feasibility, and routing derive from this one formula (§7).
  */
 export function circulationGap(config: LevelConfig): number {
-  return Math.max(config.corridorWidth + 1.0, 3.5)
+  const perSide = config.corridorWidth / 2 + SPATIAL_DEFAULTS.wallThickness + ROUTING_MARGIN
+  return Math.max(perSide * 2, 3.5)
 }
 
 /**
@@ -335,7 +343,7 @@ export function validateConfigFeasibility(config: LevelConfig): ConfigIssue[] {
   // the 6 m² closet minimum: the minimum check above stays as the
   // absolute floor, this one guards packability.
   {
-    const gap = Math.max(config.corridorWidth + 1.0, 3.5)
+    const gap = circulationGap(config)
     const cellSide = Math.sqrt(45) + gap
     const usable = usableMapArea(config.shape, config.area)
     const needed = config.roomCount * cellSide * cellSide

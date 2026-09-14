@@ -1,6 +1,9 @@
-import type { Room, RoomType, LevelConfig, Boundary } from '@/core/types'
+import type { Room, RoomType, MapShape, LevelConfig, Boundary } from '@/core/types'
 import { floorHeightFor } from '@/core/types'
 import { SeededRandom } from '@/core/random'
+import { SPATIAL_DEFAULTS } from '@/core/rules'
+import { presets, pickWeightedRoomType } from '@/core/presets'
+import { ROOM_BASE_SIZES } from '@/generator/rooms'
 import { isPointInBoundary } from '@/generator/boundary'
 
 interface TopologyNode {
@@ -42,30 +45,25 @@ export function generateTopology(config: LevelConfig, boundary: Boundary, random
     weight: 1.0,
   })
 
-  // Create remaining rooms
-  const roomTypes: RoomType[] = [
-    'standard', 'standard', 'standard', 'standard',
-    'hall', 'hall',
-    'hub',
-    'arena',
-    'objective',
-    'storage',
-    'connector',
-    'verticalConnector',
-  ]
+  // Create remaining rooms. Types come from the weighted lottery (base
+  // table × active preset profile, lawbook §89); the large-room quota is
+  // a deterministic reservation (seeded shuffle), not a per-room coin
+  // flip, so configured large-room counts actually materialize.
+  const typeWeights = presets[config.preset]?.roomTypeWeights
 
   const largeRoomCount = Math.min(config.largeRoomCount, roomCount - 2)
-  let largeRoomsCreated = 0
+  const middleIds: number[] = []
+  for (let i = 1; i < roomCount - 1; i++) middleIds.push(i)
+  const largeSet = new Set(random.shuffle(middleIds).slice(0, largeRoomCount))
 
   for (let i = 1; i < roomCount - 1; i++) {
     const floorIndex = random.nextInt(0, floorCount - 1)
     let type: RoomType
 
-    if (largeRoomsCreated < largeRoomCount && random.nextBool(0.3)) {
+    if (largeSet.has(i)) {
       type = random.pick(['hub', 'arena'])
-      largeRoomsCreated++
     } else {
-      type = random.pick(roomTypes)
+      type = pickWeightedRoomType(random, typeWeights)
     }
 
     // Vertical connectors only on floors that aren't top/bottom
@@ -308,6 +306,11 @@ function buildConnections(
     // Mostly near, occasionally far (keeps long alternate routes possible
     // without letting them dominate).
     const b = random.nextBool(0.85) ? pickNear(a, pool, random) : random.pick(pool)
+    // Capacity guard (lawbook §100): loop edges are optional, so skip pairs
+    // whose walls cannot host another gate — the funnel fallback would seal
+    // them. Tree and guarantee links stay exempt (connectivity beats looks).
+    if (!wallFitsDegree(a.type, a.connections.size + 1, config.doorWidth)) continue
+    if (!wallFitsDegree(b.type, b.connections.size + 1, config.doorWidth)) continue
     addConnection(nodes, a.id, b.id)
   }
 
@@ -324,10 +327,12 @@ function buildConnections(
   // floors. Deterministic: nearest distance, lowest id breaks ties.
   ensureConnected(nodes)
 
-  // Same-floor guarantee: every room on a multi-room floor needs at least
-  // one same-floor link. Stairs can be dropped by placement rules, but
-  // corridors never drop — so a room whose links are all vertical can be
-  // stranded by dropped shafts. Single-room floors keep cross-floor links.
+  // Same-floor guarantee: every room on a multi-room floor must reach
+  // every other room on that floor via same-floor links (see above).
+  // Semantic degree top-up runs later on placed rooms (`topUpDegrees`,
+  // in the layout attempt): wall capacity needs real footprints and the
+  // short-link cap needs real positions, and post-placement repair cannot
+  // distort placement.
   ensureSameFloorLink(nodes)
 }
 
@@ -446,12 +451,152 @@ function applyDeadEnds(
     // Degree >= 2 on both ends is NOT enough — the edge can still be the
     // only bridge between two clusters. Small graphs: BFS check is cheap.
     if (!neighbor || neighbor.connections.size < 2) continue
+    // Dead-end shaping (lawbook §13-14): never cut vertical links (stairs
+    // are scarce realizations — cutting intent strands floors behind
+    // shafts that may omit), never touch spawn/exit incident edges (no
+    // accidental dead-end starts), and respect semantic degree minimums.
+    if (neighbor.floorIndex !== node.floorIndex) continue
+    if (
+      node.type === 'spawn' || node.type === 'exit' ||
+      neighbor.type === 'spawn' || neighbor.type === 'exit'
+    ) continue
+    if (node.connections.size - 1 < minDegreeFor(node.type, config.shape)) continue
+    if (neighbor.connections.size - 1 < minDegreeFor(neighbor.type, config.shape)) continue
     node.connections.delete(connectedId)
     neighbor.connections.delete(node.id)
-    if (!isFullyConnected(nodes)) {
+    if (
+      !isFullyConnected(nodes) ||
+      leafChainLength(nodes, node.id) > MAX_DEAD_END_DEPTH ||
+      leafChainLength(nodes, neighbor.id) > MAX_DEAD_END_DEPTH
+    ) {
       node.connections.add(connectedId)
       neighbor.connections.add(node.id)
     }
+  }
+}
+
+// Lawbook §14 semantic degree minimums (soft goals, enforced as repair).
+// Hubs trunk ≥3 links; halls/arenas/connectors/stair-halls ≥2; spawn/exit
+// ≥2 so neither is an accidental dead end (§13) — except linear maps,
+// where end stations are degree 1 by design. All other types accept leaves.
+const DEGREE_MIN: Partial<Record<RoomType, number>> = {
+  hub: 3,
+  hall: 2,
+  arena: 2,
+  connector: 2,
+  verticalConnector: 2,
+  spawn: 2,
+  exit: 2,
+}
+
+/** Lawbook §13: dead-end branches stay shallow (rooms beyond the branch). */
+const MAX_DEAD_END_DEPTH = 2
+
+function minDegreeFor(type: RoomType, shape: MapShape): number {
+  if ((type === 'spawn' || type === 'exit') && shape === 'linear') return 1
+  return DEGREE_MIN[type] ?? 1
+}
+
+// Leaf-chain length from a node: 0 unless it is a leaf, then 1 plus every
+// degree-2 follower until a branch (or cycle guard). Used to cap dead-end
+// depth after pruning.
+function leafChainLength(nodes: Map<string, TopologyNode>, startId: string): number {
+  const start = nodes.get(startId)
+  if (!start || start.connections.size !== 1) return 0
+  let len = 1
+  const seen = new Set<string>([startId])
+  let prev = startId
+  let cur = [...start.connections][0]
+  for (;;) {
+    if (seen.has(cur)) break
+    seen.add(cur)
+    const node = nodes.get(cur)
+    if (!node || node.connections.size !== 2) break
+    const next = [...node.connections].find(id => id !== prev)
+    if (!next) break
+    prev = cur
+    cur = next
+    len++
+  }
+  return len
+}
+
+// Lawbook §100 wall capacity estimated from base footprints (nominal —
+// sizing variation averages out; placement and validators catch true
+// overcrowding). Used ONLY as a pre-filter for optional loop edges;
+// guarantees (tree, vertical-first, same-floor merges) stay exempt.
+function wallFitsDegree(type: RoomType, degree: number, doorW: number): boolean {
+  const base = ROOM_BASE_SIZES[type]
+  const wall = Math.min(base.w, base.d)
+  const required =
+    degree * doorW +
+    2 * SPATIAL_DEFAULTS.doorCornerMargin +
+    Math.max(0, degree - 1) * SPATIAL_DEFAULTS.doorSeparation
+  return required <= wall + 1e-9
+}
+
+// Repair links must be short (lawbook §12 loop feasibility: reasonable
+// geometric distance). A long repair edge would drag room placement across
+// the map toward its partner and ship as subdivided hops anyway — worse
+// than an honest leaf. Same scale as corridor subdivision.
+const TOPUP_LINK_MAX = 24
+
+// Semantic degree repair (lawbook §14, soft): hubs want ≥3 trunk links,
+// halls/arenas/connectors/stair-halls ≥2, spawn/exit ≥2 (except linear
+// maps, where end stations are degree 1 by design). Runs on PLACED rooms
+// (real footprints for the §100 capacity check, real positions for the
+// short-link cap), only ADDS edges, and is idempotent. Bounded: each pass
+// links at least one room or stops.
+export function topUpDegrees(rooms: Room[], config: LevelConfig): void {
+  const VERTICAL_CAP = 2
+  const byId = new Map(rooms.map(r => [r.id, r]))
+  const crossDegree = (r: Room): number => {
+    let count = 0
+    for (const c of r.connections) {
+      const other = byId.get(c)
+      if (other && other.floorIndex !== r.floorIndex) count++
+    }
+    return count
+  }
+  const fits = (r: Room, degree: number): boolean => {
+    const wall = Math.min(r.width, r.depth)
+    if (!(wall > 0)) return false
+    const required =
+      degree * config.doorWidth +
+      2 * SPATIAL_DEFAULTS.doorCornerMargin +
+      Math.max(0, degree - 1) * SPATIAL_DEFAULTS.doorSeparation
+    return required <= wall + 1e-9
+  }
+  for (let guard = 0; guard < 256; guard++) {
+    let changed = false
+    for (const id of [...byId.keys()].sort()) {
+      const node = byId.get(id)!
+      if (node.connections.length >= minDegreeFor(node.type, config.shape)) continue
+      if (!fits(node, node.connections.length + 1)) continue
+      let best: Room | null = null
+      let bestDist = Infinity
+      for (const other of byId.values()) {
+        if (other.id === id || node.connections.includes(other.id)) continue
+        if (Math.abs(other.floorIndex - node.floorIndex) > 1) continue
+        if (!fits(other, other.connections.length + 1)) continue
+        if (other.floorIndex !== node.floorIndex && (crossDegree(node) >= VERTICAL_CAP || crossDegree(other) >= VERTICAL_CAP)) continue
+        const d = Math.sqrt(
+          (node.position.x - other.position.x) ** 2 +
+          (node.position.z - other.position.z) ** 2,
+        )
+        if (d > TOPUP_LINK_MAX) continue
+        if (d < bestDist || (d === bestDist && best !== null && other.id < best.id)) {
+          best = other
+          bestDist = d
+        }
+      }
+      if (best) {
+        node.connections.push(best.id)
+        best.connections.push(node.id)
+        changed = true
+      }
+    }
+    if (!changed) break
   }
 }
 

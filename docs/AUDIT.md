@@ -1,6 +1,6 @@
 # Documentation and code audit
 
-Date: 2026-09-13. Generator version after fixes: **0.1.4**.
+Date: 2026-09-13. Generator version after fixes: **0.1.5**.
 
 ## Scope and method
 
@@ -115,9 +115,97 @@ generation output or validation acceptance, so `GENERATOR_VERSION` stays 0.1.4:
   expose: Rooms minimum 4 (runtime: 2), Dead Ends maximum 0.5 (runtime: 1.0),
   Seed maximum 999999 (runtime: u32), Corridor/Gate minimum 1.0 m (runtime:
   0.80 m agent minimum). Widened to the envelope; envelope endpoints are now
-  asserted in the existing configuration regression test (still 13 tests).
+  asserted in the existing configuration regression test.
 - Failure wording distinguished: rejected configurations preserve the prior
   artifact; diagnostic candidates (`ok: false`) replace the preview with
   visible errors and cannot export (lawbook §0 contract and the table above).
 - `README.md` project map now lists all `src/core` modules and the actual
   `src/generator` stage directories.
+
+## Full-system audit (2026-09-13, generator version **0.1.4 → 0.1.5**)
+
+Deep pass over topology, rooms, placement, corridors, stairs, validation,
+presets, and export, driven by measurements (8 presets × 25 random seeds =
+200 generations, plus the 32-case matrix). Output and acceptance changed, so
+`GENERATOR_VERSION` was bumped per `AGENTS.md`; seeds reproduce only on the
+same version.
+
+Baseline before fixes: 196/200 ok (98.0%). Every hard failure was one of two
+signatures: (a) an islanded upper floor — omitted stairs cascading into
+`FLOOR_DISCONNECTED` + `GRAPH_DISCONNECTED` + `NAV_UNREACHABLE_ROOM`; the
+retry loop usually cured it but sometimes exhausted. (b) tower-shaft mouths
+cut at 1.2 m against requested 1.8 m gates (`PORTAL_TOO_NARROW`): towers were
+~1% of built stairs and 100% of them failed validation. Dead-end hubs
+(13/206) and leaf spawns (11/96) were common; all eight presets dealt
+near-identical room mixes (only counts differed).
+
+Stairs and vertical circulation:
+
+- Tower mouths now meet the requested gate width (`towerMouthWidthFor` in
+  `src/generator/vertical`): wider gates get a wider, recentered hole inside
+  the shaft inner faces with corner-margin checks; gates wider than the
+  shaft skip towers honestly (in-room fallback, then omission). Towers went
+  from 3 to 138 per 240 links with zero narrow-gate failures.
+- Shafts are reserved BEFORE corridors claim open space (lawbook §40):
+  a towers-only probe pass feeds shaft rects into routing as pseudo-room
+  obstacles (A*, smoothing, verifier) without touching midpoint selection
+  or validation. Optional parameters only — legacy routing is byte-identical
+  when no shafts reserve.
+- Omitted links now report `STAIR_NO_PLACEMENT` (tier 1 in `errorTier`):
+  bridge omissions (no alternate realized path) are errors in attempt
+  scoring and the final report; redundant omissions are warnings on the
+  final report only, so intent edges are never silently dropped (§87).
+- `circulationGap` is derived from the router's own clearance
+  (`corridorWidth/2 + wallThickness + ROUTING_MARGIN`, floored at 3.5 m);
+  the `0.45` margin lives in one place (`src/core/rules`) and the density
+  feasibility check uses the same function.
+
+Corridors:
+
+- The best-of-two variant search grew from 4 to 10 wall-ban combos with
+  first-clean-wins ordering (clean edges cost exactly what they did; only
+  foul edges search deeper), and the variant pass now also triggers on
+  `CORRIDOR_CROSSING`, not just mouth fouls.
+- Junction objects (§34/§35 construction) remain future work: crossings
+  ship, validators report, bounded retry re-routes. See remaining gaps.
+
+Topology, halls, and dead ends:
+
+- Degree repair (lawbook §14, soft): hubs top up to 3, halls/arenas/
+  connectors/stair-halls to 2, spawn/exit to 2 (linear end stations exempt),
+  on placed rooms with real footprints (§100 capacity) and a 24 m
+  short-link cap so repair cannot drag placement across the map.
+- Dead-end pruning never cuts vertical links or spawn/exit incident edges,
+  respects type minimums, and caps branch depth at 2 (lawbook §13).
+  Dead-end hubs fell 13 → 5 per comparable sweep; zero-link rooms stayed 0.
+- Loop extras pre-check §100 wall capacity (tree and guarantee links stay
+  exempt — connectivity beats looks).
+- Large-room quota is a deterministic seeded reservation, not a coin flip.
+
+Presets (lawbook §88-89, validity never bypassed):
+
+- Per-preset room-type lottery weights (`Preset.roomTypeWeights`): office
+  deals halls/standards, warehouse chambers, horror halls/closets, arena
+  loops for FPS, etc. Mixes now differ visibly where they were noise.
+- Wall-height character: office/horror 3.2 m, dungeon 3.8 m, warehouse
+  4.2 m high-bay. Corridor widths unchanged.
+
+Verification after fixes: `npm test` **19/19** (6 new regressions, each with
+fixed rooms/config/seed), `npm run build` passes (typecheck + Vite;
+bundle ~728 kB / ~205 kB gzip after the feature pass),
+`npm run test:seeds` **32/32**, `npm audit` zero vulnerabilities, wide sweep
+**200/200 with zero errors** (previously 196/200). Generation is ~2-3×
+faster on average (attempt-0 succeeds far more often, so retry rarely runs).
+
+Remaining gaps (honest failures by design, never silent corruption):
+
+- Extreme packing (e.g. 4 m corridors between 20 m+ rooms) can still
+  produce mouth/crossing fouls on adversarial seeds (~1% on warehouse-class
+  sweeps, 0% on the other seven presets). Diagnostics name the corridor and
+  the code; export stays refused; a new seed retries cleanly.
+- In-room stair arrivals avoid upper corridor slabs but cannot cut them;
+  arrival holes exist for room slabs only.
+- Only tower shafts reserve early; full vertical-before-circulation
+  co-design (in-room entries steering mouth choice) is future work.
+- Redundant vertical intents report `STAIR_NO_PLACEMENT` warnings instead
+  of being removed from the graph; explicit and export-safe.

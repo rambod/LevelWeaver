@@ -4,7 +4,9 @@ import { narrowestPassage } from '@/core/rules'
 
 // Room sizing (pipeline stage: "Assign room sizes"). Spatial placement lives
 // in `@/generator/placement` and is re-exported here for backwards compatibility.
-const ROOM_BASE_SIZES: Record<RoomType, { w: number; d: number; h: number }> = {
+// Single source of truth for base room footprints (lawbook §7): topology
+// capacity estimates and sizing derive from here, never from literals.
+export const ROOM_BASE_SIZES: Record<RoomType, { w: number; d: number; h: number }> = {
   spawn: { w: 7, d: 7, h: 3.5 },
   exit: { w: 7, d: 7, h: 3.5 },
   standard: { w: 6, d: 6, h: 3.5 },
