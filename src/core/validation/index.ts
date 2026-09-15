@@ -119,19 +119,45 @@ export function errorTier(code: IssueCode): 1 | 2 | 3 {
 
 export interface ErrorTiers {
   t1: number
+  /**
+   * Tier-1 placement failures (lawbook §2 Order of Authority, §70 repair
+   * order): ROOM_OVERLAP, ROOM_NESTED, ROOM_OUT_OF_BOUNDS, ROOM_TOO_SMALL.
+   * No corridor, mouth, or stair repair can cure them — only a different
+   * placement can — so retry selection compares them BEFORE tier-1
+   * routing failures. Otherwise a layout with one unrepairable overlap
+   * beats a placeable layout with two repairable mouth fouls and the
+   * winnable seed ships an overlap. Clean layouts (all zero) compare
+   * exactly as before.
+   */
+  t1p: number
   t2: number
   t3: number
 }
 
-/** Lexicographic compare: fewer tier-1 wins, then tier-2, then tier-3. */
+/** Lexicographic compare: fewer placement failures wins, then fewer
+ * tier-1 overall, then tier-2, then tier-3. */
 export function compareTiers(a: ErrorTiers, b: ErrorTiers): number {
+  if (a.t1p !== b.t1p) return a.t1p - b.t1p
   if (a.t1 !== b.t1) return a.t1 - b.t1
   if (a.t2 !== b.t2) return a.t2 - b.t2
   return a.t3 - b.t3
 }
 
+/** Placement-failure codes: truth about room bodies that no downstream
+ * routing repair can change (single source; mirrors the mouth-repair
+ * veto in `@/core/generation`, plus ROOM_TOO_SMALL — rooms are never
+ * resized after the sizing stage). */
+export function isPlacementFailure(code: IssueCode): boolean {
+  return (
+    code === 'ROOM_OVERLAP' ||
+    code === 'ROOM_NESTED' ||
+    code === 'ROOM_OUT_OF_BOUNDS' ||
+    code === 'ROOM_TOO_SMALL'
+  )
+}
+
 export function tiersOf(issues: GenerationIssue[]): ErrorTiers {
-  const t: ErrorTiers = { t1: 0, t2: 0, t3: 0 }
+  const t: ErrorTiers = { t1: 0, t1p: 0, t2: 0, t3: 0 }
   for (const i of issues) {
     if (i.severity !== 'error') {
       // Warnings are soft quality signals (lawbook §80): they never fail
@@ -140,7 +166,10 @@ export function tiersOf(issues: GenerationIssue[]): ErrorTiers {
       continue
     }
     const tier = errorTier(i.code)
-    if (tier === 1) t.t1++
+    if (tier === 1) {
+      t.t1++
+      if (isPlacementFailure(i.code)) t.t1p++
+    }
     else if (tier === 2) t.t2++
     else t.t3++
   }

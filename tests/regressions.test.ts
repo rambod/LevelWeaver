@@ -4,7 +4,8 @@ import * as THREE from 'three'
 import { GLTFExporter } from 'three/examples/jsm/exporters/GLTFExporter.js'
 import { getDefaultConfig, applyPreset, pickWeightedRoomType, presets } from '../src/core/presets'
 import { validateConfigFeasibility, stairMathFor } from '../src/core/rules'
-import { validateExportModel, validateDoors, validateNavigationGrid, findCorridorCrossings } from '../src/core/validation'
+import { validateExportModel, validateDoors, validateNavigationGrid, findCorridorCrossings, tiersOf, compareTiers, isPlacementFailure } from '../src/core/validation'
+import type { GenerationIssue, IssueCode } from '../src/core/validation'
 import { LevelScene } from '../src/renderer/scene'
 import { exportGLB, levelFilename, downloadGLB } from '../src/export/gltf'
 import { useLevelStore } from '../src/stores/level'
@@ -544,4 +545,97 @@ test('hole-blocked crossing nudges its plaza into the walkable band', () => {
   assert.ok(level.rooms.some(r => r.junction), 'nudged plaza recorded')
   assert.ok(!level.validation.errors.some(i => i.code === 'CORRIDOR_CROSSING'))
   assert.ok(!level.validation.errors.some(i => i.code === 'PORTAL_SEALED'))
+})
+
+test('retry selection ranks unrepairable placement failures above routing failures', () => {
+  // Lawbook §2 + §70: overlap/nesting/bounds/size can only be cured by a
+  // different placement, never by corridor repair — so one overlap must
+  // lose to any number of repairable mouth fouls in attempt selection.
+  const mk = (code: IssueCode, severity: GenerationIssue['severity'] = 'error'): GenerationIssue => ({
+    code, severity, stage: 'test', objectIds: [], message: code,
+  })
+  assert.ok(isPlacementFailure('ROOM_OVERLAP'))
+  assert.ok(isPlacementFailure('ROOM_NESTED'))
+  assert.ok(isPlacementFailure('ROOM_OUT_OF_BOUNDS'))
+  assert.ok(isPlacementFailure('ROOM_TOO_SMALL'))
+  assert.ok(!isPlacementFailure('PORTAL_SEALED'))
+  assert.ok(!isPlacementFailure('CORRIDOR_CROSSING'))
+  assert.ok(!isPlacementFailure('STAIR_NO_PLACEMENT'))
+  const overlapPlusSeal = tiersOf([mk('ROOM_OVERLAP'), mk('PORTAL_SEALED')])
+  assert.equal(overlapPlusSeal.t1p, 1)
+  assert.equal(overlapPlusSeal.t1, 2)
+  const fiveSeals = tiersOf([
+    mk('PORTAL_SEALED'), mk('PORTAL_SEALED'), mk('PORTAL_SEALED'),
+    mk('PORTAL_SEALED'), mk('PORTAL_SEALED'),
+  ])
+  assert.equal(fiveSeals.t1p, 0)
+  assert.equal(fiveSeals.t1, 5)
+  assert.ok(compareTiers(fiveSeals, overlapPlusSeal) < 0, 'placeable layout wins despite more fouls')
+  assert.ok(compareTiers(overlapPlusSeal, fiveSeals) > 0)
+  // Clean equivalence and warning handling are unchanged.
+  assert.deepEqual(tiersOf([]), { t1: 0, t1p: 0, t2: 0, t3: 0 })
+  assert.equal(tiersOf([mk('ROOM_ASPECT', 'warning')]).t3, 1)
+  assert.equal(compareTiers(tiersOf([]), tiersOf([])), 0)
+})
+
+test('dense band crossing falls back to a compact 2.4 m plaza', () => {
+  // White-box junction repair (deterministic, no seed): hand-built
+  // X-crossing at the origin with a blocker room parked so the full-size
+  // 3 m center square is fouled but a 2.4 m square fits. Lawbook §34-35
+  // plus §100 wall capacity (2.4 m still hosts one 1.8 m gate per wall).
+  const mkRoom = (id: string, x: number, z: number, w: number, d: number, conns: string[]): Room => ({
+    id, type: 'standard', position: { x, y: 0, z }, width: w, depth: d,
+    height: 3.5, floorIndex: 0, materialTheme: 'greybox', connections: conns,
+  })
+  const rooms = [
+    mkRoom('a', -10, 0, 6, 6, ['b']), mkRoom('b', 10, 0, 6, 6, ['a']),
+    mkRoom('c', 0, -10, 6, 6, ['d']), mkRoom('d', 0, 10, 6, 6, ['c']),
+    mkRoom('blocker', 0, 2.9, 2, 2, []),
+  ]
+  const mkCorr = (id: string, s: string, e: string, x1: number, z1: number, x2: number, z2: number): Corridor => ({
+    id, startRoomId: s, endRoomId: e,
+    startPos: { x: x1, y: 0, z: z1 }, endPos: { x: x2, y: 0, z: z2 },
+    width: 2, floorIndex: 0,
+    pathPoints: [{ x: x1, y: 0, z: z1 }, { x: x2, y: 0, z: z2 }],
+  })
+  const corridors = [
+    mkCorr('corridor_a_b', 'a', 'b', -7, 0, 7, 0),
+    mkCorr('corridor_c_d', 'c', 'd', 0, -7, 0, 7),
+  ]
+  assert.equal(findCorridorCrossings(corridors).length, 1)
+  const config = { ...getDefaultConfig(), roomCount: 5, floorCount: 1 }
+  const boundary = { shape: 'square' as const, width: 60, depth: 60, center: { x: 0, y: 0 } }
+  const out = planJunctions(rooms, corridors, config, boundary, 4, [])
+  assert.ok(out, 'compact fallback must place where full size cannot')
+  assert.equal(out.rooms.length, 6)
+  const j = out.rooms.find(r => r.junction)!
+  assert.equal(j.width, 2.4)
+  assert.equal(j.depth, 2.4)
+  assert.deepEqual([...j.connections].sort(), ['a', 'b', 'c', 'd'])
+  const byId = new Map(out.rooms.map(r => [r.id, r]))
+  assert.ok(!byId.get('a')!.connections.includes('b'), 'blind intent removed')
+  assert.ok(!byId.get('c')!.connections.includes('d'), 'blind intent removed')
+  // Every plaza end is spatially realized: a direct stub, or a hop
+  // through another room (§87 — the south stub subdivides around the
+  // blocker). Reachability over shipped corridors is the honest check.
+  const adj = new Map<string, Set<string>>()
+  for (const r of out.rooms) adj.set(r.id, new Set())
+  for (const c of out.corridors) {
+    adj.get(c.startRoomId)?.add(c.endRoomId)
+    adj.get(c.endRoomId)?.add(c.startRoomId)
+  }
+  for (const e of ['a', 'b', 'c', 'd']) {
+    const seen = new Set<string>([e])
+    const queue = [e]
+    while (queue.length > 0) {
+      const cur = queue.pop()!
+      for (const nb of adj.get(cur) ?? []) {
+        if (!seen.has(nb)) {
+          seen.add(nb)
+          queue.push(nb)
+        }
+      }
+    }
+    assert.ok(seen.has(j.id), `${e} reaches the plaza over shipped corridors`)
+  }
 })

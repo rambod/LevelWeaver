@@ -371,3 +371,76 @@ non-junction candidates by design (lawbook §34-35); miter-joint spikes,
 in-room arrivals vs corridor slabs, full vertical-first co-design, and
 100-room single-floor over-constraint remain future work. No validator
 was weakened and no error downgraded to make seeds pass.
+
+## Solidity pass 3 (2026-09-15, generator version **0.1.8 → 0.1.9**)
+
+Two measured defects, both fixed with repairs gated so clean layouts
+never change (`GENERATOR_VERSION` bumped: acceptance changed on
+previously-failing seeds; clean seeds are byte-identical by
+construction — attempt-0 still wins and breaks before any comparison,
+exact-center plazas still place first, foul-only code paths never run
+on clean edges).
+
+Retry selection ranked unrepairable placement failures evenly with
+repairable routing failures (`src/core/validation`):
+
+- `ErrorTiers` gains `t1p` (placement: `ROOM_OVERLAP`, `ROOM_NESTED`,
+  `ROOM_OUT_OF_BOUNDS`, `ROOM_TOO_SMALL` — shared predicate
+  `isPlacementFailure`, mirroring the mouth-repair veto plus
+  `ROOM_TOO_SMALL`, since rooms are never resized after sizing).
+  `compareTiers` orders `t1p` before total `t1`, then `t2`, `t3`;
+  `clean()` semantics are unchanged. Rationale (lawbook §2, §70
+  repair order): no corridor, mouth, or stair repair can cure a
+  body-truth placement failure — only a different placement can — so a
+  layout with one 9 m² overlap must never beat a placeable layout with
+  two repairable mouth fouls. Ring/40462 and ring/40473 shipped massive
+  overlaps (9–10 m²) as winners under even trading; both now resolve
+  to placeable (still honestly failing) winners. The mouth-repair veto
+  itself is intentionally untouched, so variant behavior on failing
+  layouts is unchanged.
+
+Compact junction plazas (`src/core/generation`, `planJunctions`):
+
+- Spiral candidates now try full side then a 2.4 m fallback at each
+  offset (2.4 m clears the 2.4 m room minimum and hosts one 1.8 m gate
+  per wall per §100: needs 2.3 m). Dense bands that cannot clear 4 m
+  (3 m plaza + 0.5 m pads) often clear 3.4 m. Full-size center goes
+  first, so existing plazas never shrink; best-of-two adoption still
+  rejects compact plazas whose stubs foul. White-box probe: a crossing
+  whose 3 m center is fouled by a parked room converts to a 2.4 m
+  plaza with all four ends realized (one via §87 hop around the
+  blocker).
+
+Verification after fixes: `npm test` **26/26** (2 new: tier-ordering
+unit pin + compact-plaza white-box pin with corridor reachability
+proof), `npm run test:seeds` **32/32**, `npm run build` green.
+Focused sweeps (each generated twice, zero nondeterminism): presets ×
+seeds 200-209 **80/80**; warehouse 200-229 **30/30**; ring 24-room
+40460-40484 **20/25** (residuals, all honest with named codes:
+40461 seal + mid-foul, 40462 4 seals + mouth foul, 40469 lone seal,
+40473 6 seals + 3 mouth fouls, 40483 lone crossing). Seeds reproduce
+only on the same version; 0.1.8 ≠ 0.1.9 on previously-failing seeds.
+
+Measured but deferred (no safe mechanism this pass):
+
+- Residual seals are all corridor-wall-caused (in-room stairs only;
+  tower count is zero on every residual seed — the h2 planner mirror
+  holds). Two sub-causes observed: neighbor-ribbon walls crossing
+  threads, and own-wall turn-in-bubble seals (40454 dist 0.00).
+  Corridor-intrusion predicates in router and validator were diffed
+  line-by-line and agree (same erosion, exemptions, sampling), so
+  shipped fouls come from bounded-recursion exhaustion (depth-3 hops
+  ship honestly, lawbook §69), not predicate drift. Hypotheses for
+  next pass (not implemented): cap exit-leg straightening at half
+  door distance for short pinched pairs, and a second junction round
+  for independent residual crossings.
+- Junction-stub phantom edges (graph claims a room–plaza edge no
+  shipped corridor realizes; BFS/reachability use corridors, so levels
+  still validate honestly): 3–4 levels per sweep, including passing
+  ones (e.g. horrorFacility/208, ring/40465). Cleanup was deferred
+  because removal could drop a passing plaza below the ≥4-connection
+  structural assertion; the safe form (realize-via-alt-mouths first,
+  remove only with ≥4 realized left) is specified for next pass.
+- Ring-band hole crossings needing a >6 m nudge (40458, deep in the
+  courtyard void) stay honest failures; wider spirals were judged
+  likely to lose best-of-two adoption to long foul-prone stubs.

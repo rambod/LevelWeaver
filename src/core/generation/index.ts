@@ -707,47 +707,60 @@ export function planJunctions(
     }
     let px = point.x
     let pz = point.z
+    let usedSide = side
     let rect: Rect2D | null = null
+    // Compact fallback (lawbook §34, §100 wall capacity): a 3 m plaza
+    // needs 4 m of clear band; dense bands often have only ~3 m. A
+    // 2.4 m plaza still clears the room minimum (2.4 m) and hosts one
+    // 1.8 m gate per wall (needs 2.3 m), so try it wherever full size
+    // is blocked. Full size at every offset goes first, so existing
+    // plazas never shrink and clean layouts never change; best-of-two
+    // adoption below still rejects compact plazas whose stubs foul.
+    const sides = side > 2.4 ? [side, 2.4] : [side]
     for (const o of offsets) {
       const cx = point.x + o.x
       const cz = point.z + o.z
-      const cand: Rect2D = {
-        minX: cx - side / 2, maxX: cx + side / 2,
-        minZ: cz - side / 2, maxZ: cz + side / 2,
-      }
-      if (!roomFootprintInBoundary({ x: cx, z: cz }, side, side, boundary, 0.5)) continue
-      // Plazas avoid rooms, tower shafts, and each other (cheap rect
-      // checks). Kept corridor ribbons are NOT pre-checked: a ribbon
-      // through the spot reads as an intrusion downstream, and best-of-two
-      // adoption rejects the repair — while near-misses stay repairable.
-      let blocked = false
-      for (const r of pool) {
-        if (rectsOverlapPad(cand, roomRectOf(r), 0.5)) {
-          blocked = true
-          break
+      for (const s of sides) {
+        const cand: Rect2D = {
+          minX: cx - s / 2, maxX: cx + s / 2,
+          minZ: cz - s / 2, maxZ: cz + s / 2,
         }
-      }
-      if (!blocked) {
-        for (const t of towerReservations) {
-          if (rectsOverlapPad(cand, t.rect, 0.5)) {
+        if (!roomFootprintInBoundary({ x: cx, z: cz }, s, s, boundary, 0.5)) continue
+        // Plazas avoid rooms, tower shafts, and each other (cheap rect
+        // checks). Kept corridor ribbons are NOT pre-checked: a ribbon
+        // through the spot reads as an intrusion downstream, and best-of-two
+        // adoption rejects the repair — while near-misses stay repairable.
+        let blocked = false
+        for (const r of pool) {
+          if (rectsOverlapPad(cand, roomRectOf(r), 0.5)) {
             blocked = true
             break
           }
         }
-      }
-      if (!blocked) {
-        for (const p of placed) {
-          if (rectsOverlapPad(cand, p, side)) {
-            blocked = true
-            break
+        if (!blocked) {
+          for (const t of towerReservations) {
+            if (rectsOverlapPad(cand, t.rect, 0.5)) {
+              blocked = true
+              break
+            }
           }
         }
+        if (!blocked) {
+          for (const p of placed) {
+            if (rectsOverlapPad(cand, p, s)) {
+              blocked = true
+              break
+            }
+          }
+        }
+        if (blocked) continue
+        px = cx
+        pz = cz
+        usedSide = s
+        rect = cand
+        break
       }
-      if (blocked) continue
-      px = cx
-      pz = cz
-      rect = cand
-      break
+      if (rect) break
     }
     if (!rect) continue
     // Rewire: drop the blind pass-throughs, join all four ends at J.
@@ -764,8 +777,8 @@ export function planJunctions(
       id,
       type: 'connector',
       position: { x: px, y: floor * floorHeight, z: pz },
-      width: side,
-      depth: side,
+      width: usedSide,
+      depth: usedSide,
       height: config.wallHeight,
       floorIndex: floor,
       materialTheme: config.theme,
