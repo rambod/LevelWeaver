@@ -317,3 +317,57 @@ third ribbons through a plaza spot (vetoed, stays reported), miter-joint
 wall spikes beyond capsule math, in-room arrivals vs corridor slabs, full
 vertical-first co-design, and systematic 100-room single-floor
 over-constraint without junctions at that density.
+
+## Solidity pass 2 (2026-09-15, generator version **0.1.7 → 0.1.8**)
+
+Targeted the two measured residual classes from the sweeps above —
+wide-corridor mouth fouls (warehouse 4 m ribbons re-entering endpoints)
+and hole-blocked junction plazas (ring courtyard crossings with no
+placeable center) — with repairs gated so clean layouts never change.
+`GENERATOR_VERSION` bumped per `AGENTS.md` (acceptance changed on
+previously-failing seeds; clean seeds are byte-identical by construction).
+
+Corridors (`src/generator/corridors`):
+
+- Foul subdivision searches 15 m for midpoint hops (was 12 m). The 12 m
+  radius is kept for long-link pre-subdivision; only pinched
+  mid/mouth-foul edges search wider, so clean edges route byte-identically.
+  Warehouse/181 (mouth foul) now subdivides into clean hops and passes;
+  warehouse/141 improves 3 errors → 1 honest mouth foul. Ring/40457
+  improves 2 errors → 1 crossing before the junction fix below cures it.
+
+Generation (`src/core/generation`):
+
+- Junction plazas use deterministic spiral placement: exact crossing
+  point first, then compass rings at 1-6 m. Exact-center plazas never
+  move (ring/40448 byte-identical); hole-blocked centers nudge into the
+  walkable band. Best-of-two adoption still rejects the repair unless
+  strictly better, so bad nudges never land. Ring/40457 (brush + seal)
+  now resolves through a nudged plaza and passes.
+- Small-map retry budgets grow 8 → 12 layouts (≤20 rooms only). Clean
+  seeds break early on attempt 0 (no cost, no output change); failing
+  small seeds get 36 layouts instead of 24. Large-map budgets unchanged
+  (main-thread stall risk, lawbook §94).
+
+Verification after fixes: `npm test` **24/24** (2 new: warehouse/181
+mouth-subdivision pin, ring/40457 nudged-plaza pin, each with full
+config + seed and determinism check), `npm run test:seeds` **32/32**,
+`npm audit` clean. Focused sweeps (each generated twice, zero
+nondeterminism): warehouse preset seeds 100-199 **99/100** (was 98/100;
+residual warehouse/141 fails honestly with a single
+`CORRIDOR_ROOM_COLLISION` mouth foul, export refused); ring 24-room
+seeds 40440-40459 **18/20** (was 17/20; residuals 40454
+`PORTAL_SEALED` + mouth foul and 40458 lone `CORRIDOR_CROSSING`, both
+honest with named codes). Presets × seeds 100-109 **80/80**. Seeds
+reproduce only on the same version; 0.1.7 ≠ 0.1.8 outputs on
+previously-failing seeds (clean seeds unchanged).
+
+Still open (unchanged architectural gaps, plus one new measurement):
+extreme 4 m-corridor packing still over-constrains ~1% of
+warehouse-class seeds (141: single mouth foul after 36 layouts);
+ring-band hole crossings without a band spot in 6 m stay honest
+failures (40458); brush crossings with no proper point stay
+non-junction candidates by design (lawbook §34-35); miter-joint spikes,
+in-room arrivals vs corridor slabs, full vertical-first co-design, and
+100-room single-floor over-constraint remain future work. No validator
+was weakened and no error downgraded to make seeds pass.

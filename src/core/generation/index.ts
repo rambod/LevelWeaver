@@ -116,7 +116,7 @@ export function generateLevel(rawConfig: LevelConfig): GeneratedLevel {
   // byte-identical to narrower budgets.
   const MAX_TOPO_ATTEMPTS = config.roomCount > 80 ? 1 : config.roomCount > 30 ? 2 : 3
   const MAX_LAYOUT_ATTEMPTS =
-    config.roomCount > 80 ? 2 : config.roomCount > 50 ? 2 : config.roomCount > 30 ? 3 : config.roomCount > 20 ? 5 : 8
+    config.roomCount > 80 ? 2 : config.roomCount > 50 ? 2 : config.roomCount > 30 ? 3 : config.roomCount > 20 ? 5 : 12
   // Attempt-0 topology+sizes, computed once and shared by all attempt-0
   // layouts (regenerating per attempt would consume the RNG stream and
   // reshuffle every seed).
@@ -691,39 +691,65 @@ export function planJunctions(
     if (consumed.has(a.id) || consumed.has(b.id)) continue
     if (made >= MAX_JUNCTIONS) break
     const floor = a.floorIndex
-    const rect: Rect2D = {
-      minX: point.x - side / 2, maxX: point.x + side / 2,
-      minZ: point.z - side / 2, maxZ: point.z + side / 2,
+    // Spiral placement (§34-35): the exact crossing point is often
+    // unplaceable (ring courtyard hole, room overlap), but a spot a few
+    // meters away in the walkable band still joins all four ends. Try the
+    // center first, then deterministic compass rings at 1-6 m; the first
+    // placeable spot wins, so clean exact-center plazas never move.
+    // Best-of-two adoption below rejects the repair if the moved plaza's
+    // stubs foul, so a bad nudge can never hurt the attempt.
+    const offsets: { x: number; z: number }[] = [{ x: 0, z: 0 }]
+    for (let r = 1; r <= 6; r++) {
+      offsets.push(
+        { x: r, z: 0 }, { x: -r, z: 0 }, { x: 0, z: r }, { x: 0, z: -r },
+        { x: r, z: r }, { x: r, z: -r }, { x: -r, z: r }, { x: -r, z: -r },
+      )
     }
-    if (!roomFootprintInBoundary(point, side, side, boundary, 0.5)) continue
-    // Plazas avoid rooms, tower shafts, and each other (cheap rect
-    // checks). Kept corridor ribbons are NOT pre-checked: a ribbon
-    // through the spot reads as an intrusion downstream, and best-of-two
-    // adoption rejects the repair — while near-misses stay repairable.
-    let blocked = false
-    for (const r of pool) {
-      if (rectsOverlapPad(rect, roomRectOf(r), 0.5)) {
-        blocked = true
-        break
+    let px = point.x
+    let pz = point.z
+    let rect: Rect2D | null = null
+    for (const o of offsets) {
+      const cx = point.x + o.x
+      const cz = point.z + o.z
+      const cand: Rect2D = {
+        minX: cx - side / 2, maxX: cx + side / 2,
+        minZ: cz - side / 2, maxZ: cz + side / 2,
       }
-    }
-    if (!blocked) {
-      for (const t of towerReservations) {
-        if (rectsOverlapPad(rect, t.rect, 0.5)) {
+      if (!roomFootprintInBoundary({ x: cx, z: cz }, side, side, boundary, 0.5)) continue
+      // Plazas avoid rooms, tower shafts, and each other (cheap rect
+      // checks). Kept corridor ribbons are NOT pre-checked: a ribbon
+      // through the spot reads as an intrusion downstream, and best-of-two
+      // adoption rejects the repair — while near-misses stay repairable.
+      let blocked = false
+      for (const r of pool) {
+        if (rectsOverlapPad(cand, roomRectOf(r), 0.5)) {
           blocked = true
           break
         }
       }
-    }
-    if (!blocked) {
-      for (const p of placed) {
-        if (rectsOverlapPad(rect, p, side)) {
-          blocked = true
-          break
+      if (!blocked) {
+        for (const t of towerReservations) {
+          if (rectsOverlapPad(cand, t.rect, 0.5)) {
+            blocked = true
+            break
+          }
         }
       }
+      if (!blocked) {
+        for (const p of placed) {
+          if (rectsOverlapPad(cand, p, side)) {
+            blocked = true
+            break
+          }
+        }
+      }
+      if (blocked) continue
+      px = cx
+      pz = cz
+      rect = cand
+      break
     }
-    if (blocked) continue
+    if (!rect) continue
     // Rewire: drop the blind pass-throughs, join all four ends at J.
     const id = `junction_${made}`
     const ends = [a.startRoomId, a.endRoomId, b.startRoomId, b.endRoomId]
@@ -737,7 +763,7 @@ export function planJunctions(
     const junction: Room = {
       id,
       type: 'connector',
-      position: { x: point.x, y: floor * floorHeight, z: point.z },
+      position: { x: px, y: floor * floorHeight, z: pz },
       width: side,
       depth: side,
       height: config.wallHeight,

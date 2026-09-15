@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import * as THREE from 'three'
 import { GLTFExporter } from 'three/examples/jsm/exporters/GLTFExporter.js'
-import { getDefaultConfig, pickWeightedRoomType, presets } from '../src/core/presets'
+import { getDefaultConfig, applyPreset, pickWeightedRoomType, presets } from '../src/core/presets'
 import { validateConfigFeasibility, stairMathFor } from '../src/core/rules'
 import { validateExportModel, validateDoors, validateNavigationGrid, findCorridorCrossings } from '../src/core/validation'
 import { LevelScene } from '../src/renderer/scene'
@@ -513,4 +513,35 @@ test('ring crossing seed resolves through a junction plaza', () => {
   assert.equal(level.ok, true)
   assert.ok(level.rooms.some(r => r.junction), 'plaza recorded')
   assert.ok(!level.validation.errors.some(i => i.code === 'CORRIDOR_CROSSING'))
+})
+
+test('wide-corridor mouth foul subdivides through a nearby room', () => {
+  // Full generation regression (config + seed recorded): warehouse/181
+  // failed with CORRIDOR_ROOM_COLLISION (mouth foul: 4 m ribbon
+  // re-entering its endpoint away from the doorway) before foul
+  // subdivision searched 15 m for midpoint hops. Lawbook §70 step 5.
+  const config = { ...applyPreset(getDefaultConfig(), 'warehouse'), seed: 181 }
+  const level = generateLevel(config)
+  assert.equal(level.ok, true)
+  assert.deepEqual(generateLevel(config), level)
+  assert.ok(!level.validation.errors.some(i => i.code === 'CORRIDOR_ROOM_COLLISION'))
+  assert.ok(!level.validation.errors.some(i => i.code === 'PORTAL_SEALED'))
+})
+
+test('hole-blocked crossing nudges its plaza into the walkable band', () => {
+  // Full generation regression (config + seed recorded): ring/40457
+  // failed with PORTAL_SEALED + CORRIDOR_CROSSING (brush crossing with no
+  // junction point, plus a sealed gate) before plaza spiral search tried
+  // band positions around blocked crossing points. Lawbook §34-35.
+  const config = {
+    ...getDefaultConfig(),
+    roomCount: 24, floorCount: 2, area: 6000, shape: 'ring' as const,
+    largeRoomCount: 2, seed: 40457,
+  }
+  const level = generateLevel(config)
+  assert.equal(level.ok, true)
+  assert.deepEqual(generateLevel(config), level)
+  assert.ok(level.rooms.some(r => r.junction), 'nudged plaza recorded')
+  assert.ok(!level.validation.errors.some(i => i.code === 'CORRIDOR_CROSSING'))
+  assert.ok(!level.validation.errors.some(i => i.code === 'PORTAL_SEALED'))
 })

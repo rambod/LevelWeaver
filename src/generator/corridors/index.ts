@@ -377,7 +377,11 @@ export function generateCorridors(
     // errors on dense maps). Crossings ship, validators report, retry
     // re-routes the whole layout instead.
     if (built && built.corridor && depth < 3 && (built.midFoul || built.mouthFoul)) {
-      const mid = findMidpointRoom(a, b, rooms, new Set([...banned, a.id, b.id]))
+      // Wide-radius repair (15 m vs 12 m pre-subdivision): a pinched direct
+      // edge between large rooms often has no midpoint within 12 m, but a
+      // room 12-15 m off-segment still yields two short clean hops. Gated
+      // to foul edges only, so clean layouts never change.
+      const mid = findMidpointRoom(a, b, rooms, new Set([...banned, a.id, b.id]), 15)
       if (mid && mid.id !== a.id && mid.id !== b.id) {
         const nextBanned = new Set(banned)
         nextBanned.add(a.id)
@@ -406,7 +410,10 @@ function pairKey(aId: string, bId: string): string {
 // crossing validator skips them by construction — while hops through
 // ordinary rooms can re-create the very edge a junction just removed.
 // Rooms arrays without junctions behave exactly as before.
-function findMidpointRoom(a: Room, b: Room, rooms: Room[], banned: Set<string>): Room | null {
+// Radius defaults to 12 m (legacy long-link subdivision); foul repair
+// passes a wider radius so pinched mouths on large-room maps can hop
+// through a nearby room instead of shipping a sealed gate.
+function findMidpointRoom(a: Room, b: Room, rooms: Room[], banned: Set<string>, radius = 12): Room | null {
   const midX = (a.position.x + b.position.x) / 2
   const midZ = (a.position.z + b.position.z) / 2
   let best: Room | null = null
@@ -418,7 +425,7 @@ function findMidpointRoom(a: Room, b: Room, rooms: Room[], banned: Set<string>):
     if (banned.has(r.id)) continue
     if (r.floorIndex !== a.floorIndex) continue
     const toSeg = distPointToSegment(r.position.x, r.position.z, a.position.x, a.position.z, b.position.x, b.position.z)
-    if (toSeg > 12) continue
+    if (toSeg > radius) continue
     const toMid = Math.sqrt((r.position.x - midX) ** 2 + (r.position.z - midZ) ** 2)
     const junction = r.junction ? 0 : 1
     if (
