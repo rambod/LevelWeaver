@@ -501,10 +501,14 @@ test('junction repair converts crossings into shared plazas', () => {
   }
 })
 
-test('ring crossing seed resolves through a junction plaza', () => {
+test('ring crossing seed stays clean and crossing-free', () => {
   // Full generation regression (config + seed recorded): ring/40448
   // failed with a lone CORRIDOR_CROSSING before junction repair.
-  // (~2-3 s: ring band routing is expensive.)
+  // History: 0.1.7-0.1.9 winners converted the crossing into a live
+  // plaza; the wider 0.1.10 retry budget finds a fully clean routing
+  // with no crossing at all. Both outcomes are honest — pin the current
+  // one (clean, deterministic, crossing-free). Junction repair itself
+  // stays pinned by the white-box test, ring/40457, and the compact test.
   const config = {
     ...getDefaultConfig(),
     roomCount: 24, floorCount: 2, area: 6000, shape: 'ring' as const,
@@ -512,7 +516,7 @@ test('ring crossing seed resolves through a junction plaza', () => {
   }
   const level = generateLevel(config)
   assert.equal(level.ok, true)
-  assert.ok(level.rooms.some(r => r.junction), 'plaza recorded')
+  assert.deepEqual(generateLevel(config), level)
   assert.ok(!level.validation.errors.some(i => i.code === 'CORRIDOR_CROSSING'))
 })
 
@@ -611,8 +615,18 @@ test('dense band crossing falls back to a compact 2.4 m plaza', () => {
   const j = out.rooms.find(r => r.junction)!
   assert.equal(j.width, 2.4)
   assert.equal(j.depth, 2.4)
-  assert.deepEqual([...j.connections].sort(), ['a', 'b', 'c', 'd'])
+  // §87 honesty: the south stub subdivides around the blocker, so the
+  // direct d-plaza edge is dropped explicitly instead of lingering as a
+  // phantom linkage — while d stays connected through the hop.
+  assert.deepEqual([...j.connections].sort(), ['a', 'b', 'c'])
   const byId = new Map(out.rooms.map(r => [r.id, r]))
+  assert.ok(!byId.get('d')!.connections.includes(j.id), 'phantom edge dropped on both ends')
+  assert.ok(!byId.get('blocker')!.connections.includes(j.id), 'hop recording is downstream job')
+  // No remaining plaza edge lacks a shipped direct corridor.
+  const keys = new Set(out.corridors.map(c => [c.startRoomId, c.endRoomId].sort().join('|')))
+  for (const e of j.connections) {
+    assert.ok(keys.has([j.id, e].sort().join('|')), `${j.id}-${e} is realized`)
+  }
   assert.ok(!byId.get('a')!.connections.includes('b'), 'blind intent removed')
   assert.ok(!byId.get('c')!.connections.includes('d'), 'blind intent removed')
   // Every plaza end is spatially realized: a direct stub, or a hop
@@ -638,4 +652,20 @@ test('dense band crossing falls back to a compact 2.4 m plaza', () => {
     }
     assert.ok(seen.has(j.id), `${e} reaches the plaza over shipped corridors`)
   }
+})
+
+test('wider mid-size retry budget repairs a lone ring-band crossing', () => {
+  // Full generation regression (config + seed recorded): ring/40489
+  // failed with a lone CORRIDOR_CROSSING (no placeable plaza inside the
+  // 15-layout budget) before the 21-30-room bracket grew to 24 draws.
+  // (~20 s: the winning attempt needs deep retries.)
+  const config = {
+    ...getDefaultConfig(),
+    roomCount: 24, floorCount: 2, area: 6000, shape: 'ring' as const,
+    largeRoomCount: 2, seed: 40489,
+  }
+  const level = generateLevel(config)
+  assert.equal(level.ok, true)
+  assert.deepEqual(generateLevel(config), level)
+  assert.ok(!level.validation.errors.some(i => i.code === 'CORRIDOR_CROSSING'))
 })

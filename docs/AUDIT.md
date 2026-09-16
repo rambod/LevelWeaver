@@ -444,3 +444,75 @@ Measured but deferred (no safe mechanism this pass):
 - Ring-band hole crossings needing a >6 m nudge (40458, deep in the
   courtyard void) stay honest failures; wider spirals were judged
   likely to lose best-of-two adoption to long foul-prone stubs.
+
+## Solidity pass 4 (2026-09-16, generator version **0.1.9 → 0.1.10**)
+
+Ring-band census on 0.1.9 (24-room seeds 40460-40484: 24/30, all
+double-generated with zero nondeterminism) showed three fixable
+classes: lone crossings with no plaza placed, mid-size winners stuck
+at 15 layout draws, and phantom stub edges padding plaza topology.
+All three fixes are gated so previously-passing seeds keep passing
+(proved below); `GENERATOR_VERSION` bumped for output/acceptance
+changes on previously-failing seeds.
+
+Generation (`src/core/generation`):
+
+- 21-30-room retry bracket grows 5 → 8 layouts (15 → 24 draws).
+  Clean seeds break early on attempt 0 at identical cost; failing mid
+  seeds get a wider repair search. Ring/40489 (lone crossing, no
+  placeable plaza inside 15 draws) now passes; 40454 and 40458 also
+  resolve clean, as do 40469 and 40483 on re-measurement. Proven
+  necessary: with 5 layouts 40489 fails in 10.5 s; with 8 it passes.
+- Plaza spiral widens 6 → 9 m, strictly additive (rings 7-9 run only
+  when 0-6 m all fail, center-first order kept), still under
+  best-of-two adoption. Negligible cost: extra rect checks run only
+  when crossings exist.
+- §87 honesty in `planJunctions`: stub pairs with no shipped direct
+  corridor lose the direct edge on both ends instead of lingering as
+  phantom linkages. Hop trips stay connected through their shipped hop
+  corridors (recorded downstream); ends left with nothing surface as
+  honest disconnects. Corridor-based validators never saw these edges,
+  so tiers and best-of-two adoption are unaffected by the cleanup
+  itself. Measured safe: the 32-case matrix contains zero plazas, and
+  the ring integration pins hold (below).
+
+Experiments run and deliberately reverted (recorded so they are not
+retried blindly):
+
+- Junction stub routing with alternate mouths: +40% wall-clock on
+  junction layouts with no measured win beyond the three fixes above
+  (40489 still passes with legacy facing-wall stubs, faster).
+- Ring-hole void routing (block the courtyard hole in A*/smoothing/
+  verifier): fixed one seed but broke the passing ring/40448 pin with
+  a `PORTAL_SEALED`, and worsened another — hole-cutting plus junction
+  repair is currently the working ring strategy. Remains future work
+  with co-designed band routing.
+
+Verification after fixes: `npm test` **27/27** (1 new: ring/40489
+budget pin with full config + seed and determinism check),
+`npm run test:seeds` **32/32**, `npm run build` green (typecheck +
+Vite; bundle ~734 kB / ~207 kB gzip, known chunk warning unchanged).
+Ring 24-room spot re-measurement (single generation): 40454 clean
+(via plaza), 40458 clean (routing found, no plaza needed), 40469
+clean, 40483 clean, 40489 clean (pinned); previously-phantom passing
+plazas now ship zero phantom edges (40465, 40474, horrorFacility/208
+all clean with every plaza edge realized); residuals 40461 (lone
+`PORTAL_SEALED`), 40462 (lone `CORRIDOR_CROSSING`, down from 4 seals
++ mouth foul), 40473 (`CORRIDOR_CROSSING` + mouth foul + seal);
+warehouse/141 still a single mouth-foul `CORRIDOR_ROOM_COLLISION`.
+One pinned expectation updated honestly: ring/40448's wider budget
+finds a fully clean routing with no crossing at all, so its pin now
+asserts clean + crossing-free + deterministic (renamed accordingly)
+instead of plaza presence; junction repair stays pinned by the
+white-box test, ring/40457, and the compact-plaza test (which now
+also pins the no-phantom invariant). Seeds reproduce only on the same
+version; 0.1.9 ≠ 0.1.10 on previously-failing seeds (and on passing
+layouts whose plazas reseat via the compact fallback — still passing).
+
+Still open: short-pair own-wall seals (turn-in-bubble on long twisty
+band corridors, e.g. ex-40454 class — exit-leg capping hypothesis
+recorded last pass), brush crossings with no proper point (by design),
+miter-joint spikes, in-room arrivals vs corridor slabs, full
+vertical-first co-design, 100-room single-floor over-constraint, and
+main-thread stall on failing mid-size seeds (~20 s worst case;
+clean seeds break early).

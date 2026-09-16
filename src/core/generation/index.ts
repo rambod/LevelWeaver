@@ -113,10 +113,12 @@ export function generateLevel(rawConfig: LevelConfig): GeneratedLevel {
   // 95 s. Large maps get fewer attempts — attempt 0 is always identical,
   // so clean seeds reproduce bit-for-bit regardless of budget. Tiers above
   // every shipped preset/matrix size (>40 rooms), so small maps are
-  // byte-identical to narrower budgets.
+  // byte-identical to narrower budgets. The 21-30 bracket runs 8 layouts
+  // (24 draws): clean seeds break early on attempt 0 at identical cost,
+  // while failing mid-size seeds get a wider repair search.
   const MAX_TOPO_ATTEMPTS = config.roomCount > 80 ? 1 : config.roomCount > 30 ? 2 : 3
   const MAX_LAYOUT_ATTEMPTS =
-    config.roomCount > 80 ? 2 : config.roomCount > 50 ? 2 : config.roomCount > 30 ? 3 : config.roomCount > 20 ? 5 : 12
+    config.roomCount > 80 ? 2 : config.roomCount > 50 ? 2 : config.roomCount > 30 ? 3 : config.roomCount > 20 ? 8 : 12
   // Attempt-0 topology+sizes, computed once and shared by all attempt-0
   // layouts (regenerating per attempt would consume the RNG stream and
   // reshuffle every seed).
@@ -694,12 +696,14 @@ export function planJunctions(
     // Spiral placement (§34-35): the exact crossing point is often
     // unplaceable (ring courtyard hole, room overlap), but a spot a few
     // meters away in the walkable band still joins all four ends. Try the
-    // center first, then deterministic compass rings at 1-6 m; the first
+    // center first, then deterministic compass rings at 1-9 m; the first
     // placeable spot wins, so clean exact-center plazas never move.
-    // Best-of-two adoption below rejects the repair if the moved plaza's
-    // stubs foul, so a bad nudge can never hurt the attempt.
+    // Rings past 6 m only run when 0-6 m all fail (strictly additive
+    // search order), and best-of-two adoption below rejects the repair
+    // if the moved plaza's stubs foul, so a bad nudge can never hurt
+    // the attempt.
     const offsets: { x: number; z: number }[] = [{ x: 0, z: 0 }]
-    for (let r = 1; r <= 6; r++) {
+    for (let r = 1; r <= 9; r++) {
       offsets.push(
         { x: r, z: 0 }, { x: -r, z: 0 }, { x: 0, z: r }, { x: 0, z: -r },
         { x: r, z: r }, { x: r, z: -r }, { x: -r, z: r }, { x: -r, z: -r },
@@ -800,6 +804,29 @@ export function planJunctions(
   // when strictly better, so a bad rebuild can never hurt the attempt.
   const kept = corridors.filter(c => !consumed.has(c.id))
   const stubs = generateCorridors(pool, config, false, towerReservations, forbidden, kept)
+  // §87 honesty: every rewired edge needs a spatial realization. A stub
+  // pair whose direct corridor failed to route (subdivided into hops
+  // around an obstacle, or unroutable) must not linger as a direct graph
+  // edge — drop it explicitly on both ends. Hop trips stay connected
+  // through their shipped hop corridors (recorded downstream), and an
+  // end left with no realization at all surfaces as an honest
+  // disconnect instead of a phantom linkage. Corridor-based validators
+  // never saw these edges, so tiers and best-of-two adoption are
+  // unaffected by the cleanup itself.
+  const realized = new Set<string>()
+  for (const c of [...kept, ...stubs]) realized.add(pairKeyOf(c.startRoomId, c.endRoomId))
+  for (const jr of pool) {
+    if (!jr.junction) continue
+    const keptConns = jr.connections.filter(e => realized.has(pairKeyOf(jr.id, e)))
+    if (keptConns.length === jr.connections.length) continue
+    jr.connections = keptConns
+    for (const r of pool) {
+      if (r.id === jr.id) continue
+      if (!keptConns.includes(r.id) && r.connections.includes(jr.id)) {
+        r.connections = r.connections.filter(x => x !== jr.id)
+      }
+    }
+  }
   return { rooms: pool, corridors: stubs }
 }
 
