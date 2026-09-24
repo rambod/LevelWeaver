@@ -4,10 +4,13 @@ import type { MaterialTheme } from '../../core/types'
 const themes: Record<string, MaterialTheme> = {
   greybox: {
     name: 'Greybox',
-    wall: { color: 0x888888, roughness: 0.9, metalness: 0.0 },
-    floor: { color: 0x666666, roughness: 0.95, metalness: 0.0 },
-    ceiling: { color: 0x444444, roughness: 1.0, metalness: 0.0 },
-    trim: { color: 0xaaaaaa, roughness: 0.8, metalness: 0.1 },
+    // Default prototype look: lifted a stop vs pure mid-grey so walk-mode
+    // interiors read under doorway-only lighting; trim stays near-white
+    // so door liners and edges separate from walls at a glance.
+    wall: { color: 0x999999, roughness: 0.9, metalness: 0.0 },
+    floor: { color: 0x777777, roughness: 0.95, metalness: 0.0 },
+    ceiling: { color: 0x555555, roughness: 1.0, metalness: 0.0 },
+    trim: { color: 0xcccccc, roughness: 0.8, metalness: 0.1 },
     door: { color: 0x555555, roughness: 0.7, metalness: 0.2 },
     accent: { color: 0x00ff88, roughness: 0.5, metalness: 0.5 },
   },

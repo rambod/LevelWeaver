@@ -991,14 +991,16 @@ function computeSlabHoles(
     const halfW = (plan.axis === 'z' ? plan.width : plan.depth) / 2
     const halfD = (plan.axis === 'z' ? plan.depth : plan.width) / 2
     // Stairwell opening (bot-proven): the hole is the footprint grown by
-    // body clearance (0.35 m) on every side, NOT the bare footprint. A
-    // body standing on an edge tread (center 0.16+ inside the edge)
-    // reaches 0.4 past it; with a footprint-exact hole the slab edge
-    // grazes the column while the head is above the slab bottom —
-    // residual ~1.2 m of solid slab no step-up clears. The growth stays
-    // under every slab-avoidance pad (0.4+), so holes never eat corridor
-    // slabs the planner routed around.
-    const HOLE_CLEAR = 0.35
+    // body clearance on every side (SPATIAL_DEFAULTS.stairwellClear),
+    // NOT the bare footprint. A body standing on an edge tread
+    // (center 0.16+ inside the edge) reaches 0.4 past it; with a
+    // footprint-exact hole the slab edge grazes the column while the
+    // head is above the slab bottom — residual ~1.2 m of solid slab no
+    // step-up clears. The growth stays under every slab-avoidance pad
+    // (0.4+), so holes never eat corridor slabs the planner routed
+    // around. Landing/deck exit edges extend by exactly the same amount
+    // to butt-join the hole edge (see stair builders).
+    const HOLE_CLEAR = SPATIAL_DEFAULTS.stairwellClear
     const world = {
       minX: plan.x - halfW - HOLE_CLEAR,
       maxX: plan.x + halfW + HOLE_CLEAR,

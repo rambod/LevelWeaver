@@ -3,20 +3,22 @@ import { test } from 'node:test'
 import * as THREE from 'three'
 import { GLTFExporter } from 'three/examples/jsm/exporters/GLTFExporter.js'
 import { getDefaultConfig, applyPreset, pickWeightedRoomType, presets } from '../src/core/presets'
-import { validateConfigFeasibility, stairMathFor } from '../src/core/rules'
+import { validateConfigFeasibility, stairMathFor, SPATIAL_DEFAULTS } from '../src/core/rules'
 import { validateExportModel, validateDoors, validateNavigationGrid, findCorridorCrossings, tiersOf, compareTiers, isPlacementFailure } from '../src/core/validation'
 import type { GenerationIssue, IssueCode } from '../src/core/validation'
 import { LevelScene } from '../src/renderer/scene'
+import { createMaterials, getAvailableThemes } from '../src/renderer/materials'
 import { exportGLB, levelFilename, downloadGLB } from '../src/export/gltf'
 import { useLevelStore } from '../src/stores/level'
 import { fixtureLevel } from './fixtures'
 import type { Corridor, DoorOpening, LevelConfig, MeshData, Room, StairsGeometry } from '../src/core/types'
 import { createBoxMesh, createOrientedBox } from '../src/core/meshdata'
-import { generateCorridorGeometry } from '../src/generator/geometry'
+import { generateCorridorGeometry, generateRoomGeometry } from '../src/generator/geometry'
 import { generateCorridors } from '../src/generator/corridors'
 import { generateTopology, topUpDegrees } from '../src/generator/topology'
 import { assignRoomSizes } from '../src/generator/rooms'
-import { planStairs, towerMouthWidthFor } from '../src/generator/vertical'
+import { planStairs, towerMouthWidthFor, buildStairsGeometry } from '../src/generator/vertical'
+import type { StairPlan } from '../src/generator/vertical'
 import { omittedStairIssues, planJunctions, generateLevel } from '../src/core/generation'
 import { SeededRandom } from '../src/core/random'
 
@@ -668,4 +670,202 @@ test('wider mid-size retry budget repairs a lone ring-band crossing', () => {
   assert.equal(level.ok, true)
   assert.deepEqual(generateLevel(config), level)
   assert.ok(!level.validation.errors.some(i => i.code === 'CORRIDOR_CROSSING'))
+})
+
+test('corridor joints bury past the wall band and close tube ends', () => {
+  // Lawbook §52: ribbon ends must not leave see-through slits. Wall
+  // tubes get end caps, and every end extends jointOverlap past the door
+  // plane (through the 0.30 band plus a proud jamb).
+  const corridor: Corridor = {
+    id: 'corridor_test', startRoomId: 'a', endRoomId: 'b', floorIndex: 0,
+    width: 2, startPos: { x: -7, y: 0, z: 0 }, endPos: { x: 7, y: 0, z: 0 },
+    pathPoints: [{ x: -7, y: 0, z: 0 }, { x: 7, y: 0, z: 0 }],
+  }
+  const [built] = generateCorridorGeometry([corridor], 3.5)
+  const overlap = SPATIAL_DEFAULTS.jointOverlap
+  let minX = Infinity, maxX = -Infinity
+  for (const m of [...built.walls, built.floor]) {
+    for (let i = 0; i < m.vertices.length; i += 3) {
+      minX = Math.min(minX, m.vertices[i])
+      maxX = Math.max(maxX, m.vertices[i])
+    }
+  }
+  assert.ok(minX <= -7 - overlap + 1e-6, `start burial ${minX}`)
+  assert.ok(maxX >= 7 + overlap - 1e-6, `end burial ${maxX}`)
+  // End caps: triangles whose normals run along the corridor axis at an
+  // end plane (wall ribbons used to end as open tubes).
+  let caps = 0
+  for (const m of built.walls) {
+    for (let i = 0; i < m.indices.length; i += 3) {
+      const n = new THREE.Vector3().fromArray(m.normals, m.indices[i] * 3)
+      if (Math.abs(n.x) < 0.99) continue
+      const xs = [0, 1, 2].map(k => new THREE.Vector3().fromArray(m.vertices, m.indices[i + k] * 3).x)
+      if (xs.every(x => Math.abs(x - minX) < 0.01 || Math.abs(x - maxX) < 0.01)) caps++
+    }
+  }
+  assert.ok(caps >= 4, `both tube ends capped (both walls), found ${caps} cap triangles`)
+})
+
+test('shared doorway holes get trim liners outside clear mouth spans', () => {
+  // Two gates 1.1 m apart share one merged hole: the strips between and
+  // around the mouths are wall, not opening. Fillers (trim slot) close
+  // exactly those strips and never enter a clear span.
+  const room: Room = {
+    id: 'room_0', type: 'standard', position: { x: 0, y: 0, z: 0 },
+    width: 10, depth: 10, height: 3.5, floorIndex: 0,
+    materialTheme: 'greybox', connections: [],
+  }
+  const door = (z: number): DoorOpening => ({
+    roomId: 'room_0', wallIndex: 1, position: { x: 5, y: 0.1, z },
+    width: 1.0, height: 2.4, targetRoomId: 'other',
+  })
+  const [two] = generateRoomGeometry([room], new Map([['room_0', [door(-0.55), door(0.55)]]]))
+  const trims = two.walls.filter(m => m.materialIndex === 3 && m.vertices.length > 0)
+  assert.ok(trims.length > 0, 'merged span emits trim fillers')
+  // Mouth intervals [-1.05,-0.05] and [0.05,1.05]: only the 0.1 middle
+  // strip plus nothing else may be filled.
+  let zMin = Infinity, zMax = -Infinity, xMin = Infinity, xMax = -Infinity, yMax = -Infinity
+  for (const m of trims) {
+    for (let i = 0; i < m.vertices.length; i += 3) {
+      zMin = Math.min(zMin, m.vertices[i + 2]); zMax = Math.max(zMax, m.vertices[i + 2])
+      xMin = Math.min(xMin, m.vertices[i]); xMax = Math.max(xMax, m.vertices[i])
+      yMax = Math.max(yMax, m.vertices[i + 1])
+    }
+  }
+  assert.ok(zMin >= -0.05 - 1e-6 && zMax <= 0.05 + 1e-6, `filler stays in the gap strip, got [${zMin}, ${zMax}]`)
+  assert.ok(xMin >= 5 - SPATIAL_DEFAULTS.wallThickness - 1e-6 && xMax <= 5 + 1e-6, 'filler stays inside the band')
+  assert.ok(yMax <= 2.4 + 1e-6, 'filler stays below the header')
+  // Single-mouth control: hole == mouth, so no trim may appear.
+  const [one] = generateRoomGeometry([room], new Map([['room_0', [door(0)]]]))
+  assert.ok(one.walls.every(m => m.materialIndex !== 3 || m.vertices.length === 0), 'no fillers without shared spans')
+})
+
+test('stair landings meet the stairwell hole edge flush at step-off', () => {
+  // Lawbook §46: the exit edge extends exactly stairwellClear past the
+  // footprint edge to butt-join the hole edge — no step-off moat, no
+  // tuck-underlap to z-fight, tops flush with the arrival slab.
+  const lo: Room = {
+    id: 'lo', type: 'standard', position: { x: 0, y: 0, z: 0 }, width: 10, depth: 10,
+    height: 3.5, floorIndex: 0, materialTheme: 'greybox', connections: ['up'],
+  }
+  const up: Room = {
+    id: 'up', type: 'standard', position: { x: 0, y: 4, z: 0 }, width: 10, depth: 10,
+    height: 3.5, floorIndex: 1, materialTheme: 'greybox', connections: ['lo'],
+  }
+  const sm = stairMathFor(4.0)
+  const straight: StairPlan = {
+    link: { lowerRoomId: 'lo', upperRoomId: 'up' }, hostRoomId: 'lo', ascending: true,
+    axis: 'x', dir: 1, x: 0, z: 0, width: 1.4, depth: 8.2, kind: 'inroom',
+    switchback: false, stepCount: sm.stepCount, stepHeight: sm.stepHeight, stepDepth: sm.stepDepth,
+    towerRect: null, towerDoor: null,
+  }
+  const [straightBuilt] = buildStairsGeometry([straight], [lo, up], 4.0)
+  const lBox = (m: MeshData): { minX: number; maxX: number; maxY: number } => {
+    let minX = Infinity, maxX = -Infinity, maxY = -Infinity
+    for (let i = 0; i < m.vertices.length; i += 3) {
+      minX = Math.min(minX, m.vertices[i]); maxX = Math.max(maxX, m.vertices[i])
+      maxY = Math.max(maxY, m.vertices[i + 1])
+    }
+    return { minX, maxX, maxY }
+  }
+  const sl = lBox(straightBuilt.landing[0])
+  assert.ok(Math.abs(sl.maxX - (8.2 / 2 + SPATIAL_DEFAULTS.stairwellClear)) < 1e-6, `landing meets hole edge, got ${sl.maxX}`)
+  // Float32 storage: exact-decimal tops (4.2) round-trip within 1e-6.
+  assert.ok(Math.abs(sl.maxY - 4.2) < 1e-6, `landing flush with slab, got ${sl.maxY}`)
+  // Switchback arrival deck: exit is always toward canonical -along, so
+  // the deckStart side extends to its hole edge with a flush top.
+  const folded: StairPlan = { ...straight, width: 2.4, depth: 4.5, switchback: true }
+  const [foldBuilt] = buildStairsGeometry([folded], [lo, up], 4.0)
+  const deck = foldBuilt.landing[foldBuilt.landing.length - 1]
+  const dl = lBox(deck)
+  assert.ok(Math.abs(dl.minX - (-4.5 / 2 - SPATIAL_DEFAULTS.stairwellClear)) < 1e-6, `deck meets hole edge, got ${dl.minX}`)
+  assert.ok(Math.abs(dl.maxY - (sm.stepCount * sm.stepHeight + 0.2)) < 1e-6, `deck flush with slab, got ${dl.maxY}`)
+})
+
+test('generated stair arrivals step onto slab without a moat', () => {
+  // End-to-end version of the landing pin above (config + seed
+  // recorded): every arrival's exit edge must sit within a hair of an
+  // upper floor part, with tops flush. Exit side is read off the
+  // landing itself (landings always sit at the exit end).
+  const config = { ...applyPreset(getDefaultConfig(), 'dungeon'), seed: 7 }
+  const level = generateLevel(config)
+  assert.equal(level.ok, true)
+  assert.deepEqual(generateLevel(config), level)
+  assert.ok(level.stairs.length > 0, 'seed must exercise stairs')
+  for (const s of level.stairs) {
+    const upper = level.rooms.find(r => r.id === s.upperRoomId)!
+    const ug = level.roomGeometry.find(g => g.id === upper.id)!
+    const sy = s.startFloor * level.floorHeight
+    // Frames: stair meshes are world-space (builder bakes plan.x/z;
+    // only the group Y offset applies), room meshes are room-local.
+    // Exit side comes from the ARRIVAL-level landing mass only: lower
+    // turn landings would drag the centroid the wrong way.
+    let top = -Infinity
+    for (const m of s.landing) {
+      for (let i = 0; i < m.vertices.length; i += 3) {
+        top = Math.max(top, m.vertices[i + 1] + sy)
+      }
+    }
+    let cx = 0, cz = 0, n = 0
+    for (const m of s.landing) {
+      let mTop = -Infinity
+      for (let i = 0; i < m.vertices.length; i += 3) {
+        mTop = Math.max(mTop, m.vertices[i + 1] + sy)
+      }
+      if (top - mTop > 0.05) continue
+      for (let i = 0; i < m.vertices.length; i += 3) {
+        cx += m.vertices[i]; cz += m.vertices[i + 2]; n++
+      }
+    }
+    assert.ok(n > 0, `${s.id} has arrival-level landing`)
+    cx /= n; cz /= n
+    const along = s.axis === 'x' ? { x: 1, z: 0 } : { x: 0, z: 1 }
+    // Exit side: landing mass sits toward the exit end by construction.
+    const sgn = Math.sign((cx - s.position.x) * along.x + (cz - s.position.z) * along.z) || 1
+    const ex = along.x * sgn, ez = along.z * sgn
+    let landMax = -Infinity
+    for (const m of s.landing) {
+      for (let i = 0; i < m.vertices.length; i += 3) {
+        landMax = Math.max(landMax, m.vertices[i] * ex + m.vertices[i + 2] * ez)
+      }
+    }
+    let slabMin = Infinity
+    for (const f of ug.floor) {
+      for (let i = 0; i < f.vertices.length; i += 3) {
+        const a = (f.vertices[i] + upper.position.x) * ex + (f.vertices[i + 2] + upper.position.z) * ez
+        if (a > landMax - 0.5 && a < slabMin) slabMin = a
+      }
+    }
+    assert.ok(Math.abs(top - (upper.position.y + 0.2)) < 0.005, `${s.id} tops flush, got ${top}`)
+    if (isFinite(slabMin)) {
+      assert.ok(slabMin - landMax <= 0.05, `${s.id} step-off gap ${slabMin - landMax}`)
+    }
+  }
+})
+
+test('preview lighting fills interiors and theme slots stay valid', () => {
+  // Walk mode lives inside rooms lit only through doorways: ambient +
+  // hemisphere must exist so interiors never fall to black. Theme slots
+  // keep engine-independent params (preview/export share them).
+  const scene = new LevelScene()
+  let hemi = 0, ambient = 0
+  scene.scene.traverse(obj => {
+    if (obj instanceof THREE.HemisphereLight) hemi++
+    if (obj instanceof THREE.AmbientLight) ambient = (obj as THREE.AmbientLight).intensity
+  })
+  assert.equal(hemi, 1)
+  assert.ok(ambient >= 0.5, `ambient fills interiors, got ${ambient}`)
+  scene.dispose()
+  for (const name of getAvailableThemes()) {
+    const mats = createMaterials(name)
+    assert.equal(mats.size, 6)
+    for (const m of mats.values()) {
+      const p = m as THREE.MeshStandardMaterial
+      assert.ok(Number.isFinite(p.roughness) && p.roughness >= 0 && p.roughness <= 1, `${name} roughness`)
+      assert.ok(Number.isFinite(p.metalness) && p.metalness >= 0 && p.metalness <= 1, `${name} metalness`)
+    }
+    mats.forEach(m => m.dispose())
+  }
+  const grey = (createMaterials('greybox').get(0) as THREE.MeshStandardMaterial).color.getHex()
+  assert.equal(grey, 0x999999)
 })

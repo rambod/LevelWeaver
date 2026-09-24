@@ -37,9 +37,15 @@ export class LevelScene {
   }
 
   private setupLighting(): void {
-    // Ambient
-    const ambient = new THREE.AmbientLight(0xffffff, 0.4)
+    // Ambient base so enclosed interiors never fall to black: most rooms
+    // are lit only through their doorways, and walk mode spends all its
+    // time inside. Hemisphere adds a neutral sky/ground gradient on top
+    // (interior-friendly fill that costs one light, no shadow pass).
+    const ambient = new THREE.AmbientLight(0xffffff, 0.55)
     this.scene.add(ambient)
+
+    const hemisphere = new THREE.HemisphereLight(0xbdd0ff, 0x3a3f4a, 0.5)
+    this.scene.add(hemisphere)
 
     // Main directional light (sun-like)
     const dirLight = new THREE.DirectionalLight(0xffffff, 1.2)

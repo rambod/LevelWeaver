@@ -52,9 +52,11 @@ export function corridorSlabBoxes(
   wallThickness = SPATIAL_DEFAULTS.wallThickness,
 ): THREE.Box3[] {
   // Mirror the ribbon builder: slab half width + 0.02 hair, ends extended
-  // into the rooms (SEAM_OVERLAP), top 4 mm below room-slab level.
+  // into the rooms (SPATIAL_DEFAULTS.jointOverlap — keep in sync with the
+  // geometry builder by import, never by literal), top 4 mm below
+  // room-slab level.
   const halfSlab = width / 2 + wallThickness + 0.02
-  const SEAM = wallThickness / 2
+  const SEAM = SPATIAL_DEFAULTS.jointOverlap
   const SEAM_DROP = 0.004
   const THICKNESS = SPATIAL_DEFAULTS.floorThickness
   const yTop = yBase + THICKNESS - SEAM_DROP

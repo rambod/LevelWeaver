@@ -12,7 +12,7 @@ import { presets, shapes, themes } from '@/core/presets'
 // produce a different level. The version travels with every generated
 // level so stale regression seeds are detectable instead of silently
 // "passing" against new geometry.
-export const GENERATOR_VERSION = '0.1.10'
+export const GENERATOR_VERSION = '0.1.11'
 
 // Bound browser workloads before allocating grids or entering search loops.
 export const CONFIG_LIMITS = {
@@ -70,6 +70,22 @@ export const SPATIAL_DEFAULTS = {
   corridorWidth: 1.2,
   corridorClearHeight: 2.4,
   minCorridorSegment: 0.5,
+
+  // Lawbook §52-53 joint tolerances (algorithm-specific, single source —
+  // see AGENTS.md). Corridor ribbon ends bury this far past every door
+  // plane INTO the room (through the 0.30 wall band plus 0.05 proud jamb
+  // inside the room), so open tube ends can never peek out as slits and
+  // no coplanar butt faces remain. Stays below the 0.7 m validator door
+  // exemption and the ±0.7 m navigation throat bridges, so all checks
+  // agree with the built geometry.
+  jointOverlap: 0.35,
+  // Stairwell hole growth past every flight/landing footprint edge
+  // (lawbook §46: the opening must clear headroom, not trace the mesh).
+  // Landing/deck exit edges extend by exactly this amount to meet the
+  // hole edge as an exact butt joint — no moat at step-off, no overlap
+  // to z-fight. Shared by hole cutting (`@/core/generation`) and stair
+  // geometry (`@/generator/vertical`); never redefined locally.
+  stairwellClear: 0.35,
 
   floorToFloorHeight: 3.2,
   clearCeilingHeight: 2.7,

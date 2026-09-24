@@ -200,11 +200,11 @@ function createThickWallWithDoors(
   const ux = dx / len
   const uz = dz / len
 
-  const segment = (a: number, b: number, segBottom: number, segTop: number): MeshData => {
+  const segment = (a: number, b: number, segBottom: number, segTop: number, materialIndex = 0): MeshData => {
     if (b - a < 0.05 || segTop - segBottom < 0.05) return createEmptyMesh()
     const segStart = { x: start.x + ux * a, z: start.z + uz * a }
     const segEnd = { x: start.x + ux * b, z: start.z + uz * b }
-    return createThickWall(segStart, segEnd, segBottom, segTop, thickness, outwardNormal)
+    return createThickWall(segStart, segEnd, segBottom, segTop, thickness, outwardNormal, materialIndex)
   }
 
   // Door spans in wall-local coordinates (distance from `start` along wall).
@@ -224,14 +224,16 @@ function createThickWallWithDoors(
   // Merge overlapping spans so adjacent doors share one opening (merged
   // within 0.4m: paper-thin wall slivers between close doors would look
   // broken and collide badly).
-  const merged: typeof spans = []
+  interface MergedSpan { start: number; end: number; top: number; mouths: { start: number; end: number }[] }
+  const merged: MergedSpan[] = []
   for (const span of spans) {
     const last = merged[merged.length - 1]
     if (last && span.start <= last.end + 0.4) {
       last.end = Math.max(last.end, span.end)
       last.top = Math.max(last.top, span.top)
+      last.mouths.push({ start: span.start, end: span.end })
     } else {
-      merged.push({ ...span })
+      merged.push({ start: span.start, end: span.end, top: span.top, mouths: [{ start: span.start, end: span.end }] })
     }
   }
 
@@ -247,6 +249,28 @@ function createThickWallWithDoors(
     }
     if (span.top < topY - 0.05) {
       meshes.push(segment(span.start, span.end, span.top, topY))
+    }
+    // Door-liner fillers (lawbook §52, trim slot): a merged span is wider
+    // than any single mouth whenever two gates share one hole (funnel or
+    // near-touching doors). The uncovered strips between/around mouths
+    // would otherwise stand open through the full wall band as
+    // see-through slits beside the corridor ribbon. Fill them with trim
+    // jamb boxes over exactly the uncovered sub-spans: fillers never
+    // enter any mouth's clear interval, so clear width, collision, and
+    // door validation agree bit-for-bit. Single-mouth spans emit nothing
+    // (empty meshes are skipped downstream).
+    const mouths = [...span.mouths].sort((a, b) => a.start - b.start)
+    let fill = Math.max(cursor, span.start)
+    for (const m of mouths) {
+      const ms = Math.max(m.start, span.start)
+      const me = Math.min(m.end, span.end)
+      if (ms > fill + 0.05) {
+        meshes.push(segment(fill, ms, bottomY, span.top, 3))
+      }
+      fill = Math.max(fill, me)
+    }
+    if (span.end > fill + 0.05) {
+      meshes.push(segment(fill, span.end, bottomY, span.top, 3))
     }
     cursor = Math.max(cursor, span.end)
   }
@@ -264,7 +288,8 @@ function createThickWall(
   bottomY: number,
   topY: number,
   thickness: number,
-  outwardNormal: { x: number; y: number; z: number }
+  outwardNormal: { x: number; y: number; z: number },
+  materialIndex = 0
 ): MeshData {
   const dx = end.x - start.x
   const dz = end.z - start.z
@@ -290,7 +315,7 @@ function createThickWall(
     len,
     topY - bottomY,
     thickness,
-    0
+    materialIndex
   )
 }
 
@@ -545,6 +570,18 @@ function buildWallRibbon(
     // Outer face.
     b.quad(outBot[i + 1], outBot[i], outTop[i], outTop[i + 1], inward)
   }
+  // End caps (lawbook §52): wall ribbons are open tubes — an uncapped end
+  // buried mid-band still reads as a dark slit at grazing angles, and the
+  // deeper joint overlap leaves end rims proud inside rooms as jambs.
+  // Cap both ends inner→outer across the full height; winding is resolved
+  // against the supplied normal by the builder.
+  if (pts.length >= 2) {
+    const d0 = segmentDir(pts, 0)
+    b.quad(inBot[0], outBot[0], outTop[0], inTop[0], { x: -d0.x, y: 0, z: -d0.z })
+    const l = pts.length - 1
+    const d1 = segmentDir(pts, l - 1)
+    b.quad(outBot[l], inBot[l], inTop[l], outTop[l], { x: d1.x, y: 0, z: d1.z })
+  }
   return b.build(materialIndex)
 }
 
@@ -574,14 +611,16 @@ function buildCorridorGeometry(corridor: Corridor, points: Vec3[], wallHeight: n
   }
 
   const flat: FlatPoint[] = clean.map(p => ({ x: p.x, z: p.z }))
-  // Seam overlap (lawbook §52-53): ribbon ends meet room walls in a
-  // zero-overlap butt joint — coplanar touch plus float error reads as a
-  // see-through slit around gates and tower mouths. Extend both ends
-  // 0.15 m INTO the rooms (past the door plane): walls bury into room-
-  // wall solid beside the hole, slabs overlap under room slabs (4 mm
-  // below, never coplanar). Validator capsules use pathPoints, and the
-  // intrusion exemption covers 0.7 m past every door, so checks agree.
-  const SEAM_OVERLAP = WALL_THICKNESS / 2
+  // Seam overlap (lawbook §52-53, SPATIAL_DEFAULTS.jointOverlap): ribbon
+  // ends meet room walls in a zero-overlap butt joint — coplanar touch
+  // plus float error reads as a see-through slit around gates and tower
+  // mouths. Extend both ends INTO the rooms, past the door plane: past
+  // the full 0.30 wall band plus a 0.05 proud jamb inside the room, so
+  // open tube ends bury in solid (end caps below close them regardless)
+  // and no coplanar butt faces remain. Validator capsules use
+  // pathPoints, and the intrusion exemption covers 0.7 m past every
+  // door, so checks agree; the 0.05 jamb never narrows clear width.
+  const SEAM_OVERLAP = SPATIAL_DEFAULTS.jointOverlap
   if (flat.length >= 2) {
     const d0x = flat[1].x - flat[0].x
     const d0z = flat[1].z - flat[0].z

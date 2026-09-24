@@ -1663,10 +1663,16 @@ function createStairsMesh(
   // Extended 0.15 toward the run (same anti-slit overlap as the
   // switchback turn landing): the top tread otherwise ends ~0.12 short
   // of the landing, leaving a see-through slit at walking height. The
-  // top edge stays exact so arrival/exit zones are unaffected.
+  // exit edge extends exactly stairwellClear past the footprint edge to
+  // butt-join the stairwell hole edge (lawbook §46): the hole outgrows
+  // the landing by the same clearance on every side, which used to leave
+  // an open moat at step-off reading as a gap into the void. Exact butt
+  // (no tuck-underlap) means no coplanar faces to z-fight and no rise
+  // change at step-off; the top edge plan position is unchanged so
+  // arrival/exit zones are unaffected.
   const landingY = baseY + totalHeight
-  const landingCenter = dir * (depth / 2 - LANDING_DEPTH / 2 - 0.075)
-  landing.push(putBox(landingCenter, landingY + FLOOR_THICKNESS / 2, 0, LANDING_DEPTH + 0.15, FLOOR_THICKNESS, width, 1))
+  const landingCenter = dir * (depth / 2 - LANDING_DEPTH / 2 + 0.10)
+  landing.push(putBox(landingCenter, landingY + FLOOR_THICKNESS / 2, 0, LANDING_DEPTH + 0.15 + SPATIAL_DEFAULTS.stairwellClear, FLOOR_THICKNESS, width, 1))
 
   // Stringers: sloped side beams. Slope basis: u along the slope,
   // v its normal, w across the run.
@@ -1851,17 +1857,22 @@ function createSwitchbackStairsMesh(
   // drop and the stair is decorative. The deck bridges top tread to
   // footprint edge at UPPER-FLOOR level (flush with the arrival slab:
   // stepping off is seamless, and diagonal hole-edge crossings no longer
-  // face a 0.2 lip at exactly the agent maximum). The last rise
-  // (B-top tread -> deck) is 0.20 m — within the 0.20 step-up budget.
-  // Headroom underneath is safe by construction: the deck sits over
-  // flight A's LOWEST treads only (headroom there exceeds 2.4 m; proven
-  // in the design note — never extend this deck past B's top toward
-  // +canon). Walkable (lands in the `landing` array → walk collision +
-  // validator).
+  // face a 0.2 lip at exactly the agent maximum). The deck's exit edge
+  // extends exactly stairwellClear past the footprint edge to butt-join
+  // the stairwell hole edge (lawbook §46) — same anti-moat overlap as
+  // the straight landing above, exact butt so nothing z-fights and the
+  // last rise is untouched. Exit is always toward canonical -along here
+  // (exitSign resolves to -dir in world space), hence deckStart side.
+  // The last rise (B-top tread -> deck) is 0.20 m — within the 0.20
+  // step-up budget. Headroom underneath is safe by construction: the
+  // deck sits over flight A's LOWEST treads only (headroom there exceeds
+  // 2.4 m; proven in the design note — never extend this deck past B's
+  // top toward +canon). Walkable (lands in the `landing` array → walk
+  // collision + validator).
   {
     const totalHeight = stepCount * stepHeight
     const deckTop = baseY + totalHeight + FLOOR_THICKNESS
-    const deckStart = e0
+    const deckStart = e0 - SPATIAL_DEFAULTS.stairwellClear
     const deckEnd = topC + stepDepth * 0.575
     const deckC = M((deckStart + deckEnd) / 2)
     landing.push(putBox(deckC, deckTop - FLOOR_THICKNESS / 2, 0, deckEnd - deckStart, FLOOR_THICKNESS, width, 1))

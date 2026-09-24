@@ -516,3 +516,65 @@ miter-joint spikes, in-room arrivals vs corridor slabs, full
 vertical-first co-design, 100-room single-floor over-constraint, and
 main-thread stall on failing mid-size seeds (~20 s worst case;
 clean seeds break early).
+
+## Geometry seams + materials pass (2026-09-16, generator version **0.1.10 → 0.1.11**)
+
+Walk-mode screenshots showed two seam classes plus flat lighting:
+a see-through slit at some corridor→room joints, a dark moat where
+stairs meet the upper floor, and near-black interiors. Measured first
+(node-only mesh audit, no screenshots): corridor ends buried exactly
+0.15 into the 0.30 wall band (mid-band burial of open tube ends), and
+landing exit edges stopped 0.26–0.63 short of the upper slab (the
+stairwell hole outgrows every landing by the 0.35 body clearance).
+
+Corridor joints (`src/generator/geometry`, lawbook §52-53):
+
+- `SPATIAL_DEFAULTS.jointOverlap` (new, 0.35, single source): ribbon
+  ends extend past the door plane through the full band plus a 0.05
+  proud jamb — no butt faces left to slit. Stays below the 0.7 m
+  validator door exemption and navigation throat bridges, so all
+  checks agree; the jamb never narrows clear width. The walk-collision
+  slab mirror (`corridorSlabBoxes`) imports the same value.
+- Wall ribbons get end caps (both ends, full height, auto-oriented):
+  open tube ends can no longer read as dark slits at grazing angles.
+  Corridor walls are not walk colliders (analytic capsules are), so
+  this is render-only by construction.
+- Shared-hole trim liners (trim slot 3, first real use of the slot):
+  merged spans wider than any single mouth used to stand open beside
+  the ribbon. Fillers close exactly the uncovered sub-spans (>0.05,
+  same sliver rule) at full jamb height — never inside a clear mouth
+  interval, so clear width, collision, and door validation agree.
+  Single-mouth spans emit nothing (empty meshes skipped downstream).
+- Tower shafts keep their 0.15 overlap deliberately: shaft walls are
+  closed boxes (no open-tube class), and deeper burial would drift
+  past the rect-based seal checks into walk space.
+
+Stair arrivals (`src/generator/vertical`, lawbook §46):
+
+- Straight landings and switchback decks extend exactly
+  `SPATIAL_DEFAULTS.stairwellClear` (new, 0.35, shared with hole
+  cutting in `@/core/generation` — the local `HOLE_CLEAR` literal is
+  gone) past the footprint edge on the exit side (canonical -along
+  for switchbacks, proven from the exit-sign rule), butt-joining the
+  hole edge: no moat, no tuck-underlap to z-fight, tops flush so no
+  rise changes. Upper-wall clearance was verified against the
+  exit-maneuvering rule (walls sit ≥1.0 m past the edge; extension is
+  0.35). Validators read plans, not meshes — stair/headroom/slab
+  checks are untouched; walk collision gains the bridged deck boxes
+  (walkable, intended).
+
+Materials/lighting, material-only (no geometry rebuild, preview and
+GLB export share `createMaterials`, so they agree automatically):
+
+- Hemisphere + stronger ambient in the preview scene: interiors lit
+  only through doorways no longer fall to black in walk mode.
+- Greybox (default, unpinned) lifted a stop; industrial/sciFi hexes
+  untouched (pinned by export/preview regressions).
+
+Verification after fixes: `npm test` **32/32** (5 new: joint burial
++ caps, trim liners + single-door control, straight/switchback exit
+coverage, end-to-end step-off moat on dungeon/7, lighting/theme
+slots), `npm run test:seeds` **32/32**, `npm run build` green.
+Seeds reproduce only on the same version; 0.1.10 ≠ 0.1.11 geometry
+(all renders/exports rebuild from the new description; clean
+acceptance unchanged — no validator touched).
