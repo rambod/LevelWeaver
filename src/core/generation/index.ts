@@ -65,6 +65,52 @@ export interface GeneratedLevel {
   ok: boolean
 }
 
+// Same-floor realized-corridor redundancy probe (lawbook §12, §87):
+// corridor (aId,bId) is droppable only when both ends stay connected
+// through OTHER realized same-floor corridors. Corridors — never graph
+// intent (unrealized edges must not read as redundancy) and never stair
+// detours (matches pruneMonsterLinks: omitted shafts must not island
+// rooms behind phantom stairs). An alternate a-b path exists exactly
+// when the edge is not a bridge, so no third room can island either.
+// Pure and deterministic.
+export function isRealizedRedundant(
+  corridors: Pick<Corridor, 'startRoomId' | 'endRoomId' | 'floorIndex' | 'id'>[],
+  rooms: Pick<Room, 'id' | 'floorIndex'>[],
+  aId: string,
+  bId: string,
+): boolean {
+  const a = rooms.find(r => r.id === aId)
+  const b = rooms.find(r => r.id === bId)
+  if (!a || !b || a.floorIndex !== b.floorIndex) return false
+  const floor = a.floorIndex
+  const adj = new Map<string, Set<string>>()
+  for (const r of rooms) adj.set(r.id, new Set())
+  for (const c of corridors) {
+    if (c.floorIndex !== floor) continue
+    if (
+      (c.startRoomId === aId && c.endRoomId === bId) ||
+      (c.startRoomId === bId && c.endRoomId === aId)
+    ) {
+      continue // the candidate edge itself never counts
+    }
+    adj.get(c.startRoomId)?.add(c.endRoomId)
+    adj.get(c.endRoomId)?.add(c.startRoomId)
+  }
+  const seen = new Set<string>([aId])
+  const queue = [aId]
+  while (queue.length > 0) {
+    const cur = queue.pop()!
+    if (cur === bId) return true
+    for (const nb of adj.get(cur) ?? []) {
+      if (!seen.has(nb)) {
+        seen.add(nb)
+        queue.push(nb)
+      }
+    }
+  }
+  return false
+}
+
 export function generateLevel(rawConfig: LevelConfig): GeneratedLevel {
   // Normalize: older configs / presets may lack the gate dimensions.
   // Defaults preserve the previous look (1.8 x 2.4 m gates).
@@ -174,11 +220,14 @@ export function generateLevel(rawConfig: LevelConfig): GeneratedLevel {
     const altCorridors = generateCorridors(layout.roomsBase, config, true, layout.towerReservations)
     const alt = finishLayout(layout.roomsBase, altCorridors, boundary, config, floorHeight, layout.towerReservations)
     if (compareTiers(alt.tiers, layout.tiers) < 0) {
+      // Carry the drop paper trail: the rebuild starts from dropped
+      // rooms (removed edges stay removed) and records its own drops.
+      alt.dropped = [...layout.dropped, ...alt.dropped]
       layout = alt
     }
   }
 
-  const { rooms, corridors, doorOpenings, stairPlans, slabHoles } = layout
+  const { rooms, corridors, doorOpenings, stairPlans, slabHoles, dropped } = layout
 
 // A layout qualifies for variant repair when alternate mouths can
 // plausibly cure it: sealed gates, endpoint mouth intrusions, or corridor
@@ -224,6 +273,15 @@ interface LayoutResult {
   issues: GenerationIssue[]
   /** Early tower-shaft reservations that steered corridor routing (§40). */
   towerReservations: TowerReservation[]
+  /**
+   * Explicit drop records (lawbook §87): corridors removed by the
+   * post-hoc redundant-foul repair, with their endpoint rooms. The
+   * final stage-gate rebuilds validation fresh from shipped geometry,
+   * which would silently forget the removal — these records re-emit
+   * the paper-trail warning there. Fresh tails start empty; the drop
+   * repair is the only writer.
+   */
+  dropped: { corridorId: string; a: string; b: string }[]
 }
 
 function runLayoutAttempt(
@@ -348,7 +406,7 @@ function finishTailLayout(
     ...validateStairs(stairPlans),
     ...validateLinkLengths(rooms),
   ]
-  return { roomsBase, rooms, corridors, doorOpenings, stairPlans, slabHoles, tiers: tiersOf(attemptIssues), issues: attemptIssues, towerReservations }
+  return { roomsBase, rooms, corridors, doorOpenings, stairPlans, slabHoles, tiers: tiersOf(attemptIssues), issues: attemptIssues, towerReservations, dropped: [] }
 }
 
 // Junction repair wrapper (lawbook §34-35, §70): after the normal tail,
@@ -371,7 +429,86 @@ function finishLayout(
   // intent), so doors, stairs, geometry, and any later variant rebuild
   // all see the plazas. Best-of-two: adopt only strictly-better tiers.
   const fixed = finishTailLayout(repaired.rooms, repaired.corridors, boundary, config, floorHeight, towerReservations)
-  return compareTiers(fixed.tiers, base.tiers) < 0 ? fixed : base
+  const adopted = compareTiers(fixed.tiers, base.tiers) < 0 ? fixed : base
+  // Post-hoc redundant-foul drops (below): unroutable leftovers that no
+  // mouth/junction repair cured. Runs on the adopted layout only.
+  return dropRedundantFoulCorridors(adopted, boundary, config, floorHeight)
+}
+
+// Post-hoc redundant-foul drop (lawbook §12 loop feasibility, §70 local
+// repair before global regen, §87 explicitness): after mouth and
+// junction repairs, some corridors still ship with hard spatial fouls —
+// corridor crossings and room intrusions, usually redundant loop extras
+// on dense single-floor maps whose chords no placement can route. When
+// the two endpoint rooms stay connected through OTHER realized
+// corridors, the foul ribbon is decorative: remove the corridor AND its
+// graph edge explicitly (both ends), rebuild the tail so doors, stairs,
+// and slabs re-derive consistently, and keep the result only when
+// strictly better. Best-of-two adoption (never ties) plus the three
+// gates below keep this from ever hurting an attempt.
+function dropRedundantFoulCorridors(
+  layout: LayoutResult,
+  boundary: Boundary,
+  config: LevelConfig,
+  floorHeight: number,
+): LayoutResult {
+  // Gate 1 (cost): full tail rebuilds are main-thread seconds — small
+  // maps only, mirroring the mouth-repair gate.
+  if (config.roomCount > 50) return layout
+  // Gate 2 (placement): drops cannot cure overlaps/nesting/bounds —
+  // those winners need different placements, not fewer corridors.
+  if (layout.tiers.t1p > 0) return layout
+  // Gate 3 (trigger): droppable-class hard errors only — crossings and
+  // room intrusions (both mid-route and endpoint mouth-foul flavors; the
+  // mouth-variant already tried alternate walls, this is the fallback).
+  // Seals are excluded: they implicate gate threads whose blocking wall
+  // usually belongs to a corridor that must stay, and dropping around
+  // them reshuffles doors and stair walk zones for no measured win.
+  const droppable = (code: string): boolean =>
+    code === 'CORRIDOR_CROSSING' || code === 'CORRIDOR_ROOM_COLLISION'
+  const hasFoul = layout.issues.some(i => i.severity === 'error' && droppable(i.code))
+  if (!hasFoul) return layout
+  let current = layout
+  // Max 3 adoptions; every adoption strictly decreases tiers, so this
+  // always terminates (tiers are bounded below by zero).
+  for (let round = 0; round < 3; round++) {
+    // Deterministic candidate order: foul corridors by id. issue
+    // objectIds mix corridor and room ids — keep only corridor ids.
+    const ids = new Set<string>()
+    for (const issue of current.issues) {
+      if (issue.severity !== 'error' || !droppable(issue.code)) continue
+      for (const id of issue.objectIds) {
+        if (current.corridors.some(c => c.id === id)) ids.add(id)
+      }
+    }
+    let adopted = false
+    for (const cid of [...ids].sort()) {
+      const corr = current.corridors.find(c => c.id === cid)
+      if (!corr) continue
+      if (!isRealizedRedundant(current.corridors, current.rooms, corr.startRoomId, corr.endRoomId)) continue
+      // Trial on fresh copies (never mutate the candidate: later trials
+      // in this round still read it).
+      const trialRooms = current.rooms.map(r => ({ ...r, connections: [...r.connections] }))
+      for (const [id, other] of [[corr.startRoomId, corr.endRoomId], [corr.endRoomId, corr.startRoomId]] as const) {
+        const node = trialRooms.find(r => r.id === id)
+        if (node) node.connections = node.connections.filter(x => x !== other)
+      }
+      const trialCorridors = current.corridors.filter(c => c.id !== cid)
+      const trial = finishTailLayout(trialRooms, trialCorridors, boundary, config, floorHeight, current.towerReservations)
+      if (compareTiers(trial.tiers, current.tiers) < 0) {
+        // Paper trail (§87: never silently drop): record the removal for
+        // the final report. Tiers are NOT recomputed here — the warning
+        // rides along without penalizing ties, so a dropped-clean layout
+        // compares exactly as the clean layout it now is.
+        trial.dropped = [...current.dropped, { corridorId: cid, a: corr.startRoomId, b: corr.endRoomId }]
+        current = trial
+        adopted = true
+        break // re-scan fouls from the new state next round
+      }
+    }
+    if (!adopted) break
+  }
+  return current
 }
 
 // Distance from point P to segment AB (2D). Local helper so the prune
@@ -498,6 +635,20 @@ function pruneMonsterLinks(rooms: Room[]): void {
   issues.push(...validateStairsGeometry(stairs))
   issues.push(...validateNavigationGrid(rooms, doorOpenings, corridors, stairPlans, floorHeight))
   issues.push(...validateExportModel({ roomGeometry, corridorGeometry, stairs }))
+  // Paper trail for post-hoc redundant-foul drops (§87): the fresh
+  // validation above cannot see removed corridors, so re-emit each
+  // removal as a warning. Always warnings — acceptance is unchanged.
+  for (const d of dropped) {
+    issues.push({
+      code: 'CORRIDOR_REDUNDANT_DROPPED',
+      severity: 'warning',
+      stage: 'corridors',
+      objectIds: [d.corridorId, d.a, d.b],
+      message:
+        `${d.corridorId} shipped with a hard spatial foul, but ${d.a} reaches ${d.b} ` +
+        `through other realized same-floor corridors, so the redundant ribbon was dropped explicitly.`,
+    })
+  }
   const validation = reportOf(issues)
   if (validation.errors.length > 0) {
     console.warn(

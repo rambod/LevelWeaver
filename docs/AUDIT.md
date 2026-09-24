@@ -578,3 +578,66 @@ slots), `npm run test:seeds` **32/32**, `npm run build` green.
 Seeds reproduce only on the same version; 0.1.10 ≠ 0.1.11 geometry
 (all renders/exports rebuild from the new description; clean
 acceptance unchanged — no validator touched).
+
+## Redundant-ribbon drop pass (2026-09-17, generator version **0.1.11 → 0.1.12**)
+
+Broad census on 0.1.11 (single generation each): all 8 shapes × 1/2/3
+floors at 12 rooms **72/72**, min-room stacking (2 rooms over 2
+floors), 5 floors, wall-height/door extremes, and max large-room
+quotas all pass. The only failures are dense large single-floor maps:
+linear 30-room seed 21 (two mid-route room intrusions) and branching
+40-room seed 22 (crossing + seal) — classic loop-extra chords no
+placement can route. Both are fixed below by one mechanism.
+
+Post-hoc redundant-foul drop (`src/core/generation`, lawbook §12
+loop feasibility, §70 local repair, §87 explicitness):
+
+- After mouth and junction repairs, corridors still shipping
+  `CORRIDOR_CROSSING` or `CORRIDOR_ROOM_COLLISION` (mid-route and
+  endpoint mouth-foul flavors) are tested against the realized
+  same-floor corridor graph: endpoints connected through OTHER
+  corridors means the ribbon is decorative. The corridor AND its
+  graph edge go explicitly (both ends), the tail rebuilds so doors,
+  stairs, and slabs re-derive consistently, and the result lands only
+  when strictly better. Corridors only — never graph intent
+  (unrealized edges must not read as redundancy) and never stair
+  detours (phantom-stair lesson from `pruneMonsterLinks`, which this
+  mirrors post-hoc). Backbone bridges always survive the probe, so no
+  third room can island. Three gates keep it from ever hurting an
+  attempt: ≤50 rooms (main-thread cost), no placement failures
+  (drops cannot cure those), and a droppable-class hard error present
+  — layouts without errors return the identical reference.
+- Paper trail without tier distortion: drop records ride
+  `LayoutResult.dropped` (fresh tails start empty; the mouth-variant
+  carries records across rebuilds) and the final stage-gate re-emits
+  each as a `CORRIDOR_REDUNDANT_DROPPED` warning (new code, warnings
+  never fail a level). Selection compares exactly the clean layout
+  the drop produced.
+- New structural invariant this exposed and fixed along the way: the
+  final report rebuilds validation fresh from shipped geometry, so
+  attempt-local findings never travelled — the `dropped` records are
+  now the (only) channel, re-emitted at the gate.
+
+Verification after fixes: `npm test` **34/34** (2 new: redundancy
+probe unit pin — triangle redundant, bridge/cross-floor/unknown kept
+— plus the linear30/21 integration pin with full config + seed and
+determinism check), `npm run test:seeds` **32/32**, `npm run build`
+green. Linear30/21 flips clean (two intrusions dropped, warning
+recorded); branching40/22 improves 3 errors → 1 honest
+`PORTAL_SEALED` (two coincident own-wall funnel seals on one wall —
+mouth-variant and drops exhausted, recorded below); warehouse/141
+keeps its single mouth foul untouched (backbone bridge: the probe
+correctly refuses). One pinned expectation updated honestly:
+ring/40457's drop repair removes the crossing ribbons as redundant
+instead of plazating them, so its pin now asserts clean +
+crossing/seal-free + deterministic (mechanism still covered by the
+white-box, compact-plaza, and linear pins). Seeds reproduce only on
+the same version; 0.1.11 ≠ 0.1.12 on previously-failing seeds.
+
+Still open: own-wall funnel seals on shared walls (both mouths of a
+two-gate funnel sealed by their own turning ribbons — needs mouth
+co-design, not more retries), brush crossings with no proper point
+(by design), short-pair own-wall seals, miter-joint spikes, in-room
+arrivals vs corridor slabs, full vertical-first co-design, 100-room
+single-floor over-constraint, and main-thread stall on failing
+mid-size seeds (~25 s worst case; clean seeds break early).

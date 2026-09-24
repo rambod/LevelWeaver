@@ -35,6 +35,11 @@ export type IssueCode =
   | 'CORRIDOR_CROSSING'
   | 'CORRIDOR_TOO_LOW'
   | 'CORRIDOR_LONG_LINK'
+  // Explicit paper trail for post-hoc redundant-foul drops (§87): the
+  // corridor AND its graph edge are gone; this warning records why.
+  // Always a warning — it never fails a level, only breaks tier ties
+  // toward layouts that routed cleanly in the first place.
+  | 'CORRIDOR_REDUNDANT_DROPPED'
   | 'STAIR_NO_PLACEMENT'
   | 'STAIR_BAD_RISER'
   | 'STAIR_BAD_TREAD'

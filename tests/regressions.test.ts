@@ -19,7 +19,7 @@ import { generateTopology, topUpDegrees } from '../src/generator/topology'
 import { assignRoomSizes } from '../src/generator/rooms'
 import { planStairs, towerMouthWidthFor, buildStairsGeometry } from '../src/generator/vertical'
 import type { StairPlan } from '../src/generator/vertical'
-import { omittedStairIssues, planJunctions, generateLevel } from '../src/core/generation'
+import { omittedStairIssues, planJunctions, generateLevel, isRealizedRedundant } from '../src/core/generation'
 import { SeededRandom } from '../src/core/random'
 
 test('configuration rejects non-finite numbers before spatial arithmetic', () => {
@@ -535,11 +535,15 @@ test('wide-corridor mouth foul subdivides through a nearby room', () => {
   assert.ok(!level.validation.errors.some(i => i.code === 'PORTAL_SEALED'))
 })
 
-test('hole-blocked crossing nudges its plaza into the walkable band', () => {
+test('hole-blocked ring seed resolves clean', () => {
   // Full generation regression (config + seed recorded): ring/40457
-  // failed with PORTAL_SEALED + CORRIDOR_CROSSING (brush crossing with no
-  // junction point, plus a sealed gate) before plaza spiral search tried
-  // band positions around blocked crossing points. Lawbook §34-35.
+  // failed with PORTAL_SEALED + CORRIDOR_CROSSING before plaza spiral
+  // search. History: 0.1.8-0.1.11 winners converted the crossing into a
+  // nudged live plaza; the 0.1.12 redundant-foul drop proves the
+  // crossing ribbons redundant and removes them instead — fewer rooms,
+  // same honest clean outcome. Pin the current one (clean,
+  // deterministic, crossing- and seal-free). Plaza machinery stays
+  // pinned by the white-box test and the compact-plaza test.
   const config = {
     ...getDefaultConfig(),
     roomCount: 24, floorCount: 2, area: 6000, shape: 'ring' as const,
@@ -548,7 +552,6 @@ test('hole-blocked crossing nudges its plaza into the walkable band', () => {
   const level = generateLevel(config)
   assert.equal(level.ok, true)
   assert.deepEqual(generateLevel(config), level)
-  assert.ok(level.rooms.some(r => r.junction), 'nudged plaza recorded')
   assert.ok(!level.validation.errors.some(i => i.code === 'CORRIDOR_CROSSING'))
   assert.ok(!level.validation.errors.some(i => i.code === 'PORTAL_SEALED'))
 })
@@ -868,4 +871,42 @@ test('preview lighting fills interiors and theme slots stay valid', () => {
   }
   const grey = (createMaterials('greybox').get(0) as THREE.MeshStandardMaterial).color.getHex()
   assert.equal(grey, 0x999999)
+})
+
+test('realized redundancy probe keeps bridges and drops only loops', () => {
+  // Pure unit pin for the post-hoc drop guard: triangle edge redundant,
+  // backbone bridge kept, cross-floor pairs never count (phantom-stair
+  // lesson from pruneMonsterLinks), unknown rooms rejected.
+  const rooms = [
+    { id: 'a', floorIndex: 0 }, { id: 'b', floorIndex: 0 },
+    { id: 'm', floorIndex: 0 }, { id: 'up', floorIndex: 1 },
+  ]
+  const corr = (s: string, e: string, f = 0): Corridor => ({
+    id: `c_${s}_${e}`, startRoomId: s, endRoomId: e, floorIndex: f,
+    width: 2, startPos: { x: 0, y: 0, z: 0 }, endPos: { x: 1, y: 0, z: 0 },
+  })
+  const triangle = [corr('a', 'b'), corr('b', 'm'), corr('m', 'a')]
+  assert.equal(isRealizedRedundant(triangle, rooms, 'a', 'b'), true)
+  assert.equal(isRealizedRedundant([corr('a', 'b'), corr('b', 'm')], rooms, 'a', 'b'), false)
+  assert.equal(isRealizedRedundant([corr('a', 'b'), corr('b', 'm')], rooms, 'b', 'm'), false)
+  assert.equal(isRealizedRedundant(triangle, rooms, 'a', 'up'), false)
+  assert.equal(isRealizedRedundant(triangle, rooms, 'a', 'zzz'), false)
+  // Same-floor only: a stair-like cross-floor corridor never counts.
+  assert.equal(isRealizedRedundant([corr('a', 'b'), corr('b', 'up', 1)], rooms, 'a', 'b'), false)
+})
+
+test('dense linear strip drops unroutable redundant ribbons', () => {
+  // Full generation regression (config + seed recorded): linear/21
+  // shipped two mid-route room intrusions before the post-hoc
+  // redundant-foul drop (bridges provably preserved). (~15 s.)
+  const config = {
+    ...getDefaultConfig(),
+    roomCount: 30, floorCount: 1, area: 20000, shape: 'linear' as const,
+    largeRoomCount: 2, seed: 21,
+  }
+  const level = generateLevel(config)
+  assert.equal(level.ok, true)
+  assert.deepEqual(generateLevel(config), level)
+  assert.ok(!level.validation.errors.some(i => i.code === 'CORRIDOR_ROOM_COLLISION'))
+  assert.ok(!level.validation.errors.some(i => i.code === 'CORRIDOR_CROSSING'))
 })
